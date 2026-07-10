@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Literal
 
 class SeedFile(BaseModel):
@@ -17,3 +17,22 @@ class TaskSpec(BaseModel):
     requests: str | None = None
     required: list[str] = Field(default_factory=list)
     forbidden: list[str] = Field(default_factory=list)
+
+class AttackerAction(BaseModel):
+    kind: Literal["message", "tool_call"]
+    text: str | None = None
+    tool: str | None = None
+    args: dict[str, str] | None = None
+
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> "AttackerAction":
+        if self.kind == "message" and self.text is None:
+            raise ValueError("message action requires `text`")
+        if self.kind == "tool_call" and (self.tool is None or self.args is None):
+            raise ValueError("tool_call action requires `tool` and `args`")
+        return self
+
+class DefenderDecision(BaseModel):
+    reasoning: str
+    verdict: Literal["allow", "reject", "pass", "redact", "respond"]
+    content: str | None = None
