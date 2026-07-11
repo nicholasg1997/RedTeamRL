@@ -2,7 +2,7 @@ from pydantic import BaseModel
 from typing import Literal
 from redteamrl.sandbox.base import Sandbox
 from redteamrl.policies.prompted import PromptedAttacker, PromptedDefender
-from redteamrl.types import TaskSpec
+from redteamrl.types import TaskSpec, DefenderDecision
 from redteamrl.harness.protocol import render_action
 from redteamrl.harness.egress import egress_check
 from redteamrl.harness.reward import attacker_reward, defender_reward
@@ -34,6 +34,13 @@ def run_episode(spec: TaskSpec, attacker: PromptedAttacker, defender: PromptedDe
             returned = decision.content or ""
         else:  # tool_call
             if action.tool not in spec.enabled_tools:
+                decision = DefenderDecision(
+                    reasoning=f"[harness] tool '{action.tool}' not in enabled_tools; not adjudicated",
+                    verdict="reject",
+                    content=None,
+
+                )
+                
                 returned = f"[error: unknown tool '{action.tool}']"
             else:
                 decision = defender.adjudicate_call(conversation, action)
