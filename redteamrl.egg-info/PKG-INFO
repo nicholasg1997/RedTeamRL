@@ -6,3 +6,6 @@ Requires-Dist: pydantic>=2.13.4
 Requires-Dist: pyyaml>=6.0.3
 Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"
+Provides-Extra: local
+Requires-Dist: mlx-lm; extra == "local"
+Requires-Dist: transformers<5; extra == "local"

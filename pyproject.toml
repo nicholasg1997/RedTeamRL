@@ -10,14 +10,21 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ipykernel>=7.3.0",
 ]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# mlx-lm 0.31.3 declares transformers>=5, but its code breaks on transformers 5.13
+# (the AutoTokenizer.register change). Force <5, which it actually works with.
+[tool.uv]
+override-dependencies = ["transformers<5"]
+
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+local = ["mlx-lm", "transformers<5"]
 
 [tool.setuptools.packages.find]
 include = ["redteamrl*"]

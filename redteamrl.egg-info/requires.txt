@@ -3,3 +3,7 @@ pyyaml>=6.0.3
 
 [dev]
 pytest>=8
+
+[local]
+mlx-lm
+transformers<5
