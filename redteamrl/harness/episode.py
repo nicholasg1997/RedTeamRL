@@ -40,7 +40,6 @@ def run_episode(spec: TaskSpec, attacker: PromptedAttacker, defender: PromptedDe
                     content=None,
 
                 )
-                
                 returned = f"[error: unknown tool '{action.tool}']"
             else:
                 decision = defender.adjudicate_call(conversation, action)

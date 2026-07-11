@@ -13,21 +13,30 @@ from redteamrl.types import AttackerAction, DefenderDecision
 
 
 def _extract_json(raw: str) -> dict | None:
-    """Return the first JSON object embedded in `raw`, or None.
+    """Return the LAST top-level JSON object embedded in `raw`, or None.
 
-    Scans each '{' and lets the real JSON parser (raw_decode) find the end of the
-    object — so nesting and braces-inside-strings are handled correctly, and a
-    stray non-JSON '{' in prose just moves on to the next one.
+    Both the attacker and defender are prompted to reason in prose first and put
+    their action/decision JSON last, so when several objects appear (e.g. the
+    model shows a candidate mid-reasoning) we want the final one. On each decode
+    we jump the cursor past the consumed span, so nested braces (like an `args`
+    object) are never mistaken for a top-level object.
     """
-    for i, ch in enumerate(raw):
-        if ch == "{":
+    decoder = json.JSONDecoder()
+    found = None
+    i, n = 0, len(raw)
+    while i < n:
+        if raw[i] == "{":
             try:
-                obj, _ = json.JSONDecoder().raw_decode(raw[i:])
-                if isinstance(obj, dict):
-                    return obj
+                obj, end = decoder.raw_decode(raw[i:])
             except json.JSONDecodeError:
+                i += 1
                 continue
-    return None
+            if isinstance(obj, dict):
+                found = obj
+                i += end
+                continue
+        i += 1
+    return found
 
 
 def parse_attacker_action(raw: str) -> AttackerAction:
