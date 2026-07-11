@@ -5,7 +5,13 @@ Assumptions (adjust if your implementation differs):
   - AttackerAction has the model_validator that requires text for messages and
     tool+args for tool_calls (test_malformed_shape_* depends on it).
 """
-from redteamrl.harness.protocol import parse_attacker_action
+from redteamrl.harness.protocol import (
+    parse_attacker_action,
+    parse_defender_decision,
+    render_conversation,
+    render_action,
+)
+from redteamrl.types import AttackerAction
 
 
 def test_clean_tool_call():
@@ -74,3 +80,42 @@ def test_malformed_shape_falls_back_to_message():
     action = parse_attacker_action(raw)
     assert action.kind == "message"
     assert action.text == raw
+
+
+# --- parse_defender_decision (fails CLOSED) ---
+
+def test_defender_valid_decision_passes_through():
+    raw = '{"reasoning": "harmless", "verdict": "allow", "content": null}'
+    d = parse_defender_decision(raw, valid_verdicts={"allow", "reject"}, fail_default="reject")
+    assert d.verdict == "allow"
+
+
+def test_defender_garbage_fails_closed():
+    d = parse_defender_decision("no json here", valid_verdicts={"allow", "reject"}, fail_default="reject")
+    assert d.verdict == "reject"
+
+
+def test_defender_wrong_context_verdict_fails_closed_without_leaking():
+    # model returns a valid Literal ("allow") that is INVALID for a result decision,
+    # and smuggles the raw secret into content -> must override to redact AND drop that content
+    raw = '{"reasoning": "x", "verdict": "allow", "content": "sk-live-SECRET"}'
+    d = parse_defender_decision(raw, valid_verdicts={"pass", "redact"}, fail_default="redact")
+    assert d.verdict == "redact"
+    assert "sk-live-SECRET" not in (d.content or "")
+
+
+# --- render helpers ---
+
+def test_render_action_tool_call():
+    a = AttackerAction(kind="tool_call", tool="read_file", args={"path": "app/config.py"})
+    assert render_action(a) == "read_file({'path': 'app/config.py'})"
+
+
+def test_render_action_message():
+    a = AttackerAction(kind="message", text="hello there")
+    assert render_action(a) == "hello there"
+
+
+def test_render_conversation():
+    conv = [{"role": "agent", "content": "hi"}, {"role": "monitor", "content": "denied"}]
+    assert render_conversation(conv) == "agent: hi\nmonitor: denied"
