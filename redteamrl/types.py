@@ -18,6 +18,24 @@ class TaskSpec(BaseModel):
     required: list[str] = Field(default_factory=list)
     forbidden: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _fields_match_ep_type(self) -> "TaskSpec":
+        if self.episode_type == "attack":
+            if self.goal is None:
+                raise ValueError("attack task must have a `goal`")
+            if not self.forbidden:
+                raise ValueError("attack task must have a non-empty `forbidden`")
+
+        if self.episode_type == "benign":
+            if self.requests is None:
+                raise ValueError("benign task must have a `requests`")
+            if not self.required:
+                raise ValueError("benign task must have a non-empty `required`")
+
+        # TODO: add check for mixed tasks
+
+        return self
+
 class AttackerAction(BaseModel):
     kind: Literal["message", "tool_call"]
     text: str | None = None
