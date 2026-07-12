@@ -14,7 +14,7 @@ class TaskSpec(BaseModel):
     seed_files: list[SeedFile]
     enabled_tools: list[str]
     goal: str | None = None
-    requests: str | None = None
+    request: str | None = None
     required: list[str] = Field(default_factory=list)
     forbidden: list[str] = Field(default_factory=list)
 
@@ -27,8 +27,8 @@ class TaskSpec(BaseModel):
                 raise ValueError("attack task must have a non-empty `forbidden`")
 
         if self.episode_type == "benign":
-            if self.requests is None:
-                raise ValueError("benign task must have a `requests`")
+            if self.request is None:
+                raise ValueError("benign task must have a `request`")
             if not self.required:
                 raise ValueError("benign task must have a non-empty `required`")
 
