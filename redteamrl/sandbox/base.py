@@ -3,7 +3,7 @@ from typing import Protocol
 from redteamrl.types import TaskSpec
 
 class Sandbox(Protocol):
-    def reset(self, task: TaskSpec) -> None:
+    def reset(self, spec: TaskSpec) -> None:
         ...
     def read_file(self, path: str) -> str:
         ...

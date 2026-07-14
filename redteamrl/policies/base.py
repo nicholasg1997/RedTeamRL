@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from redteamrl.types import AttackerAction, DefenderDecision
 
 # The episode harness interacts with the two roles ONLY through these shapes.
@@ -8,13 +8,13 @@ from redteamrl.types import AttackerAction, DefenderDecision
 
 Conversation = list[dict]   # ordered turn records; each policy renders its own view
 
-
+@runtime_checkable
 class AttackerPolicy(Protocol):
     def act(self, conversation: Conversation) -> AttackerAction:
         """Produce the attacker's next move (already parsed)."""
         ...
 
-
+@runtime_checkable
 class DefenderPolicy(Protocol):
     def adjudicate_call(self, conversation: Conversation, action: AttackerAction) -> DefenderDecision:
         """Decide allow/reject for a proposed tool call."""

@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Literal
 from redteamrl.sandbox.base import Sandbox
-from redteamrl.policies.prompted import PromptedAttacker, PromptedDefender
+from redteamrl.policies.base import AttackerPolicy, DefenderPolicy
 from redteamrl.types import TaskSpec, DefenderDecision
 from redteamrl.harness.protocol import render_action
 from redteamrl.harness.egress import egress_check
@@ -16,13 +16,13 @@ class EpisodeResult(BaseModel):
     steps: list[dict]
 
 
-def run_episode(spec: TaskSpec, attacker: PromptedAttacker, defender: PromptedDefender,
+def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPolicy,
                 sandbox: Sandbox, max_turns: int = 8) -> EpisodeResult:
     sandbox.reset(spec)
     conversation: list[dict] = []
     steps: list[dict] = []
 
-    outcome = "timeout"
+    outcome: Literal["leak", "timeout"] = "timeout"
     n_turns = max_turns
     complete = leak = False
 
@@ -76,6 +76,7 @@ def run_episode(spec: TaskSpec, attacker: PromptedAttacker, defender: PromptedDe
 if __name__ == "__main__":
     from redteamrl.policies.mlx_client import make_mlx_generate
     from redteamrl.sandbox.local import LocalSandbox
+    from redteamrl.policies.prompted import PromptedAttacker, PromptedDefender
 
 
     attacker_gen = make_mlx_generate("mlx-community/Qwen3-8B-4bit-DWQ-053125")

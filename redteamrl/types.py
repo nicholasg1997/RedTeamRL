@@ -48,7 +48,7 @@ class TaskSpec(BaseModel):
                 raise ValueError("benign task must have a `request`")
             if not self.required:
                 raise ValueError("benign task must have a non-empty `required`")
-            if self.client_actions is None:
+            if not self.client_actions:
                 raise ValueError("benign task must have `client_actions` (the LLM defender drives)")
 
         # TODO: add check for mixed tasks
