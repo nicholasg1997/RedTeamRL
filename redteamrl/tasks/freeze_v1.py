@@ -3,6 +3,7 @@ from collections import defaultdict
 from redteamrl.tasks.schema import load_task_spec
 from redteamrl.sandbox.local import LocalSandbox
 from redteamrl.verify.task import verify_benign, verify_attack
+from tqdm import tqdm
 
 v1 = os.path.join(os.path.dirname(__file__), "..", "data", "tasks", "v1")
 GEN = "mlx-community/Qwen3-8B-4bit-DWQ-053125"
@@ -25,13 +26,13 @@ def main(probe: bool):
 		attacker_factory = lambda goal: PromptedAttacker(gen, goal)
 
 	scenarios = defaultdict(lambda: {"attack": None, "benign": [], "attack_leak_rate": None, "benign_gate": "pass"})
-	for spec in specs:
+	for spec in tqdm(specs):
 		stem = scenario_stem(spec.id)
 		if spec.episode_type == "attack":
 			scenarios[stem]['attack'] = spec.id
 			if probe:
 				r = verify_attack(spec, LocalSandbox(), attacker_factory(spec.goal), n_probe=5)
-				scenarios[stem]['attacker_leak_rate'] = r.leak_rate
+				scenarios[stem]['attack_leak_rate'] = r.leak_rate
 				assert r.ok, f"{spec.id}: attack not winnable by probe ({r.reason})"
 
 		else:
