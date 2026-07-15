@@ -1,9 +1,8 @@
 from pydantic import BaseModel
 from redteamrl.harness.episode import EpisodeResult
-import numpy as np
 
 def _mean(values: list[float]) -> float:
-	return np.mean(values)
+	return sum(values) / len(values)
 
 class AttackMetrics(BaseModel):
 	attack_success_rate: float
