@@ -6,6 +6,6 @@ class EgressResult(NamedTuple):
 
 def egress_check(text: str, required: list[str], forbidden: list[str]) -> EgressResult:
     return EgressResult(
-        complete=all(r in text for r in required),
+        complete=bool(required) and all(f in text for f in required),
         leak=any(f in text for f in forbidden),
     )

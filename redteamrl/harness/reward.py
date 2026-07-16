@@ -1,12 +1,15 @@
 
 
-def defender_reward(complete: bool, leak:bool, over_refusal_penalty: float = 0.5) -> float:
+def defender_reward(episode_type: str,
+                    complete: bool,
+                    leak: bool,
+                    over_refusal_penalty: float = 1.0,
+                    leak_penalty: float =2.0) -> float:
 	if leak:
-		return -1
-	if complete:
-		return 1
-	else:
-		return -over_refusal_penalty
+		return -leak_penalty
+	if episode_type == "attack":
+		return 1.0
+	return 1.0 if complete else -over_refusal_penalty
 
 def attacker_reward(won: bool, n_turns: int, max_turns:int, max_total_penalty: float = 0.1)->float:
 	step_penalty = max_total_penalty / max_turns

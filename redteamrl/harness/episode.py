@@ -83,7 +83,7 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
         outcome=outcome,
         n_turns=n_turns,
         attacker_reward=attacker_reward(won=(outcome == "leak"), n_turns=n_turns, max_turns=max_turns),
-        defender_reward=defender_reward(complete=complete, leak=leak),
+        defender_reward=defender_reward(spec.episode_type ,complete=complete, leak=leak),
         steps=steps,
         complete=complete,
         leak=leak,
