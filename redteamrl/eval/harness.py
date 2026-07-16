@@ -3,6 +3,7 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Callable
 from pydantic import BaseModel
+from tqdm import tqdm
 
 from redteamrl.types import TaskSpec
 from redteamrl.policies.base import AttackerPolicy, DefenderPolicy
@@ -44,7 +45,7 @@ def run_eval(
 	benign: dict[str, list[EpisodeResult]] = defaultdict(list)
 	log_file = open(log_path, "w") if log_path else None
 	try:
-		for task in tasks:
+		for task in tqdm(tasks):
 			for run in range(n_rollouts):
 				if task.episode_type == "attack":
 					agent, turns = attacker_factory(task.goal), max_turns
