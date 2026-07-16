@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import defaultdict
 from typing import Callable
@@ -34,36 +36,50 @@ def run_eval(
 		tasks: list[TaskSpec],
 		attacker_factory: Callable[[str], AttackerPolicy],
 		defender: DefenderPolicy,
-		sandbox: Sandbox,
+		sandbox_factory: Callable[[], Sandbox],
 		n_rollouts: int = 5,
 		max_turns: int = 8,
 		log_path: str | Path | None = None,
 		attacker_id: str = "",
 		defender_id: str = "",
+		max_concurrency: int = 1,
 ) -> EvalReport:
+	work = [(task, rollout) for task in tasks for rollout in range(n_rollouts)]
+	log_file = open(log_path, "w") if log_path else None
+	log_lock = threading.Lock()
+
+	def run_one(item: tuple[TaskSpec, int]):
+		task, rollout = item
+		if task.episode_type == "attack":
+			agent, turns = attacker_factory(task.goal), max_turns
+		else:
+			agent, turns = ScriptedClient(task.client_actions), len(task.client_actions)
+		sandbox = sandbox_factory()
+		try:
+			result = run_episode(task, agent, defender, sandbox, max_turns=turns)
+		finally:
+			sandbox.close()
+		if log_file:
+			line = json.dumps({
+				"task_id": task.id, "episode_type": task.episode_type,
+				"rollout": rollout, "result": result.model_dump(),
+			})
+			with log_lock:
+				log_file.write(line + "\n")
+		return task.id, task.episode_type, result
+
 	attack: dict[str, list[EpisodeResult]] = defaultdict(list)
 	benign: dict[str, list[EpisodeResult]] = defaultdict(list)
-	log_file = open(log_path, "w") if log_path else None
 	try:
-		for task in tqdm(tasks):
-			for run in range(n_rollouts):
-				if task.episode_type == "attack":
-					agent, turns = attacker_factory(task.goal), max_turns
-				else:
-					agent, turns = ScriptedClient(task.client_actions), len(task.client_actions)
-				result = run_episode(task, agent, defender, sandbox, max_turns=turns)
-				if log_file:
-					log_file.write(json.dumps({
-						"task_id": task.id, "episode_type": task.episode_type,
-						"seed": run, "result": result.model_dump(),
-					}) + "\n")
-				(attack if task.episode_type == "attack" else benign)[task.id].append(result)
+		with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+			for tid, etype, result in tqdm(pool.map(run_one, work), total=len(work)):
+				(attack if etype == "attack" else benign)[tid].append(result)
 	finally:
 		if log_file:
 			log_file.close()
 
-	flat_attack = [r for rs in attack.values() for r in rs]
-	flat_benign = [r for rs in benign.values() for r in rs]
+	flat_attack = [r for results in attack.values() for r in results]
+	flat_benign = [r for results in benign.values() for r in results]
 
 	return EvalReport(
 		n_rollouts=n_rollouts, max_turns=max_turns, attacker_id=attacker_id, defender_id=defender_id,

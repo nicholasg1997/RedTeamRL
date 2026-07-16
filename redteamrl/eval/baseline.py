@@ -20,7 +20,7 @@ def main(n_rollouts: int = 5) -> None:
 		tasks=tasks,
 		attacker_factory=lambda goal: PromptedAttacker(generate=gen_atk, goal=goal),
 		defender=PromptedDefender(generate=gen_def),
-		sandbox=LocalSandbox(),
+		sandbox_factory=LocalSandbox,
 		n_rollouts=n_rollouts,
 		log_path=log_path,
 		attacker_id=ATTACKER_MODEL,
