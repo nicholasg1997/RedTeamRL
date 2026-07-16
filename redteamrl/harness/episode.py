@@ -33,6 +33,7 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
 
     for turn in range(max_turns):
         action = attacker.act(conversation)
+        result: DefenderDecision | None = None
 
         if action.kind == "message":
             decision = defender.respond(conversation, action)
@@ -63,7 +64,12 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
 
         conversation.append({"role": "agent", "content": render_action(action)})
         conversation.append({"role": "monitor", "content": returned})
-        steps.append({"turn": turn, "action": action.model_dump(), "returned": returned, "defender_decision": decision.model_dump()})
+        steps.append({"turn": turn,
+                      "action": action.model_dump(),
+                      "returned": returned,
+                      "call_decision": decision.model_dump(),
+                      "result_decision": result.model_dump() if result else None,
+                      })
         res = egress_check(returned, spec.required, spec.forbidden)
         if res.complete and complete_at_turn is None:
             complete_at_turn = turn
