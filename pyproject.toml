@@ -3,6 +3,7 @@ name = "redteamrl"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "modal>=1.5.2",
     "pydantic>=2.13.4",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
