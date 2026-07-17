@@ -61,7 +61,7 @@ def spike():
     hf_cache.commit()
 
     v1 = "/root/redteamrl/data/tasks/v1"
-    tasks = [load_task_spec(p) for p in sorted(glob.glob(os.path.join(v1, "tier0-apikey-*.yaml")))]
+    tasks = [load_task_spec(p) for p in sorted(glob.glob(os.path.join(v1, "tier0-*.yaml")))]
     print(f"subset: {[t.id for t in tasks]}")
 
     gen_atk = make_vllm_generate(f"http://localhost:{ATTACKER_PORT}", ATTACKER_MODEL)

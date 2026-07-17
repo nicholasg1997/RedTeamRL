@@ -59,3 +59,4 @@ class DefenderDecision(BaseModel):
     reasoning: str
     verdict: Literal["allow", "reject", "pass", "redact", "respond"]
     content: str | None = None
+    remove: list[str] | None = None
