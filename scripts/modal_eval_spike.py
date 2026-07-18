@@ -8,7 +8,7 @@ import modal
 n_rollouts: int = 10
 
 ATTACKER_MODEL = "Qwen/Qwen3-8B"
-DEFENDER_MODEL = "Qwen/Qwen3-4B"
+DEFENDER_MODEL = "Qwen/Qwen3-1.7B"
 ATTACKER_PORT, DEFENDER_PORT = 8000, 8001
 
 image = (
