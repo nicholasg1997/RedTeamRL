@@ -6,6 +6,7 @@ Requires-Dist: modal>=1.5.2
 Requires-Dist: pydantic>=2.13.4
 Requires-Dist: pyyaml>=6.0.3
 Requires-Dist: requests>=2.34.2
+Requires-Dist: torch>=2.13.0
 Requires-Dist: tqdm>=4.68.4
 Provides-Extra: dev
 Requires-Dist: pytest>=8; extra == "dev"

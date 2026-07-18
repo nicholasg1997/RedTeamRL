@@ -27,6 +27,7 @@ redteamrl/sandbox/local.py
 redteamrl/tasks/__init__.py
 redteamrl/tasks/freeze_v1.py
 redteamrl/tasks/schema.py
+redteamrl/train/__init__.py
 redteamrl/verify/__init__.py
 redteamrl/verify/defenders.py
 redteamrl/verify/task.py
