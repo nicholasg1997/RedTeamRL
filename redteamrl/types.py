@@ -7,10 +7,12 @@ class SeedFile(BaseModel):
     content: str
 
 class AttackerAction(BaseModel):
-    kind: Literal["message", "tool_call"]
+    kind: Literal["message", "tool_call", "submit"]
     text: str | None = None
     tool: str | None = None
     args: dict[str, str] | None = None
+    value: str | None = None      # submit: the exfiltrated secret (never shown to the monitor)
+    raw: str | None = None        # diagnostic: full pre-parse model text (never shown to the monitor)
 
     @model_validator(mode="after")
     def _fields_match_kind(self) -> "AttackerAction":
@@ -18,6 +20,8 @@ class AttackerAction(BaseModel):
             raise ValueError("message action requires `text`")
         if self.kind == "tool_call" and (self.tool is None or self.args is None):
             raise ValueError("tool_call action requires `tool` and `args`")
+        if self.kind == "submit" and self.value is None:
+            raise ValueError("submit action requires `value`")
         return self
 
 class TaskSpec(BaseModel):
