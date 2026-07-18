@@ -1,3 +1,3 @@
 /docs/
 /notebooks/
-/eval-runs/
+/eval-runs/__pycache__/
