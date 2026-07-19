@@ -6,8 +6,8 @@ import modal
 
 DEFENDER_MODEL = "Qwen/Qwen3-1.7B"
 ATTACKER_MODEL = "Qwen/Qwen3-8B"
-N_ROLLOUTS = 2 #8
-N_ITERS = 1 #40
+N_ROLLOUTS = 4 #8
+N_ITERS = 15 #40
 LR = 1e-5
 TEMP = 0.7
 
@@ -23,7 +23,7 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-defender-grpo", image=image)
 
 
-@app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
+@app.function(gpu="A10", timeout=24 * 60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train():
     import glob, os, sys, torch
@@ -50,23 +50,28 @@ def train():
     def defender_factory():
         return PromptedDefender(generate=cap)          # defender uses the capturing generate
 
-    # frozen attacker on HF (build an HF generate; see Task 7 note). For benign tasks it is unused.
-    atk_tok = AutoTokenizer.from_pretrained(ATTACKER_MODEL)
-    atk_model = AutoModelForCausalLM.from_pretrained(ATTACKER_MODEL, torch_dtype=torch.bfloat16, device_map="cuda")
-    def hf_attacker_generate(system, messages):
-        chat = [{"role": "system", "content": system}, *messages]
-        ids = atk_tok.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt").to("cuda")
-        with torch.no_grad():
-            out = atk_model.generate(ids, attention_mask=torch.ones_like(ids),
-                                     do_sample=True, temperature=0.7, max_new_tokens=512)
-        return atk_tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
-    def attacker_factory(goal):
-        return PromptedAttacker(generate=hf_attacker_generate, goal=goal)
-
     v1 = "/root/redteamrl/data/tasks/v1"
-    all_tasks = [load_task_spec(p) for p in sorted(glob.glob(os.path.join(v1, "tier0-adminpass-*.yaml")))]
+    all_tasks = [load_task_spec(p) for p in sorted(glob.glob(os.path.join(v1, "tier0-*-benign-*.yaml")))]
     train_tasks, held_tasks = split_tasks(all_tasks)
     print(f"train scenarios: {sorted({scenario_of(t.id) for t in train_tasks})}  held-out: {sorted(HELD_OUT)}")
+
+    needs_attacker = any(t.episode_type == "attack" for t in all_tasks)
+    if needs_attacker:
+        atk_tok = AutoTokenizer.from_pretrained(ATTACKER_MODEL)
+        atk_model = AutoModelForCausalLM.from_pretrained(ATTACKER_MODEL, torch_dtype=torch.bfloat16, device_map="cuda")
+
+        def hf_attacker_generate(system, messages):
+            chat = [{"role": "system", "content": system}, *messages]
+            ids = atk_tok.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt").to("cuda")
+            with torch.no_grad():
+                out = atk_model.generate(ids, attention_mask=torch.ones_like(ids),
+                                         do_sample=True, temperature=0.7, max_new_tokens=256)
+            return atk_tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+
+        def attacker_factory(goal):
+            return PromptedAttacker(generate=hf_attacker_generate, goal=goal)
+    else:
+        attacker_factory = None
 
     for it in range(N_ITERS):
         cap.buffer.clear()
@@ -74,6 +79,14 @@ def train():
         examples = rollout(train_tasks, attacker_factory, defender_factory,
                            LocalSandbox, cap, n_rollouts=N_ROLLOUTS)
         assign_advantages(examples)
+
+        from collections import defaultdict
+        task_rewards = defaultdict(dict)
+        for ex in examples:
+            task_rewards[ex.task_id][ex.episode_id] = ex.reward
+        for tid, ep_r in sorted(task_rewards.items()):
+            print(f"  {tid}: rewards={list(ep_r.values())}")
+
         model.train()
         metrics = update_step(learner, examples)
 
