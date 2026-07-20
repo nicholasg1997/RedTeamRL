@@ -4,21 +4,23 @@ from redteamrl.train.capture import Example
 from redteamrl.train.grpo import group_advantages, example_loss
 
 
-def rollout(tasks, attacker_factory, defender_factory, sandbox_factory,
-            capturing_generate, n_rollouts: int) -> list[Example]:
+def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
+            sandbox_factory, capturing_generate, n_rollouts: int, max_turns: int = 12) -> list[Example]:
+	"""Run n_rollouts episodes per task; tag every captured DEFENDER Example with that episode's
+	defender_reward. The attack/benign agents are built per-spec by the caller's factories
+	(scripted, for the de-risk run) — so the ONLY live, captured model is the defender. Every bit
+	of within-group reward variance is therefore attributable to the defender's sampled decisions,
+	which is exactly the credit-assignment we want when training the defender."""
 	examples: list[Example] = []
 	episode_id = 0
 	for spec in tasks:
 		for _ in range(n_rollouts):
 			start = len(capturing_generate.buffer)
-			if spec.episode_type == "attack":
-				agent, turns = attacker_factory(spec.goal), 8
-			else:
-				from redteamrl.policies.scripted import ScriptedClient
-				agent, turns = ScriptedClient(spec.client_actions), len(spec.client_actions)
+			factory = attack_agent_factory if spec.episode_type == "attack" else benign_agent_factory
+			agent = factory(spec)
 			sandbox = sandbox_factory()
 			try:
-				result = run_episode(spec, agent, defender_factory(), sandbox, max_turns=turns)
+				result = run_episode(spec, agent, defender_factory(), sandbox, max_turns=max_turns)
 			finally:
 				sandbox.close()
 

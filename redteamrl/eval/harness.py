@@ -43,6 +43,7 @@ def run_eval(
 		attacker_id: str = "",
 		defender_id: str = "",
 		max_concurrency: int = 1,
+		benign_agent_factory: Callable[[str], AttackerPolicy] | None = None,
 ) -> EvalReport:
 	work = [(task, rollout) for task in tasks for rollout in range(n_rollouts)]
 	log_file = open(log_path, "w") if log_path else None
@@ -52,6 +53,8 @@ def run_eval(
 		task, rollout = item
 		if task.episode_type == "attack":
 			agent, turns = attacker_factory(task.goal, task.request), max_turns
+		elif benign_agent_factory is not None:
+			agent, turns = benign_agent_factory(task.request), max_turns
 		else:
 			agent, turns = ScriptedClient(task.client_actions), len(task.client_actions)
 		sandbox = sandbox_factory()
