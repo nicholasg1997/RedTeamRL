@@ -44,8 +44,6 @@ def test_built_benign_tasks_pass_the_verifier():
         assert r.ok, f"{t.id}: {r.reason}"
 
 
-
-
 def test_attack_cover_becomes_request_goal_stays_hidden():
     from redteamrl.envs import build_tasks
     from redteamrl.envs.billing import BILLING
