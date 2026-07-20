@@ -51,7 +51,7 @@ def run_eval(
 	def run_one(item: tuple[TaskSpec, int]):
 		task, rollout = item
 		if task.episode_type == "attack":
-			agent, turns = attacker_factory(task.goal), max_turns
+			agent, turns = attacker_factory(task.goal, task.request), max_turns
 		else:
 			agent, turns = ScriptedClient(task.client_actions), len(task.client_actions)
 		sandbox = sandbox_factory()

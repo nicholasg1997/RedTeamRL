@@ -18,7 +18,7 @@ def _benign():
                     seed_files=SEED, client_actions=[READ])
 
 # stand-in "attacker": a scripted reader (ignores goal). Satisfies AttackerPolicy.
-FACTORY = lambda goal: ScriptedClient([READ])
+FACTORY = lambda goal, cover=None: ScriptedClient([READ])
 
 class _RejectAll:
     def adjudicate_call(self, c, a): return DefenderDecision(reasoning="no", verdict="reject", content=None)

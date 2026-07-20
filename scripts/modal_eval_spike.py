@@ -76,7 +76,7 @@ def spike():
     t0 = time.time()
     report = run_eval(
         tasks=tasks,
-        attacker_factory=lambda goal: PromptedAttacker(generate=gen_atk, goal=goal),
+        attacker_factory=lambda goal, cover=None: PromptedAttacker(generate=gen_atk, goal=goal),
         defender=PromptedDefender(generate=gen_def),
         sandbox_factory=LocalSandbox,
         n_rollouts=n_rollouts,
