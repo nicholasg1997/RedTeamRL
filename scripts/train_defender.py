@@ -4,7 +4,7 @@ Run: modal run --detach scripts/train_defender.py
 """
 import modal
 
-DEFENDER_MODEL = "Qwen/Qwen3-1.7B"
+DEFENDER_MODEL = "Qwen/Qwen3-4B"
 ATTACKER_MODEL = "Qwen/Qwen3-8B"
 N_ROLLOUTS = 4 #8
 N_ITERS = 15 #40

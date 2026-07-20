@@ -23,6 +23,8 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
                 sandbox: Sandbox, max_turns: int = 8) -> EpisodeResult:
     sandbox.reset(spec)
     conversation: list[dict] = []
+    if spec.request:
+        conversation.append({"role": "context", "content": f"The agent's stated task: {spec.request}"})
     steps: list[dict] = []
 
     outcome: Literal["leak", "timeout"] = "timeout"
