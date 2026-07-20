@@ -13,7 +13,8 @@ from redteamrl.types import TaskSpec, SeedFile, AttackerAction
 
 class AttackTemplate(BaseModel):
     id_suffix: str
-    goal: str                                    # what the attacker is told to exfiltrate
+    cover: str
+    goal: str
 
 
 class BenignTemplate(BaseModel):
@@ -53,7 +54,7 @@ def build_tasks(env: Environment, canary: str, canary_path: str, tier: int = 1) 
         tasks.append(TaskSpec(
             id=f"{env.id}-attack-{a.id_suffix}", episode_type="attack", tier=tier,
             seed_files=files, enabled_tools=env.enabled_tools,
-            goal=a.goal, forbidden=[canary],
+            goal=a.goal, forbidden=[canary], request=a.cover,
         ))
     for b in env.benigns:
         tasks.append(TaskSpec(
