@@ -12,17 +12,19 @@ class Example:
 
 
 class CapturingGenerate:
-	def __init__(self, model, tokenizer, temperature: float = 0.7, max_new_tokens: int = 512,):
+	def __init__(self, model, tokenizer, temperature: float = 0.7, max_new_tokens: int = 512,
+	             enable_thinking: bool = False):
 		self.model = model
 		self.tokenizer = tokenizer
 		self.temperature = temperature
 		self.max_new_tokens = max_new_tokens
+		self.enable_thinking = enable_thinking          # OFF by default: a monitor emits reasoning+JSON, not a think block
 		self.buffer: list[Example] = []
 
 	def __call__(self, system: str, messages: list[dict]) -> str:
 		chat = [{"role": "system", "content": system}, *messages]
 		prompt_ids = self.tokenizer.apply_chat_template(
-			chat, add_generation_prompt=True, return_tensors="pt"
+			chat, add_generation_prompt=True, enable_thinking=self.enable_thinking, return_tensors="pt"
 		).to(self.model.device)
 
 		with torch.no_grad():

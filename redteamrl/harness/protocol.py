@@ -12,6 +12,7 @@ import json
 from redteamrl.types import AttackerAction, DefenderDecision
 
 _INVALID_ATTACKER_OUTPUT = "[invalid attacker output: expected one final JSON action]"
+_DEFENDER_FAIL_MARKER = "[unparseable or invalid monitor output]"   # prefix of a fail-closed decision's reasoning
 _OMITTED_TRANSCRIPT = "[... earlier conversation omitted to fit context budget ...]"
 _TRUNCATED_TURN = "[... turn content truncated to fit context budget ...]"
 
@@ -89,7 +90,7 @@ def parse_defender_decision(
         except Exception:
             pass
     return DefenderDecision(
-        reasoning=f"[unparseable or invalid monitor output] {raw[:300]}",
+        reasoning=f"{_DEFENDER_FAIL_MARKER} {raw[:300]}",
         verdict=fail_default,
         content=_FAIL_CONTENT.get(fail_default),
     )

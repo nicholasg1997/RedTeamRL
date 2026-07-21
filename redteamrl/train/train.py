@@ -2,6 +2,25 @@ import torch
 from redteamrl.harness.episode import run_episode
 from redteamrl.train.capture import Example
 from redteamrl.train.grpo import group_advantages, example_loss
+from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT, _DEFENDER_FAIL_MARKER
+
+
+def _tally_invalid(diag: dict, episode_type: str, result) -> None:
+	"""Tally invalid-JSON outputs so a run is diagnosable without guessing WHICH side failed to
+	emit a parseable action: the defender (fail-closed -> deny corner), the attacker, or the honest
+	benign agent. Also records episode length (an env/dynamics signal)."""
+	diag["turns"].append(result.n_turns)
+	act, inv = ("atk_act", "atk_inv") if episode_type == "attack" else ("ben_act", "ben_inv")
+	for s in result.steps:
+		diag[act] += 1
+		a = s["action"]
+		if a.get("kind") == "message" and a.get("text") == _INVALID_ATTACKER_OUTPUT:
+			diag[inv] += 1
+		for d in (s.get("call_decision"), s.get("result_decision")):
+			if d:
+				diag["def_dec"] += 1
+				if str(d.get("reasoning", "")).startswith(_DEFENDER_FAIL_MARKER):
+					diag["def_fail"] += 1
 
 
 def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
@@ -15,6 +34,7 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 	episode_id = 0
 	for ti, spec in enumerate(tasks):
 		task_rewards = []
+		td = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0, "turns": []}
 		for _ in range(n_rollouts):
 			start = len(capturing_generate.buffer)
 			factory = attack_agent_factory if spec.episode_type == "attack" else benign_agent_factory
@@ -29,11 +49,16 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 				ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, result.defender_reward
 			examples.extend(capturing_generate.buffer[start:])
 			task_rewards.append(result.defender_reward)
+			_tally_invalid(td, spec.episode_type, result)
 			episode_id += 1
 		
-		# per-task rewards expose group variance EARLY: all-identical = dead group (no gradient),
-		# mixed = live. You see liveness within one task, not at the end of the round.
-		print(f"    [rollout] {ti + 1}/{len(tasks)} {spec.id}: rewards={task_rewards}", flush=True)
+		# per task: rewards (all-identical = dead group; mixed = live) + WHERE invalid JSON came
+		# from (agent truncating vs defender fail-closing) + avg episode length — no guessing.
+		agent_inv, agent_acts = td["atk_inv"] + td["ben_inv"], td["atk_act"] + td["ben_act"]
+		avg_turns = sum(td["turns"]) / max(len(td["turns"]), 1)
+		print(f"    [rollout] {ti + 1}/{len(tasks)} {spec.id}: rewards={task_rewards}  "
+		      f"invalid[agent {agent_inv}/{agent_acts}, defender {td['def_fail']}/{td['def_dec']}]  "
+		      f"avg_turns={avg_turns:.1f}", flush=True)
 	return examples
 
 def assign_advantages(examples: list[Example]) -> None:

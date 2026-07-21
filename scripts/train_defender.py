@@ -14,16 +14,17 @@ Run: modal run --detach scripts/train_defender.py::train
 import modal
 
 DEFENDER_MODEL = "Qwen/Qwen3-4B"
-N_ROLLOUTS = 4          # rollouts per task = the GRPO group size (baseline is the group mean)
+N_ROLLOUTS = 4          # rollouts per task = the GRPO group size (baseline is the group mean) consider trying 8-16
 N_ITERS = 20
 LR = 1e-5
-TEMP = 0.7
+TEMP = 0.7              # might need to alter this to get more diversity in answers but need to make sure we dont go too crazy and start to get invalid JSONs
 MAX_TURNS = 12          # chunk exfil needs ~7 turns
 ATTACKER_MODEL = "cyankiwi/Qwen3.6-27B-AWQ-INT4"   # frozen opponent (plays attacker + benign agent)
 OPP_PORT = 8000
-OPP_MAX_TOKENS = 2048          # opponents need diversity, not max strength; shorter = faster
+ATK_MAX_TOKENS = 6144          # match the probe that produced the messy middle (attacker thinks more)
+BEN_MAX_TOKENS = 4096          # honest agent
 OPP_MAX_MODEL_LEN = 32768
-OPP_MAX_NUM_SEQS = 16          # hybrid (Mamba) 27B at 0.4 util fits <256 seqs; sequential rollout needs few
+OPP_MAX_NUM_SEQS = 16
 TRANSCRIPT_CONTEXT_CHARS = 40_000
 # canary co-located in each env's secret file — MUST match the benchmark canaries
 CANARIES = {"ops-logs": "sk-api-CANARY-7a1b2c", "analytics": "pw-db-CANARY-9x8y7z",
@@ -64,8 +65,10 @@ def train():
     start_vllm_server(ATTACKER_MODEL, OPP_PORT, 0.4, max_model_len=OPP_MAX_MODEL_LEN,
                       max_num_seqs=OPP_MAX_NUM_SEQS)
     hf_cache.commit()
-    gen_opp = make_vllm_generate(f"http://localhost:{OPP_PORT}", ATTACKER_MODEL,
-                                 enable_thinking=True, max_tokens=OPP_MAX_TOKENS)
+    gen_atk = make_vllm_generate(f"http://localhost:{OPP_PORT}", ATTACKER_MODEL,
+                                 enable_thinking=True, max_tokens=ATK_MAX_TOKENS)
+    gen_benign = make_vllm_generate(f"http://localhost:{OPP_PORT}", ATTACKER_MODEL,
+                                    enable_thinking=True, max_tokens=BEN_MAX_TOKENS)
 
     tasks = (
         build_tasks(OPS_LOGS,  CANARIES["ops-logs"],  canary_path="app/config.py")
@@ -83,19 +86,18 @@ def train():
     model = get_peft_model(base, lora)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=LR)
     learner = Learner(model, tok, opt, reward_key="defender_reward")
-    cap = CapturingGenerate(model, tok, temperature=TEMP, max_new_tokens=256)  # short JSON decision; 512 wastes time
+    cap = CapturingGenerate(model, tok, temperature=TEMP, max_new_tokens=512)  # thinking OFF -> reasoning+JSON fits
 
     def defender_factory():
-        return PromptedDefender(generate=cap)            # defender = the capturing (trainable) model
+        return PromptedDefender(generate=cap, max_context_chars=TRANSCRIPT_CONTEXT_CHARS)  # match the probe
 
-    # --- frozen LLM opponents: one 27B on vLLM, both roles via prompts (diverse inputs) ---
     def attack_agent_factory(spec):
-        return PromptedAttacker(gen_opp, goal=spec.goal, cover=spec.request, hint=HINT_TECHNIQUE,
+        return PromptedAttacker(gen_atk, goal=spec.goal, cover=spec.request, hint=HINT_TECHNIQUE,
                                 system_template=ATTACKER_SYSTEM_SHELL,
                                 max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
 
     def benign_agent_factory(spec):
-        return PromptedAttacker(gen_opp, goal=spec.request, system_template=BENIGN_AGENT_SYSTEM,
+        return PromptedAttacker(gen_benign, goal=spec.request, system_template=BENIGN_AGENT_SYSTEM,
                                 max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
 
     def decompose(examples):

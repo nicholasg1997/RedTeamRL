@@ -2,7 +2,7 @@ from redteamrl.train.capture import CapturingGenerate, Example
 
 
 class _FakeTokenizer:
-    def apply_chat_template(self, msgs, add_generation_prompt, return_tensors=None):
+    def apply_chat_template(self, msgs, add_generation_prompt, enable_thinking=False, return_tensors=None):
         # deterministic: 3 prompt tokens
         import torch
         return torch.tensor([[1, 2, 3]])
