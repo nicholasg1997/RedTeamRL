@@ -1,4 +1,4 @@
-import requests
+import subprocess, time, requests
 
 
 def _prompt_stats(system: str, messages: list[dict]) -> str:
@@ -50,3 +50,24 @@ def make_vllm_generate(
 		return resp.json()["choices"][0]["message"]["content"]
 
 	return generate
+
+
+def start_vllm_server(model: str, port: int, mem_frac: float, max_model_len: int = 8192,
+                      max_num_seqs: int | None = None, timeout_s: int = 1200, poll_s: int = 2) -> None:
+	"""Launch `vllm serve <model>` and block until its /health is 200. Shared by the eval probe
+	and the training harness. `max_num_seqs` caps concurrent sequences — needed for hybrid
+	(Mamba) models at low gpu_memory_utilization, where vLLM's default 256 can exceed the cache
+	blocks that fit. Raises if it never becomes healthy within timeout_s."""
+	cmd = ["vllm", "serve", model, "--port", str(port),
+	       "--gpu-memory-utilization", str(mem_frac), "--max-model-len", str(max_model_len)]
+	if max_num_seqs is not None:
+		cmd += ["--max-num-seqs", str(max_num_seqs)]
+	subprocess.Popen(cmd)
+	for _ in range(max(1, timeout_s // poll_s)):
+		try:
+			if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
+				return
+		except Exception:
+			pass
+		time.sleep(poll_s)
+	raise RuntimeError(f"vLLM for {model} on :{port} never became healthy in {timeout_s}s")

@@ -35,26 +35,12 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-shell-probe", image=image)
 
 
-def _start_vllm(model: str, port: int, mem_frac: float):
-    import subprocess, time, requests
-    subprocess.Popen(["vllm", "serve", model, "--port", str(port),
-                      "--gpu-memory-utilization", str(mem_frac), "--max-model-len", str(MAX_MODEL_LEN)])
-    for _ in range(600):
-        try:
-            if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(2)
-    raise RuntimeError(f"vLLM for {model} on :{port} never became healthy")
-
-
 @app.function(gpu="A100-80GB", timeout=60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def probe():
     import sys
     sys.path.insert(0, "/root")
-    from redteamrl.policies.vllm_client import make_vllm_generate
+    from redteamrl.policies.vllm_client import make_vllm_generate, start_vllm_server
     from redteamrl.policies.prompted import (
         PromptedAttacker, PromptedDefender, ATTACKER_SYSTEM_SHELL, HINT_TECHNIQUE, BENIGN_AGENT_SYSTEM,
     )
@@ -65,8 +51,8 @@ def probe():
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
 
-    _start_vllm(ATTACKER_MODEL, ATTACKER_PORT, 0.6)   # heavy: bigger model + thinking + 32k ctx
-    _start_vllm(DEFENDER_MODEL, DEFENDER_PORT, 0.3)    # light: 4B, short JSON decisions
+    start_vllm_server(ATTACKER_MODEL, ATTACKER_PORT, 0.6, max_model_len=MAX_MODEL_LEN)   # heavy: 27B + thinking
+    start_vllm_server(DEFENDER_MODEL, DEFENDER_PORT, 0.3, max_model_len=MAX_MODEL_LEN)   # light: 4B
     hf_cache.commit()
 
     tasks = (

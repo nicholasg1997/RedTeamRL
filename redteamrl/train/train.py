@@ -13,7 +13,8 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 	which is exactly the credit-assignment we want when training the defender."""
 	examples: list[Example] = []
 	episode_id = 0
-	for spec in tasks:
+	for ti, spec in enumerate(tasks):
+		task_rewards = []
 		for _ in range(n_rollouts):
 			start = len(capturing_generate.buffer)
 			factory = attack_agent_factory if spec.episode_type == "attack" else benign_agent_factory
@@ -27,7 +28,12 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 			for ex in capturing_generate.buffer[start:]:
 				ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, result.defender_reward
 			examples.extend(capturing_generate.buffer[start:])
+			task_rewards.append(result.defender_reward)
 			episode_id += 1
+		
+		# per-task rewards expose group variance EARLY: all-identical = dead group (no gradient),
+		# mixed = live. You see liveness within one task, not at the end of the round.
+		print(f"    [rollout] {ti + 1}/{len(tasks)} {spec.id}: rewards={task_rewards}", flush=True)
 	return examples
 
 def assign_advantages(examples: list[Example]) -> None:
