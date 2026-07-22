@@ -1,0 +1,47 @@
+from types import SimpleNamespace
+
+import torch
+
+from redteamrl.sft.sft_train import sft_step
+
+
+class _Tokenizer:
+    eos_token_id = 3
+
+    def apply_chat_template(self, chat, add_generation_prompt, enable_thinking):
+        return [1]
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [2]}
+
+
+class _LossModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.device = torch.device("cpu")
+
+    def forward(self, input_ids, attention_mask, labels):
+        return SimpleNamespace(loss=self.weight.square())
+
+
+_EXAMPLE = {"system": "sys", "prompt": "prompt", "target": "target"}
+
+
+def _one_step(batch):
+    model = _LossModel()
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    metrics = sft_step(model, _Tokenizer(), batch, opt, max_grad_norm=0)
+    return model.weight.item(), metrics
+
+
+def test_duplicate_examples_do_not_multiply_effective_learning_rate():
+    one_weight, _ = _one_step([_EXAMPLE])
+    repeated_weight, _ = _one_step([_EXAMPLE] * 8)
+    assert repeated_weight == one_weight
+
+
+def test_empty_batch_is_a_noop():
+    weight, metrics = _one_step([])
+    assert weight == 1.0
+    assert metrics == {"loss": 0.0, "n": 0}

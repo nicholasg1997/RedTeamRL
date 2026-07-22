@@ -1,4 +1,4 @@
-from redteamrl.harness.protocol import parse_defender_decision
+from redteamrl.harness.protocol import parse_defender_decision, _DEFENDER_FAIL_MARKER
 from redteamrl.sft.attribute import correct_verdict
 
 HINDSIGHT_TEMPLATE = """\
@@ -35,5 +35,9 @@ def rationalize(record: dict, generate) -> dict | None:
     prompt = build_authoring_prompt(record, correct)
     raw = generate(record['system'], [{'role': 'user', 'content': prompt}])
     decision = parse_defender_decision(raw, valid_verdicts=valid, fail_default=correct)
+    # parse_defender_decision fails CLOSED to fail_default (== correct here), which would sail through
+    # verdict_matches. Drop those: we only train on reasoning the model actually produced.
+    if decision.reasoning.startswith(_DEFENDER_FAIL_MARKER):
+        return None
     return {"reasoning": decision.reasoning, "verdict": decision.verdict,
             "content": decision.content, "remove": decision.remove}
