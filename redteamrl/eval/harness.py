@@ -17,6 +17,7 @@ from redteamrl.eval.metrics import AttackMetrics, BenignMetrics
 class EvalReport(BaseModel):
 	n_rollouts: int
 	max_turns: int
+	post_completion_turns: int | None = None
 	attacker_id: str
 	defender_id: str
 	overall_attack: AttackMetrics
@@ -29,7 +30,10 @@ class EvalReport(BaseModel):
 		return "\n".join([
 			f"Eval  attacker={self.attacker_id or '?'}  defender={self.defender_id or '?'}  n_rollouts={self.n_rollouts}",
 			f"  ATTACK  success={a.attack_success_rate:.1%}  defense={1 - a.attack_success_rate:.1%}  avg_steps_to_leak={a.avg_steps_to_leak}",
-			f"  BENIGN  completion={b.completion_rate:.1%}  over_refusal={b.over_refusal_rate:.1%}  benign_leak={b.benign_leak_rate:.1%}  avg_steps={b.avg_steps_to_completion}",
+			f"  BENIGN  completion={b.completion_rate:.1%}  over_refusal={b.over_refusal_rate:.1%}  "
+			f"benign_leak={b.benign_leak_rate:.1%}  pre={b.leak_before_completion_rate:.1%}  "
+			f"at={b.leak_at_completion_rate:.1%}  post={b.post_completion_leak_rate:.1%}  "
+			f"avg_steps={b.avg_steps_to_completion}",
 		])
 
 def run_eval(
@@ -48,6 +52,7 @@ def run_eval(
 		resume_dir: str | Path | None = None,
 		checkpoint_callback: Callable[[], None] | None = None,
 		checkpoint_every: int = 10,
+		post_completion_turns: int | None = None,
 ) -> EvalReport:
 	if max_concurrency < 1:
 		raise ValueError("max_concurrency must be at least 1")
@@ -79,11 +84,12 @@ def run_eval(
 				row = json.load(f)
 			if (
 				not isinstance(row, dict)
-				or row.get("schema_version") != 1
+				or row.get("schema_version") != 2
 				or row.get("work_index") != index
 				or row.get("base_task_id") != base_task.id
 				or row.get("episode_type") != base_task.episode_type
 				or row.get("rollout") != rollout
+				or row.get("post_completion_turns_config") != post_completion_turns
 			):
 				raise ValueError("checkpoint identity does not match the requested evaluation")
 			EpisodeResult.model_validate(row["result"])
@@ -114,16 +120,24 @@ def run_eval(
 			agent, turns = ScriptedClient(task.client_actions), len(task.client_actions)
 		sandbox = sandbox_factory()
 		try:
-			result = run_episode(task, agent, defender, sandbox, max_turns=turns)
+			result = run_episode(
+				task,
+				agent,
+				defender,
+				sandbox,
+				max_turns=turns,
+				post_completion_turns=post_completion_turns,
+			)
 		finally:
 			sandbox.close()
 		row = {
-			"schema_version": 1,
+			"schema_version": 2,
 			"work_index": index,
 			"base_task_id": base_task.id,
 			"task_id": task.id,
 			"episode_type": task.episode_type,
 			"rollout": rollout,
+			"post_completion_turns_config": post_completion_turns,
 			"result": result.model_dump(),
 		}
 		write_checkpoint(index, row)
@@ -144,19 +158,37 @@ def run_eval(
 		progress.set_description(f"eval (resumed {len(completed)})")
 	try:
 		with ThreadPoolExecutor(max_workers=max_concurrency) as pool:
-			for start in range(0, len(pending), checkpoint_every):
-				wave = pending[start:start + checkpoint_every]
-				futures = [pool.submit(run_one, item) for item in wave]
-				for future in as_completed(futures):
-					index, row = future.result()
-					completed[index] = row
-					progress.update(1)
-				if resume_path is not None and checkpoint_callback is not None:
+			# Keep the worker pool full independently of the persistence cadence. Each worker writes
+			# a unique checkpoint through an atomic rename, so committing every N completed episodes
+			# is safe even while other workers are still generating.
+			futures = [pool.submit(run_one, item) for item in pending]
+			since_commit = 0
+			for future in as_completed(futures):
+				index, row = future.result()
+				completed[index] = row
+				progress.update(1)
+				since_commit += 1
+				if (
+					resume_path is not None
+					and checkpoint_callback is not None
+					and since_commit >= checkpoint_every
+				):
 					checkpoint_callback()
+					since_commit = 0
 					print(
 						f"eval checkpoint: committed {len(completed)}/{len(work)} episodes",
 						flush=True,
 					)
+			if (
+				resume_path is not None
+				and checkpoint_callback is not None
+				and since_commit
+			):
+				checkpoint_callback()
+				print(
+					f"eval checkpoint: committed {len(completed)}/{len(work)} episodes",
+					flush=True,
+				)
 	finally:
 		progress.close()
 
@@ -186,7 +218,8 @@ def run_eval(
 	flat_benign = [r for results in benign.values() for r in results]
 
 	return EvalReport(
-		n_rollouts=n_rollouts, max_turns=max_turns, attacker_id=attacker_id, defender_id=defender_id,
+		n_rollouts=n_rollouts, max_turns=max_turns, post_completion_turns=post_completion_turns,
+		attacker_id=attacker_id, defender_id=defender_id,
 		overall_attack=AttackMetrics.from_results(flat_attack),
 		overall_benign=BenignMetrics.from_results(flat_benign),
 		attack_by_task={tid: AttackMetrics.from_results(rs) for tid, rs in attack.items()},

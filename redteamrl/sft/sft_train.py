@@ -22,6 +22,33 @@ def _pad_microbatch(tok, encoded, device):
 	return input_ids, labels, attention_mask
 
 
+def sft_loss(model, tok, examples: list[dict], microbatch_size: int = 2) -> float:
+	"""Teacher-forced target-token loss without updating weights."""
+	if not examples:
+		return 0.0
+	if microbatch_size <= 0:
+		raise ValueError("microbatch_size must be positive")
+	encoded = [encode_example(tok, ex) for ex in examples]
+	encoded.sort(key=lambda pair: len(pair[0]))
+	total_target_tokens = sum(sum(label != -100 for label in labels) for _, labels in encoded)
+	total_loss = 0.0
+	was_training = model.training
+	model.eval()
+	try:
+		with torch.inference_mode():
+			for start in range(0, len(encoded), microbatch_size):
+				microbatch = encoded[start:start + microbatch_size]
+				ii, ll, attention_mask = _pad_microbatch(tok, microbatch, model.device)
+				microbatch_target_tokens = int((ll != -100).sum().item())
+				loss = model(input_ids=ii, attention_mask=attention_mask, labels=ll).loss
+				if not torch.isfinite(loss):
+					raise FloatingPointError("non-finite SFT evaluation loss")
+				total_loss += loss.item() * microbatch_target_tokens
+	finally:
+		model.train(was_training)
+	return total_loss / total_target_tokens
+
+
 def sft_step(
 	model,
 	tok,
@@ -45,14 +72,18 @@ def sft_step(
 		ii, ll, attention_mask = _pad_microbatch(tok, microbatch, model.device)
 		microbatch_target_tokens = int((ll != -100).sum().item())
 		loss = model(input_ids=ii, attention_mask=attention_mask, labels=ll).loss
+		if not torch.isfinite(loss):
+			raise FloatingPointError("non-finite SFT training loss")
 		# Hugging Face returns a mean over supervised tokens. Weight each microbatch by its token
 		# count so accumulated gradients equal one token-mean loss over the full logical batch.
 		weight = microbatch_target_tokens / total_target_tokens
 		(loss * weight).backward()
 		total_loss += loss.item() * microbatch_target_tokens
 	if max_grad_norm > 0:
-		torch.nn.utils.clip_grad_norm_(
+		grad_norm = torch.nn.utils.clip_grad_norm_(
 			[p for p in model.parameters() if p.requires_grad], max_grad_norm
 		)
+		if not torch.isfinite(grad_norm):
+			raise FloatingPointError("non-finite SFT gradient norm")
 	opt.step()
 	return {"loss": total_loss / total_target_tokens, "n": len(batch)}

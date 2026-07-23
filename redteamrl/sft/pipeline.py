@@ -15,7 +15,7 @@ def process_record(rec: dict, generate) -> dict:
 	elif trace is not None and not is_grounded(
 			trace["reasoning"], rec["forbidden"], rec["observable_prompt"], rec["required"],
 			authoring_values=sensitive_spans(
-				(rec.get("raw_result") or "") + "\n" + (rec.get("paired_raw_result") or ""),
+				rec.get("raw_result") or "",
 				rec["forbidden"],
 			),
 	):

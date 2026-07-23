@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from redteamrl.sft.sft_train import sft_step
+from redteamrl.sft.sft_train import sft_loss, sft_step
 
 
 class _Tokenizer:
@@ -69,3 +69,13 @@ def test_invalid_microbatch_size_rejected():
         assert "positive" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_teacher_forced_loss_does_not_update_weights_and_restores_mode():
+    model = _LossModel()
+    model.train()
+    before = model.weight.item()
+    loss = sft_loss(model, _Tokenizer(), [_EXAMPLE] * 3, microbatch_size=2)
+    assert loss == 1.0
+    assert model.weight.item() == before
+    assert model.training is True

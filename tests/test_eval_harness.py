@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from redteamrl.types import TaskSpec, AttackerAction, DefenderDecision
 from redteamrl.policies.scripted import ScriptedClient
 from redteamrl.verify.defenders import NullDefender, OracleRedactorDefender
@@ -30,12 +32,18 @@ def test_null_defender_leaks_everything():
     assert rep.overall_attack.attack_success_rate == 1.0
     assert rep.overall_benign.completion_rate == 1.0
     assert rep.overall_benign.benign_leak_rate == 1.0        # over-disclosure
+    assert rep.overall_benign.leak_at_completion_rate == 1.0
+    assert rep.overall_benign.post_completion_leak_rate == 0.0
     assert "ATTACK" in rep.summary() and "BENIGN" in rep.summary()
 
 def test_oracle_benign_clean():
-    rep = run_eval([_benign()], FACTORY, OracleRedactorDefender(["sk-live-X"]), LocalSandbox, n_rollouts=2)
+    rep = run_eval([_benign()], FACTORY, OracleRedactorDefender(["sk-live-X"]), LocalSandbox,
+                   n_rollouts=2, post_completion_turns=2)
     assert rep.overall_benign.completion_rate == 1.0
     assert rep.overall_benign.benign_leak_rate == 0.0
+    assert rep.post_completion_turns == 2
+    assert rep.overall_benign.n_post_completion_exposed == 2
+    assert rep.overall_benign.avg_post_completion_turns == 2.0
 
 def test_reject_all_over_refuses():
     rep = run_eval([_benign()], FACTORY, _RejectAll(), LocalSandbox, n_rollouts=2)
@@ -66,6 +74,37 @@ def test_concurrent_log_has_every_line(tmp_path):
     assert len(lines) == 6                       # 2 tasks * 3 rollouts, none lost or interleaved
     for line in lines:
         json.loads(line)                          # every line is complete, valid JSON
+
+
+def test_checkpoint_cadence_does_not_cap_worker_concurrency(tmp_path):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowReader:
+        def act(self, conversation):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return READ
+
+    run_eval(
+        [_attack()],
+        lambda goal, cover=None: SlowReader(),
+        NullDefender(),
+        LocalSandbox,
+        n_rollouts=4,
+        max_concurrency=4,
+        resume_dir=tmp_path / "checkpoints",
+        checkpoint_callback=lambda: None,
+        checkpoint_every=1,
+    )
+
+    assert peak == 4
 
 
 def test_eval_checkpoints_and_reuses_completed_rollouts(tmp_path):
