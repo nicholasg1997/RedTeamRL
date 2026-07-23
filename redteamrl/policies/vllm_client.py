@@ -53,7 +53,7 @@ def make_vllm_generate(
 
 
 def start_vllm_server(model: str, port: int, mem_frac: float, max_model_len: int = 8192,
-                      max_num_seqs: int | None = None, timeout_s: int = 1200, poll_s: int = 2) -> None:
+                      max_num_seqs: int | None = None, timeout_s: int = 1200, poll_s: int = 2) -> subprocess.Popen:
 	"""Launch `vllm serve <model>` and block until its /health is 200. Shared by the eval probe
 	and the training harness. `max_num_seqs` caps concurrent sequences — needed for hybrid
 	(Mamba) models at low gpu_memory_utilization, where vLLM's default 256 can exceed the cache
@@ -62,12 +62,25 @@ def start_vllm_server(model: str, port: int, mem_frac: float, max_model_len: int
 	       "--gpu-memory-utilization", str(mem_frac), "--max-model-len", str(max_model_len)]
 	if max_num_seqs is not None:
 		cmd += ["--max-num-seqs", str(max_num_seqs)]
-	subprocess.Popen(cmd)
+	proc = subprocess.Popen(cmd)
 	for _ in range(max(1, timeout_s // poll_s)):
 		try:
 			if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
-				return
+				return proc
 		except Exception:
 			pass
 		time.sleep(poll_s)
+	stop_vllm_server(proc)
 	raise RuntimeError(f"vLLM for {model} on :{port} never became healthy in {timeout_s}s")
+
+
+def stop_vllm_server(proc: subprocess.Popen | None, timeout_s: int = 60) -> None:
+	"""Release a vLLM process and its GPU allocation, with a bounded graceful shutdown."""
+	if proc is None or proc.poll() is not None:
+		return
+	proc.terminate()
+	try:
+		proc.wait(timeout=timeout_s)
+	except subprocess.TimeoutExpired:
+		proc.kill()
+		proc.wait()

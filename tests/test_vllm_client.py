@@ -1,6 +1,8 @@
+import subprocess
+
 import pytest
 from unittest.mock import patch, MagicMock
-from redteamrl.policies.vllm_client import make_vllm_generate, start_vllm_server
+from redteamrl.policies.vllm_client import make_vllm_generate, start_vllm_server, stop_vllm_server
 
 def test_builds_openai_payload_and_extracts_content():
     fake = MagicMock()
@@ -40,8 +42,36 @@ def test_start_vllm_server_returns_when_healthy():
 
 def test_start_vllm_server_raises_when_never_healthy():
     resp = MagicMock(); resp.status_code = 500
-    with patch("redteamrl.policies.vllm_client.subprocess.Popen"), \
+    proc = MagicMock(); proc.poll.return_value = None
+    with patch("redteamrl.policies.vllm_client.subprocess.Popen", return_value=proc), \
          patch("redteamrl.policies.vllm_client.requests.get", return_value=resp), \
          patch("redteamrl.policies.vllm_client.time.sleep"):
         with pytest.raises(RuntimeError, match="never became healthy"):
             start_vllm_server("Qwen/Q", 8000, 0.4, timeout_s=4)
+    proc.terminate.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=60)
+
+def test_start_vllm_server_returns_handle():
+    resp = MagicMock(); resp.status_code = 200
+    sentinel = MagicMock()
+    with patch("redteamrl.policies.vllm_client.subprocess.Popen", return_value=sentinel), \
+         patch("redteamrl.policies.vllm_client.requests.get", return_value=resp):
+        proc = start_vllm_server("Qwen/Q", 8000, 0.4)
+    assert proc is sentinel
+
+
+def test_stop_vllm_server_terminates_and_waits():
+    proc = MagicMock(); proc.poll.return_value = None
+    stop_vllm_server(proc, timeout_s=7)
+    proc.terminate.assert_called_once_with()
+    proc.wait.assert_called_once_with(timeout=7)
+    proc.kill.assert_not_called()
+
+
+def test_stop_vllm_server_kills_after_timeout():
+    proc = MagicMock(); proc.poll.return_value = None
+    proc.wait.side_effect = [subprocess.TimeoutExpired("vllm", 7), 0]
+    stop_vllm_server(proc, timeout_s=7)
+    proc.terminate.assert_called_once_with()
+    proc.kill.assert_called_once_with()
+    assert proc.wait.call_count == 2
