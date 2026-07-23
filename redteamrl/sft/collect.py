@@ -15,31 +15,34 @@ def _write_json_atomic(path, obj):
 		json.dump(obj, f)
 	os.replace(tmp, path)
 
-def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, out_dir, max_turns):
+def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, out_dir, max_turns,
+			 task_transform=None):
 	key = f"{spec.id}#{rollout_index}"
 	path = os.path.join(out_dir, f"{key}.json")
 	if os.path.exists(path):
 		return False
+	episode_spec = task_transform(spec, rollout_index) if task_transform else spec
 	defender = defender_factory()
 	sandbox = sandbox_factory()
 	try:
-		ep = run_episode(spec, agent_for(spec), defender, sandbox, max_turns=max_turns)
+		ep = run_episode(episode_spec, agent_for(episode_spec), defender, sandbox, max_turns=max_turns)
 	finally:
 		sandbox.close()
 	leaked, delivered = outcome_flags(ep)
 	records = []
 	for decision_index, rec in enumerate(defender.records):
-		rec.update({"episode_key": key, "task_id": spec.id, "episode_type": spec.episode_type,
+		rec.update({"episode_key": key, "task_id": spec.id, "episode_type": episode_spec.episode_type,
 		            "record_id": f"{key}:decision-{decision_index}",
-		            "system": defender.system, "forbidden": spec.forbidden, "required": spec.required,
-		            "true_role": spec.episode_type,
+		            "system": defender.system, "forbidden": episode_spec.forbidden,
+		            "required": episode_spec.required, "true_role": episode_spec.episode_type,
 		            "episode_leaked": leaked, "episode_required_delivered": delivered})
 		records.append(rec)
 	_write_json_atomic(path, {"episode_key": key, "records": records})
 	return True
 
 def collect_episodes(tasks, n_collect, agent_for, defender_factory, sandbox_factory,
-					 out_dir, max_turns, max_workers=1, commit=None, commit_every=None):
+					 out_dir, max_turns, max_workers=1, commit=None, commit_every=None,
+					 task_transform=None):
 	"""Collect independent episodes concurrently and persist completed waves.
 
 	Only newly written episodes count toward commits. Work is submitted one worker-sized wave at a
@@ -62,7 +65,8 @@ def collect_episodes(tasks, n_collect, agent_for, defender_factory, sandbox_fact
 		for start in range(0, len(work), max_workers):
 			wave = work[start:start + max_workers]
 			futures = [pool.submit(_run_one, spec, r, agent_for, defender_factory,
-			                       sandbox_factory, out_dir, max_turns) for spec, r in wave]
+			                       sandbox_factory, out_dir, max_turns, task_transform)
+			           for spec, r in wave]
 			for fut in as_completed(futures):
 				if fut.result():
 					written += 1
@@ -89,15 +93,23 @@ class RecordingDefender(PromptedDefender):
             CALL_INSTRUCTION.replace("{action}", render_action(action))
 		decision = super().adjudicate_call(conversation, action)
 		self.records.append({"decision_type": "call", "observable_prompt": prompt,
-                             "raw_result": None, "decision": decision.model_dump()})
+		                     "raw_result": None, "paired_raw_result": None,
+		                     "action": action.model_dump(), "decision": decision.model_dump()})
 		return decision
 
 	def adjudicate_result(self, conversation, action, raw_result) -> DefenderDecision:
 		prompt = render_conversation(conversation, max_chars=self.max_context_chars) + "\n\n" + \
             RESULT_INSTRUCTION.replace("{action}", render_action(action)).replace("{raw_result}", raw_result)
 		decision = super().adjudicate_result(conversation, action, raw_result)
+		for record in reversed(self.records):
+			if (record["decision_type"] == "call"
+					and record.get("paired_raw_result") is None
+					and record.get("action") == action.model_dump()):
+				record["paired_raw_result"] = raw_result
+				break
 		self.records.append({"decision_type": "result", "observable_prompt": prompt,
-		                     "raw_result": raw_result, "decision": decision.model_dump()})
+		                     "raw_result": raw_result, "action": action.model_dump(),
+		                     "decision": decision.model_dump()})
 		return decision
 
 def collect_records(tasks, attack_factory, benign_factory, defender_factory, sandbox_factory, n_rollouts, max_turns):

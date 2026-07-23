@@ -68,6 +68,96 @@ def test_concurrent_log_has_every_line(tmp_path):
         json.loads(line)                          # every line is complete, valid JSON
 
 
+def test_eval_checkpoints_and_reuses_completed_rollouts(tmp_path):
+    resume_dir = tmp_path / "checkpoints"
+    log = tmp_path / "run.jsonl"
+    commits = []
+    first = run_eval(
+        [_attack(), _benign()], FACTORY, NullDefender(), LocalSandbox,
+        n_rollouts=3, max_concurrency=2, log_path=log,
+        resume_dir=resume_dir, checkpoint_callback=lambda: commits.append("commit"),
+        checkpoint_every=2,
+    )
+    assert len(list(resume_dir.glob("*.json"))) == 6
+    assert len(commits) == 3
+
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("a completed rollout was run again")
+
+    second = run_eval(
+        [_attack(), _benign()], should_not_run, NullDefender(), should_not_run,
+        n_rollouts=3, max_concurrency=2, log_path=log,
+        benign_agent_factory=should_not_run,
+        resume_dir=resume_dir, checkpoint_callback=should_not_run,
+        checkpoint_every=2,
+    )
+    assert second == first
+    assert len(log.read_text().splitlines()) == 6
+
+
+def test_eval_resumes_only_missing_rollouts_and_commits_partial_final_wave(tmp_path):
+    resume_dir = tmp_path / "checkpoints"
+    run_eval(
+        [_attack()], FACTORY, NullDefender(), LocalSandbox,
+        n_rollouts=5, resume_dir=resume_dir, checkpoint_every=2,
+    )
+    (resume_dir / "000003.json").unlink()
+    (resume_dir / "000004.json").unlink()
+
+    calls = []
+
+    def counting_factory(goal, cover=None):
+        calls.append((goal, cover))
+        return ScriptedClient([READ])
+
+    commits = []
+    report = run_eval(
+        [_attack()], counting_factory, NullDefender(), LocalSandbox,
+        n_rollouts=5, resume_dir=resume_dir,
+        checkpoint_callback=lambda: commits.append("commit"), checkpoint_every=10,
+    )
+    assert len(calls) == 2
+    assert commits == ["commit"]
+    assert report.attack_by_task["atk"].n_runs == 5
+
+
+def test_eval_rejects_stale_checkpoint_identity(tmp_path):
+    resume_dir = tmp_path / "checkpoints"
+    run_eval([_attack()], FACTORY, NullDefender(), LocalSandbox,
+             n_rollouts=1, resume_dir=resume_dir)
+    row_path = resume_dir / "000000.json"
+    row = json.loads(row_path.read_text())
+    row["base_task_id"] = "different-task"
+    row_path.write_text(json.dumps(row))
+
+    try:
+        run_eval([_attack()], FACTORY, NullDefender(), LocalSandbox,
+                 n_rollouts=1, resume_dir=resume_dir)
+    except RuntimeError as exc:
+        assert "Invalid or stale evaluation checkpoint" in str(exc)
+    else:
+        raise AssertionError("stale checkpoint should have been rejected")
+
+
+def test_task_transform_receives_rollout_and_keeps_report_grouping(tmp_path):
+    log = tmp_path / "transformed.jsonl"
+
+    def transform(task, rollout):
+        old = task.forbidden[0]
+        new = f"sk-rollout-{rollout}"
+        files = [file.model_copy(update={"content": file.content.replace(old, new)})
+                 for file in task.seed_files]
+        return task.model_copy(update={"forbidden": [new], "seed_files": files})
+
+    report = run_eval([_attack()], FACTORY, NullDefender(), LocalSandbox, n_rollouts=3,
+                      log_path=str(log), task_transform=transform)
+    assert report.attack_by_task["atk"].n_runs == 3
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    for row in rows:
+        returned = row["result"]["steps"][0]["returned"]
+        assert f"sk-rollout-{row['rollout']}" in returned
+
+
 LIST = AttackerAction(kind="tool_call", tool="list_dir", args={"path": "."})
 
 def _benign_needs_read():

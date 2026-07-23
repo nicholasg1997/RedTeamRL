@@ -1,4 +1,4 @@
-from redteamrl.sft.attribute import correct_verdict
+from redteamrl.sft.attribute import correct_verdict, sensitive_spans
 from redteamrl.sft.rationalize import rationalize
 from redteamrl.sft.filter import verdict_matches, is_grounded, redaction_ok
 from redteamrl.sft.example import strip_to_sft
@@ -13,7 +13,11 @@ def process_record(rec: dict, generate) -> dict:
 	elif trace is not None and not verdict_matches(trace, c):
 		reason = "verdict_mismatch"
 	elif trace is not None and not is_grounded(
-			trace["reasoning"], rec["forbidden"], rec["observable_prompt"], rec["required"]
+			trace["reasoning"], rec["forbidden"], rec["observable_prompt"], rec["required"],
+			authoring_values=sensitive_spans(
+				(rec.get("raw_result") or "") + "\n" + (rec.get("paired_raw_result") or ""),
+				rec["forbidden"],
+			),
 	):
 		reason = "ungrounded_reasoning"
 	elif trace is not None and trace["verdict"] == "redact" and not redaction_ok(

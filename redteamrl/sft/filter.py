@@ -1,4 +1,4 @@
-
+from redteamrl.sft.attribute import MIN_SECRET_FRAGMENT_CHARS, sensitive_spans
 
 
 _PRIVILEGED_PHRASES = (
@@ -18,6 +18,7 @@ def is_grounded(
 	forbidden: list[str],
 	observable_prompt: str,
 	required: list[str] | None = None,
+	authoring_values: list[str] | None = None,
 ) -> bool:
 	low = reasoning.lower()
 	if any(p in low for p in _PRIVILEGED_PHRASES):
@@ -28,26 +29,38 @@ def is_grounded(
 	for value in [*forbidden, *(required or [])]:
 		if value in reasoning and value not in observable_prompt:
 			return False
+	# A rationalizer may leak only part of a hindsight-only fragment. Check all sufficiently long
+	# pieces, not just the maximal span supplied by the mechanical taint detector.
+	for value in authoring_values or []:
+		if value in observable_prompt:
+			continue
+		for start in range(len(value)):
+			for end in range(start + MIN_SECRET_FRAGMENT_CHARS, len(value) + 1):
+				piece = value[start:end]
+				if piece in reasoning and piece not in observable_prompt:
+					return False
 
 	return True
 
 def redaction_ok(remove: list[str], raw_result: str, forbidden: list[str], required: list[str]) -> bool:
 	"""A `redact` target is trainable only if it actually works. Reject it unless: `remove` is non-empty,
-	every removed substring is exactly a forbidden value from the raw result, removing them eliminates
-	every forbidden value, and no required value is swallowed. Guards against training on redactions that leak
-	or remove unrelated benign content."""
+	every removed substring is a mechanically-derived sensitive span in the raw result, removing them
+	eliminates every such span, and no required value is swallowed."""
 	if not remove:
 		return False
 	if any(s not in raw_result for s in remove):
 		return False
-	# The bootstrap knows the exact synthetic canaries. Requiring an exact match prevents a target
-	# from deleting a whole field, line, or document merely because that larger span contains one.
-	if any(s not in forbidden for s in remove):
+	allowed_spans = set(sensitive_spans(raw_result, forbidden))
+	if not allowed_spans:
+		return False
+	# Requiring exact maximal taint spans prevents deleting a whole line/document merely because it
+	# contains a sensitive fragment.
+	if any(s not in allowed_spans for s in remove):
 		return False
 	scrubbed = raw_result
 	for s in remove:
 		scrubbed = scrubbed.replace(s, "")
-	if any(f in scrubbed for f in forbidden):
+	if any(span in scrubbed for span in allowed_spans):
 		return False
 	# A required value can be satisfied by another turn. At this decision point we only know that
 	# redaction must preserve required values that were actually present in this raw result.
