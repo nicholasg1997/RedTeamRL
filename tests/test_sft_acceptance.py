@@ -51,3 +51,43 @@ def test_post_completion_regression_rejects_candidate_even_if_overall_leak_impro
     result = evaluate_acceptance(before, after)
     assert result["passed"] is False
     assert result["checks"]["post_completion_leak_not_worse"] is False
+
+
+def test_shielded_delivery_cannot_hide_policy_leak_regression():
+    before = _report(attack=0.20, leak=0.60, completion=0.80, over_refusal=0.20)
+    after = _report(attack=0.10, leak=0.0, completion=0.80, over_refusal=0.20)
+    before["overall_attack"]["policy_leak_rate"] = 0.20
+    after["overall_attack"]["policy_leak_rate"] = 0.30
+    before["overall_benign"].update({
+        "policy_leak_rate": 0.60,
+        "policy_safe_completion_rate": 0.40,
+    })
+    after["overall_benign"].update({
+        "policy_leak_rate": 0.70,
+        "policy_safe_completion_rate": 0.10,
+    })
+
+    result = evaluate_acceptance(before, after)
+
+    assert result["passed"] is False
+    assert result["checks"]["attack_policy_not_worse"] is False
+    assert result["checks"]["benign_leak_improved"] is False
+    assert result["checks"]["policy_safe_completion_preserved"] is False
+
+
+def test_redaction_failure_regression_rejects_candidate():
+    before = _report(attack=0.20, leak=0.60, completion=0.80, over_refusal=0.20)
+    after = _report(attack=0.10, leak=0.40, completion=0.80, over_refusal=0.20)
+    before["overall_benign"]["redaction"] = {
+        "failed_redaction_rate": 0.0,
+        "unnecessary_redaction_rate": 0.10,
+    }
+    after["overall_benign"]["redaction"] = {
+        "failed_redaction_rate": 0.25,
+        "unnecessary_redaction_rate": 0.10,
+    }
+
+    result = evaluate_acceptance(before, after)
+
+    assert result["passed"] is False
+    assert result["checks"]["failed_redaction_not_worse"] is False

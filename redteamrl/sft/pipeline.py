@@ -31,5 +31,10 @@ def process_record(rec: dict, generate) -> dict:
 			reason = "accepted"
 		except ValueError:
 			reason = "privileged_prompt"
-	return {"record_id": rec["record_id"], "accepted": example is not None,
-	        "reason": reason, "example": example}
+	return {
+		"record_id": rec["record_id"],
+		"target_verdict": c,
+		"accepted": example is not None,
+		"reason": reason,
+		"example": example,
+	}

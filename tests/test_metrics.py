@@ -2,12 +2,13 @@ from redteamrl.harness.episode import EpisodeResult
 from redteamrl.eval.metrics import AttackMetrics, BenignMetrics
 
 def _er(leak=False, complete=False, n_turns=3, complete_at_turn=None,
-        leak_phase=None, post_completion_turns=0):
+        leak_phase=None, post_completion_turns=0, **kwargs):
     return EpisodeResult(
         outcome="leak" if leak else "timeout", n_turns=n_turns,
         complete=complete, leak=leak, complete_at_turn=complete_at_turn,
         leak_phase=leak_phase, post_completion_turns=post_completion_turns,
         attacker_reward=0.0, defender_reward=0.0, steps=[],
+        **kwargs,
     )
 
 def test_attack_metrics():
@@ -63,3 +64,56 @@ def test_empty_results_do_not_crash():
     assert benign.n_runs == 0
     assert benign.conditional_post_completion_leak_rate is None
     assert benign.post_completion_leaks_per_100_turns is None
+
+
+def test_policy_leaks_and_redaction_failures_are_separate_from_delivery():
+    results = [
+        _er(
+            complete=False,
+            policy_leak=True,
+            policy_leak_at_turn=0,
+            failed_redactions=1,
+            redaction_attempts=1,
+            redaction_opportunities=1,
+            result_decisions=1,
+        ),
+        _er(
+            complete=True,
+            complete_at_turn=1,
+            effective_redactions=1,
+            redaction_attempts=1,
+            redaction_opportunities=1,
+            result_decisions=1,
+        ),
+        _er(
+            complete=True,
+            complete_at_turn=1,
+            unnecessary_redactions=1,
+            redaction_attempts=1,
+            result_decisions=1,
+        ),
+        _er(
+            leak=True,
+            complete=True,
+            complete_at_turn=1,
+            leak_phase="at_completion",
+            sensitive_result_passes=1,
+            redaction_opportunities=1,
+            result_decisions=1,
+        ),
+    ]
+
+    metrics = BenignMetrics.from_results(results)
+
+    assert metrics.benign_leak_rate == 1 / 4
+    assert metrics.policy_leak_rate == 2 / 4
+    assert metrics.shielded_policy_leak_rate == 1 / 4
+    assert metrics.policy_safe_completion_rate == 2 / 4
+    assert metrics.delivered_safe_completion_rate == 2 / 4
+    assert metrics.redaction.redaction_opportunities == 3
+    assert metrics.redaction.effective_redactions == 1
+    assert metrics.redaction.failed_redactions == 1
+    assert metrics.redaction.sensitive_result_passes == 1
+    assert metrics.redaction.failed_redaction_rate == 1 / 2
+    assert metrics.redaction.sensitive_result_pass_rate == 1 / 3
+    assert metrics.redaction.unnecessary_redaction_rate == 1 / 3

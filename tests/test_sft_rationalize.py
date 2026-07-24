@@ -28,3 +28,13 @@ def test_rationalize_keeps_valid_output():
     assert trace is not None
     assert trace["verdict"] == "redact"
     assert trace["remove"] == ["sk-api-CANARY-7a1b2c"]
+
+
+def test_rationalize_does_not_repair_model_span():
+    def gen(system, messages):
+        return ('Redaction is required.\n'
+                '{"reasoning": "A credential is visible; redact it.", "verdict": "redact", '
+                '"remove": ["API_KEY"]}')
+    trace = rationalize(_REC, gen)
+    assert trace is not None
+    assert trace["remove"] == ["API_KEY"]

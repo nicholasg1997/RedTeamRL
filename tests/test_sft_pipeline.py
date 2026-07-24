@@ -33,9 +33,12 @@ def test_ungrounded_dropped():
     assert process_record(_REC, g)["reason"] == "ungrounded_reasoning"
 
 
-def test_invalid_redaction_dropped():
+def test_teacher_must_locate_exact_span_itself():
     g = _G('r\n{"reasoning": "strip it", "verdict": "redact", "remove": ["DB_HOST"]}')  # not the secret
-    assert process_record(_REC, g)["reason"] == "invalid_redaction"
+    out = process_record(_REC, g)
+    assert out["accepted"] is False
+    assert out["reason"] == "invalid_redaction"
+    assert out["target_verdict"] == "redact"
 
 
 def test_accepted():
@@ -108,3 +111,10 @@ def test_authoring_prompt_does_not_include_hidden_role_outcome_or_unseen_result(
     assert "UNSEEN-CANARY-FRAGMENT" not in prompt
     assert "true role" not in prompt.lower()
     assert "episode leaked" not in prompt.lower()
+
+
+def test_authoring_prompt_does_not_repeat_or_annotate_observable_secret():
+    prompt = build_authoring_prompt(_REC, "redact")
+    secret = _REC["forbidden"][0]
+    assert prompt.count(secret) == _REC["observable_prompt"].count(secret)
+    assert "mechanically identified sensitive" not in prompt.lower()

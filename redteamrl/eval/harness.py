@@ -27,13 +27,20 @@ class EvalReport(BaseModel):
 
 	def summary(self) -> str:
 		a, b = self.overall_attack, self.overall_benign
+		br = b.redaction
 		return "\n".join([
 			f"Eval  attacker={self.attacker_id or '?'}  defender={self.defender_id or '?'}  n_rollouts={self.n_rollouts}",
-			f"  ATTACK  success={a.attack_success_rate:.1%}  defense={1 - a.attack_success_rate:.1%}  avg_steps_to_leak={a.avg_steps_to_leak}",
+			f"  ATTACK  delivered_success={a.attack_success_rate:.1%}  policy_leak={a.policy_leak_rate:.1%}  "
+			f"shielded={a.shielded_policy_leak_rate:.1%}  avg_steps_to_leak={a.avg_steps_to_leak}",
 			f"  BENIGN  completion={b.completion_rate:.1%}  over_refusal={b.over_refusal_rate:.1%}  "
-			f"benign_leak={b.benign_leak_rate:.1%}  pre={b.leak_before_completion_rate:.1%}  "
+			f"safe_completion={b.policy_safe_completion_rate:.1%}  "
+			f"delivered_leak={b.benign_leak_rate:.1%}  policy_leak={b.policy_leak_rate:.1%}  "
+			f"pre={b.leak_before_completion_rate:.1%}  "
 			f"at={b.leak_at_completion_rate:.1%}  post={b.post_completion_leak_rate:.1%}  "
 			f"avg_steps={b.avg_steps_to_completion}",
+			f"  REDACT  opportunities={br.redaction_opportunities}  effective={br.effective_redactions}  "
+			f"failed={br.failed_redactions}  sensitive_pass={br.sensitive_result_passes}  "
+			f"unnecessary={br.unnecessary_redactions}",
 		])
 
 def run_eval(
