@@ -20,9 +20,9 @@ _TRUNCATED_TURN = "[... turn content truncated to fit context budget ...]"
 def _extract_json(raw: str) -> dict | None:
     """Return the LAST top-level JSON object embedded in `raw`, or None.
 
-    Both the attacker and defender are prompted to reason in prose first and put
-    their action/decision JSON last, so when several objects appear (e.g. the
-    model shows a candidate mid-reasoning) we want the final one. On each decode
+    Attackers may reason in prose before their JSON, and legacy defender outputs may do the same,
+    so when several objects appear (e.g. the model shows a candidate mid-reasoning) we want the
+    final one. On each decode
     we jump the cursor past the consumed span, so nested braces (like an `args`
     object) are never mistaken for a top-level object.
     """

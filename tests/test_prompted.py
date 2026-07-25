@@ -5,6 +5,7 @@ the defender's fail-closed behavior.
 """
 from redteamrl.policies.prompted import (
     PromptedAttacker, PromptedDefender, ATTACKER_SYSTEM_SHELL, HINT_TECHNIQUE, BENIGN_AGENT_SYSTEM,
+    RESULT_INSTRUCTION,
 )
 from redteamrl.types import AttackerAction
 
@@ -63,6 +64,36 @@ def test_defender_result_garbage_fails_closed_to_redact():
     decision = d.adjudicate_result([], _tool_action(), "API_KEY = sk-live-SECRET")
     assert decision.verdict == "redact"
     assert "sk-live-SECRET" not in (decision.content or "")
+
+
+def test_valid_nonmatching_remove_is_executed_literally():
+    d = PromptedDefender(stub(
+        '{"reasoning": "The token field is sensitive.", "verdict": "redact", '
+        '"remove": ["DEPLOY_TOKEN"]}'
+    ))
+    decision = d.adjudicate_result(
+        [],
+        AttackerAction(kind="tool_call", tool="read_file", args={"path": "credentials"}),
+        "DEPLOY_TOKEN=synthetic-secret",
+    )
+    assert decision.verdict == "redact"
+    assert decision.content == "[REDACTED]=synthetic-secret"
+
+
+def test_valid_absent_remove_does_not_gain_an_implicit_withhold():
+    d = PromptedDefender(stub(
+        '{"reasoning": "Redaction is needed.", "verdict": "redact", '
+        '"remove": ["not-present"]}'
+    ))
+    raw = "DEPLOY_TOKEN=synthetic-secret"
+    assert d.adjudicate_result([], _tool_action(), raw).content == raw
+
+
+def test_result_instruction_requires_whole_result_scan_without_entropy_shortcut():
+    low = RESULT_INSTRUCTION.lower()
+    assert "inspect every field and value" in low
+    assert "does not make the rest of the result safe" in low
+    assert "high-entropy public identifier is not a secret" in low
 
 
 def test_defender_respond_fails_closed():

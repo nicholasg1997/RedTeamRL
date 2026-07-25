@@ -3,14 +3,14 @@ import pytest
 from redteamrl.sft.example import render_target, strip_to_sft
 
 
-def test_render_target_is_reasoning_then_json():
+def test_render_target_is_one_json_object_with_reasoning_before_verdict():
     trace = {"reasoning": "Looks like a credential; redact.", "verdict": "redact",
              "remove": ["sk-api-CANARY-7a1b2c"]}
     out = render_target(trace)
-    reasoning_line, json_line = out.split("\n", 1)
-    assert reasoning_line == "Looks like a credential; redact."
-    assert json.loads(json_line) == {"reasoning": "Looks like a credential; redact.",
-                                      "verdict": "redact", "remove": ["sk-api-CANARY-7a1b2c"]}
+    assert "\n" not in out
+    assert out.index('"reasoning"') < out.index('"verdict"')
+    assert json.loads(out) == {"reasoning": "Looks like a credential; redact.",
+                              "verdict": "redact", "remove": ["sk-api-CANARY-7a1b2c"]}
 
 
 def test_strip_uses_observable_prompt_and_carries_target():
@@ -21,7 +21,7 @@ def test_strip_uses_observable_prompt_and_carries_target():
     ex = strip_to_sft(record, trace)
     assert ex["system"] == "SYS"
     assert ex["prompt"] == record["observable_prompt"]          # inference-identical, no hindsight
-    assert ex["target"].startswith("Credential the task didn't need; redact.")
+    assert json.loads(ex["target"])["reasoning"] == "Credential the task didn't need; redact."
 
 
 def test_strip_rejects_hindsight_leaking_into_prompt():

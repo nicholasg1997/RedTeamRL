@@ -1,5 +1,7 @@
+from collections import Counter
+
 import torch
-from redteamrl.harness.episode import run_episode
+from redteamrl.harness.episode import RedactionEnforcement, run_episode
 from redteamrl.train.capture import Example
 from redteamrl.train.grpo import group_advantages, example_loss
 from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT, _DEFENDER_FAIL_MARKER
@@ -24,12 +26,19 @@ def _tally_invalid(diag: dict, episode_type: str, result) -> None:
 
 
 def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
-            sandbox_factory, capturing_generate, n_rollouts: int, max_turns: int = 12) -> list[Example]:
-	"""Run n_rollouts episodes per task; tag every captured DEFENDER Example with that episode's
-	defender_reward. The attack/benign agents are built per-spec by the caller's factories
-	(scripted, for the de-risk run) — so the ONLY live, captured model is the defender. Every bit
-	of within-group reward variance is therefore attributable to the defender's sampled decisions,
-	which is exactly the credit-assignment we want when training the defender."""
+            sandbox_factory, capturing_generate, n_rollouts: int, max_turns: int = 12,
+            redaction_enforcement: RedactionEnforcement = "unshielded",
+            trained_side: str = "defender") -> list[Example]:
+	"""Run n_rollouts episodes per task; tag every captured Example with that episode's reward for
+	the side being trained.
+
+	Exactly ONE side is live and captured per run — whichever `capturing_generate` was handed to.
+	`trained_side` selects which reward tags those examples, so the same loop serves the defender
+	phase and the attacker phase. Keeping the opponent frozen is what makes within-group reward
+	variance attributable to the trained model; turning both sides live before the loop is proven
+	makes a dead group undiagnosable."""
+	if trained_side not in {"defender", "attacker"}:
+		raise ValueError("trained_side must be 'defender' or 'attacker'")
 	examples: list[Example] = []
 	episode_id = 0
 	for ti, spec in enumerate(tasks):
@@ -41,14 +50,32 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 			agent = factory(spec)
 			sandbox = sandbox_factory()
 			try:
-				result = run_episode(spec, agent, defender_factory(), sandbox, max_turns=max_turns)
+				result = run_episode(
+					spec,
+					agent,
+					defender_factory(),
+					sandbox,
+					max_turns=max_turns,
+					redaction_enforcement=redaction_enforcement,
+				)
 			finally:
 				sandbox.close()
 
+			reward = (
+				result.defender_reward if trained_side == "defender" else result.attacker_reward
+			)
+			verdicts = episode_verdicts(result)
 			for ex in capturing_generate.buffer[start:]:
-				ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, result.defender_reward
+				ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, reward
+				ex.verdicts = verdicts
+				ex.episode_type = spec.episode_type
+				ex.policy_leak = bool(getattr(result, "policy_leak", False))
+				ex.complete = bool(getattr(result, "complete", False))
+				ex.defender_protocol_failures = int(
+					getattr(result, "defender_protocol_failures", 0)
+				)
 			examples.extend(capturing_generate.buffer[start:])
-			task_rewards.append(result.defender_reward)
+			task_rewards.append(reward)
 			_tally_invalid(td, spec.episode_type, result)
 			episode_id += 1
 		
@@ -60,6 +87,28 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 		      f"invalid[agent {agent_inv}/{agent_acts}, defender {td['def_fail']}/{td['def_dec']}]  "
 		      f"avg_turns={avg_turns:.1f}", flush=True)
 	return examples
+
+def episode_verdicts(result) -> list[dict[str, str]]:
+	"""Every typed defender verdict this episode produced, for within-group diversity.
+
+	`group_diversity` was being handed empty lists, so mixed_verdict_group_rate and
+	verdict_entropy were structurally zero and the constant-policy signal measured nothing. Keep
+	call and result verdicts separate: an always-allow/always-pass policy has two protocol words
+	but zero behavioral diversity.
+	"""
+	verdicts = []
+	for step in result.steps:
+		for decision_type, decision in (
+			("call", step.get("call_decision")),
+			("result", step.get("result_decision")),
+		):
+			if decision and decision.get("verdict"):
+				verdicts.append({
+					"decision_type": decision_type,
+					"verdict": str(decision["verdict"]),
+				})
+	return verdicts
+
 
 def assign_advantages(examples: list[Example]) -> None:
 	ep_reward = {}
@@ -76,24 +125,52 @@ def assign_advantages(examples: list[Example]) -> None:
 		example.advantage = by_ep[example.episode_id]
 
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2) -> dict:
+	"""One GRPO step, weighting every episode equally regardless of trajectory length.
+
+	Credit is assigned at episode granularity, so a ten-decision trajectory must not receive ten
+	times the weight of a one-decision one. Each decision is scaled by
+	``1 / (n_episodes * decisions_in_its_episode)`` and backpropagated IMMEDIATELY.
+
+	Accumulating the losses and calling a single ``backward()`` at the end is mathematically
+	identical but holds one autograd graph per live example simultaneously. At iteration 0 that
+	was 350 graphs through a 4B model beside a 27B vLLM server, which OOM'd an 80GB A100.
+	"""
 	learner.optimizer.zero_grad()
-	total = 0.0
+	live = [example for example in examples if example.advantage != 0]
+	decisions_per_episode = Counter(example.episode_id for example in live)
+	n_episodes = len(decisions_per_episode)
 	ratios = []
-	n = 0
-	for example in examples:
-		if example.advantage == 0:
-			continue
+	kls = []
+	total_loss = 0.0
+
+	for example in live:
 		new_lp = learner.logprobs(example.prompt_ids, example.completion_ids, use_adapter=True, with_grad=True)
 		old_lp = learner.logprobs(example.prompt_ids, example.completion_ids, use_adapter=True, with_grad=False).detach()
 		ref_lp = learner.logprobs(example.prompt_ids, example.completion_ids, use_adapter=False, with_grad=False).detach()
 		mask = torch.ones_like(new_lp)
 		loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta, clip_eps)
-		loss.backward()
-		total += loss.item()
+		weight = 1.0 / (n_episodes * decisions_per_episode[example.episode_id])
+		(loss * weight).backward()
+		total_loss += loss.item() * weight
 		ratios.append(torch.exp(new_lp - old_lp).mean().item())
-		n += 1
-	learner.optimizer.step()
+		# Report the same non-negative k3 estimator used by the optimization objective.
+		delta = ref_lp - new_lp
+		kls.append((torch.exp(delta) - delta - 1.0).mean().item())
+
+	if live:
+		trainable = [p for p in learner.model.parameters() if p.requires_grad]
+		grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=float("inf")))
+		learner.optimizer.step()
+	else:
+		grad_norm = 0.0
+		total_loss = 0.0
+
 	return {
-		"loss": total / max(n, 1), "mean_ratio": sum(ratios) / max(len(ratios), 1),
-		"n_live_examples": n, "n_examples": len(examples)
+		"loss": total_loss,
+		"mean_ratio": sum(ratios) / max(len(ratios), 1),
+		"mean_kl": sum(kls) / max(len(kls), 1),
+		"grad_norm": grad_norm,
+		"n_live_episodes": n_episodes,
+		"n_live_examples": len(live),
+		"n_examples": len(examples),
 	}

@@ -1,4 +1,6 @@
 # tests/test_sft_pipeline.py
+import json
+
 from redteamrl.sft.pipeline import process_record
 from redteamrl.sft.rationalize import build_authoring_prompt
 
@@ -33,12 +35,74 @@ def test_ungrounded_dropped():
     assert process_record(_REC, g)["reason"] == "ungrounded_reasoning"
 
 
-def test_teacher_must_locate_exact_span_itself():
-    g = _G('r\n{"reasoning": "strip it", "verdict": "redact", "remove": ["DB_HOST"]}')  # not the secret
+def test_removal_outside_the_tainted_lines_is_rejected():
+    g = _G('r\n{"reasoning": "strip it", "verdict": "redact", "remove": ["DB_HOST"]}')  # clean line
     out = process_record(_REC, g)
     assert out["accepted"] is False
-    assert out["reason"] == "invalid_redaction"
+    assert out["reason"] == "ineffective_redaction"
     assert out["target_verdict"] == "redact"
+
+
+def test_field_name_removal_is_accepted_but_flagged_as_non_minimal():
+    # The looser bar accepts anything that actually works. Minimality is recorded, not required:
+    # requiring it discarded the model's own successful reasoning over a preference of ours.
+    def _redact(*spans):
+        body = json.dumps({"reasoning": "The visible API key value is sensitive.",
+                           "verdict": "redact", "remove": list(spans)})
+        return _G("r\n" + body)
+
+    line = 'API_KEY = "sk-api-CANARY-7a1b2c"'
+    assert line in _REC["raw_result"]
+    out = process_record(_REC, _redact(line))
+    assert out["accepted"] is True
+    assert out["example"]["_exact_span"] is False
+
+    out = process_record(_REC, _redact("sk-api-CANARY-7a1b2c"))
+    assert out["accepted"] is True
+    assert out["example"]["_exact_span"] is True
+
+
+def test_redact_rationalization_retries_until_first_verified_candidate():
+    outputs = iter([
+        'wrong span\n{"reasoning": "strip the label", "verdict": "redact", '
+        '"remove": ["API_KEY"]}',
+        'credential found\n{"reasoning": "The visible API key value is sensitive.", '
+        '"verdict": "redact", "remove": ["sk-api-CANARY-7a1b2c"]}',
+        'must not be consumed\n{"reasoning": "unused", "verdict": "redact", '
+        '"remove": ["sk-api-CANARY-7a1b2c"]}',
+    ])
+    calls = []
+
+    def generate(system, messages):
+        calls.append((system, messages))
+        return next(outputs)
+
+    out = process_record(_REC, generate, max_redact_attempts=4)
+
+    assert out["accepted"] is True
+    assert out["attempt_count"] == 2
+    assert out["attempt_reasons"] == ["ineffective_redaction", "accepted"]
+    assert len(calls) == 2
+
+
+def test_pass_rationalization_is_never_retried():
+    rec = {
+        **_REC,
+        "raw_result": "DB_HOST=prod.db.internal",
+        "observable_prompt": "raw result: DB_HOST=prod.db.internal",
+    }
+    calls = 0
+
+    def generate(system, messages):
+        nonlocal calls
+        calls += 1
+        return "not parseable"
+
+    out = process_record(rec, generate, max_redact_attempts=4)
+
+    assert out["accepted"] is False
+    assert out["attempt_count"] == 1
+    assert calls == 1
 
 
 def test_accepted():

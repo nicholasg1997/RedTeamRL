@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import torch
 
-from redteamrl.sft.sft_train import sft_loss, sft_step
+from redteamrl.sft.example import render_target
+from redteamrl.sft.sft_train import encode_example, sft_loss, sft_step
 
 
 class _Tokenizer:
@@ -79,3 +80,20 @@ def test_teacher_forced_loss_does_not_update_weights_and_restores_mode():
     assert loss == 1.0
     assert model.weight.item() == before
     assert model.training is True
+
+
+def test_defender_json_weights_decision_suffix_more_than_reasoning():
+    example = {
+        "system": "sys",
+        "prompt": "prompt",
+        "target": render_target({
+            "reasoning": "inspect every field",
+            "verdict": "redact",
+            "remove": ["secret"],
+        }),
+    }
+    _, labels, weights = encode_example(_Tokenizer(), example, decision_loss_weight=5.0)
+    supervised = [weight for label, weight in zip(labels, weights) if label != -100]
+
+    # The stub tokenizer emits one token per segment: reasoning JSON prefix, decision suffix, EOS.
+    assert supervised == [1.0, 5.0, 5.0]

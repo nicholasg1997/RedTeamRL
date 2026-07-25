@@ -2,6 +2,13 @@ import contextlib
 import torch
 
 class Learner:
+	"""Score completions under the live adapter and its adapter-disabled reference.
+
+	The caller owns the reference construction. For defender GRPO, ``train_defender.py`` first
+	merges the accepted SFT bootstrap into the backbone and then attaches a new trainable adapter;
+	disabling that adapter therefore returns the frozen SFT policy, not raw Qwen.
+	"""
+
 	def __init__(self, model, tokenizer, optimizer, reward_key: str = "defender_reward"):
 		self.model = model
 		self.tokenizer = tokenizer

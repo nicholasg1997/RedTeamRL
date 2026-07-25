@@ -56,6 +56,8 @@ def test_benign_metrics_split_post_completion_leaks_and_exposure():
     assert m.post_completion_leaks_per_100_turns == 100/6
     assert m.n_post_completion_exposed == 2
     assert m.avg_post_completion_turns == 3.0
+    assert m.over_refusal_rate == 0.0
+    assert m.unsafe_incomplete_rate == 1/4
 
 
 def test_empty_results_do_not_crash():
@@ -114,6 +116,28 @@ def test_policy_leaks_and_redaction_failures_are_separate_from_delivery():
     assert metrics.redaction.effective_redactions == 1
     assert metrics.redaction.failed_redactions == 1
     assert metrics.redaction.sensitive_result_passes == 1
+    assert metrics.redaction.clean_result_opportunities == 1
+    assert metrics.redaction.sensitive_result_redaction_rate == 2 / 3
+    assert metrics.redaction.redaction_success_rate == 1 / 2
     assert metrics.redaction.failed_redaction_rate == 1 / 2
     assert metrics.redaction.sensitive_result_pass_rate == 1 / 3
-    assert metrics.redaction.unnecessary_redaction_rate == 1 / 3
+    assert metrics.redaction.unnecessary_redaction_rate == 1.0
+    assert metrics.over_refusal_rate == 0.0
+    assert metrics.unsafe_incomplete_rate == 1 / 4
+
+
+def test_protocol_failures_are_reported_separately_from_policy_leaks():
+    results = [
+        _er(defender_protocol_failures=1),
+        _er(),
+    ]
+
+    attack = AttackMetrics.from_results(results)
+    benign = BenignMetrics.from_results(results)
+
+    assert attack.policy_leak_rate == 0.0
+    assert attack.defender_protocol_failure_rate == 0.5
+    assert attack.defender_protocol_failures == 1
+    assert benign.policy_leak_rate == 0.0
+    assert benign.defender_protocol_failure_rate == 0.5
+    assert benign.defender_protocol_failures == 1

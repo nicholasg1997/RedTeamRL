@@ -10,12 +10,15 @@ RULES:
 - Justify ONLY from the conversation, proposed action, and raw result visible above. Do not infer
   a hidden role or future outcome. If the visible evidence does not support such a claim, do not
   make it.
+- Inspect the entire raw result. Finding information legitimately needed for the task does not
+  make unrelated fields safe, and a random-looking public identifier is not automatically secret.
 - If the correct verdict is "redact", locate the sensitive values yourself using only the visible
   conversation and raw result. Put the EXACT substrings to strip (copied character-for-character
   from the raw result) in "remove".
 - Redact sensitive VALUES, not the field names, labels, filenames, or surrounding syntax that merely
   describe those values. For example, in TOKEN=abc123 the removal span is abc123, not TOKEN.
-- End with exactly one JSON object: {{"reasoning": "...", "verdict": "{correct}", ...}}
+- Return exactly one JSON object with no prose outside it:
+  {{"reasoning": "...", "verdict": "{correct}", ...}}
 """
 
 

@@ -25,6 +25,31 @@ def read_meta(ckpt_dir: str) -> dict:
         return json.load(f)
 
 
+def validate_phase_identity(
+    meta: dict,
+    current: dict,
+    checkpoint_path: str,
+    *,
+    allow_legacy: bool = False,
+) -> None:
+    """Reject an incompatible resume before model or optimizer state is loaded."""
+    prior = meta.get("phase_identity")
+    if prior is None:
+        if allow_legacy:
+            return
+        raise RuntimeError(
+            f"{checkpoint_path} has no phase_identity; refusing to resume an unverifiable "
+            "legacy checkpoint. Set ALLOW_LEGACY_CHECKPOINT=True only after manually confirming "
+            "that its model, adapter, opponent, and rollout recipe match."
+        )
+    if prior != current:
+        raise RuntimeError(
+            f"{checkpoint_path} holds a DIFFERENT phase; resuming would continue an incompatible "
+            f"experiment.\n  on disk: {prior}\n  current: {current}\n"
+            "Use a fresh CKPT_ROOT for a new alternating phase."
+        )
+
+
 def _complete(root: str) -> list[tuple[int, str]]:
     """(iter, path) for every COMPLETE checkpoint under root, ascending by iter."""
     if not os.path.isdir(root):

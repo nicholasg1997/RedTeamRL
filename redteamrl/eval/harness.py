@@ -11,13 +11,14 @@ from redteamrl.types import TaskSpec
 from redteamrl.policies.base import AttackerPolicy, DefenderPolicy
 from redteamrl.policies.scripted import ScriptedClient
 from redteamrl.sandbox.base import Sandbox
-from redteamrl.harness.episode import run_episode, EpisodeResult
+from redteamrl.harness.episode import run_episode, EpisodeResult, RedactionEnforcement
 from redteamrl.eval.metrics import AttackMetrics, BenignMetrics
 
 class EvalReport(BaseModel):
 	n_rollouts: int
 	max_turns: int
 	post_completion_turns: int | None = None
+	redaction_enforcement: RedactionEnforcement = "unshielded"
 	attacker_id: str
 	defender_id: str
 	overall_attack: AttackMetrics
@@ -27,20 +28,41 @@ class EvalReport(BaseModel):
 
 	def summary(self) -> str:
 		a, b = self.overall_attack, self.overall_benign
-		br = b.redaction
+		ar, br = a.redaction, b.redaction
+
+		def pct(value: float | None) -> str:
+			return "n/a" if value is None else f"{value:.1%}"
+
+		def redaction_summary(prefix: str, metrics) -> str:
+			return (
+				f"  {prefix} REDACT  opportunities={metrics.redaction_opportunities} "
+				f"attempt_recall={pct(metrics.sensitive_result_redaction_rate)} "
+				f"effective={metrics.effective_redactions} "
+				f"success_given_attempt={pct(metrics.redaction_success_rate)} "
+				f"failed={metrics.failed_redactions} "
+				f"sensitive_pass={metrics.sensitive_result_passes} "
+				f"apparent_clean_false_positive={pct(metrics.unnecessary_redaction_rate)} "
+				f"(n={metrics.unnecessary_redactions}/{metrics.clean_result_opportunities})"
+			)
+
 		return "\n".join([
-			f"Eval  attacker={self.attacker_id or '?'}  defender={self.defender_id or '?'}  n_rollouts={self.n_rollouts}",
+			f"Eval  attacker={self.attacker_id or '?'}  defender={self.defender_id or '?'}  "
+			f"n_rollouts={self.n_rollouts}  redaction={self.redaction_enforcement}",
 			f"  ATTACK  delivered_success={a.attack_success_rate:.1%}  policy_leak={a.policy_leak_rate:.1%}  "
-			f"shielded={a.shielded_policy_leak_rate:.1%}  avg_steps_to_leak={a.avg_steps_to_leak}",
-			f"  BENIGN  completion={b.completion_rate:.1%}  over_refusal={b.over_refusal_rate:.1%}  "
+			f"shielded={a.shielded_policy_leak_rate:.1%}  "
+			f"protocol_fail={a.defender_protocol_failure_rate:.1%} "
+			f"(n={a.defender_protocol_failures})  avg_steps_to_leak={a.avg_steps_to_leak}",
+			redaction_summary("ATTACK", ar),
+			f"  BENIGN  completion={b.completion_rate:.1%}  clean_over_refusal={b.over_refusal_rate:.1%}  "
+			f"unsafe_incomplete={b.unsafe_incomplete_rate:.1%}  "
 			f"safe_completion={b.policy_safe_completion_rate:.1%}  "
 			f"delivered_leak={b.benign_leak_rate:.1%}  policy_leak={b.policy_leak_rate:.1%}  "
+			f"protocol_fail={b.defender_protocol_failure_rate:.1%} "
+			f"(n={b.defender_protocol_failures})  "
 			f"pre={b.leak_before_completion_rate:.1%}  "
 			f"at={b.leak_at_completion_rate:.1%}  post={b.post_completion_leak_rate:.1%}  "
 			f"avg_steps={b.avg_steps_to_completion}",
-			f"  REDACT  opportunities={br.redaction_opportunities}  effective={br.effective_redactions}  "
-			f"failed={br.failed_redactions}  sensitive_pass={br.sensitive_result_passes}  "
-			f"unnecessary={br.unnecessary_redactions}",
+			redaction_summary("BENIGN", br),
 		])
 
 def run_eval(
@@ -60,11 +82,14 @@ def run_eval(
 		checkpoint_callback: Callable[[], None] | None = None,
 		checkpoint_every: int = 10,
 		post_completion_turns: int | None = None,
+		redaction_enforcement: RedactionEnforcement = "unshielded",
 ) -> EvalReport:
 	if max_concurrency < 1:
 		raise ValueError("max_concurrency must be at least 1")
 	if checkpoint_every < 1:
 		raise ValueError("checkpoint_every must be at least 1")
+	if redaction_enforcement not in {"unshielded", "fail_closed"}:
+		raise ValueError("redaction_enforcement must be 'unshielded' or 'fail_closed'")
 
 	work = [
 		(index, task, rollout)
@@ -91,12 +116,13 @@ def run_eval(
 				row = json.load(f)
 			if (
 				not isinstance(row, dict)
-				or row.get("schema_version") != 2
+				or row.get("schema_version") != 3
 				or row.get("work_index") != index
 				or row.get("base_task_id") != base_task.id
 				or row.get("episode_type") != base_task.episode_type
 				or row.get("rollout") != rollout
 				or row.get("post_completion_turns_config") != post_completion_turns
+				or row.get("redaction_enforcement") != redaction_enforcement
 			):
 				raise ValueError("checkpoint identity does not match the requested evaluation")
 			EpisodeResult.model_validate(row["result"])
@@ -134,17 +160,19 @@ def run_eval(
 				sandbox,
 				max_turns=turns,
 				post_completion_turns=post_completion_turns,
+				redaction_enforcement=redaction_enforcement,
 			)
 		finally:
 			sandbox.close()
 		row = {
-			"schema_version": 2,
+			"schema_version": 3,
 			"work_index": index,
 			"base_task_id": base_task.id,
 			"task_id": task.id,
 			"episode_type": task.episode_type,
 			"rollout": rollout,
 			"post_completion_turns_config": post_completion_turns,
+			"redaction_enforcement": redaction_enforcement,
 			"result": result.model_dump(),
 		}
 		write_checkpoint(index, row)
@@ -226,6 +254,7 @@ def run_eval(
 
 	return EvalReport(
 		n_rollouts=n_rollouts, max_turns=max_turns, post_completion_turns=post_completion_turns,
+		redaction_enforcement=redaction_enforcement,
 		attacker_id=attacker_id, defender_id=defender_id,
 		overall_attack=AttackMetrics.from_results(flat_attack),
 		overall_benign=BenignMetrics.from_results(flat_benign),

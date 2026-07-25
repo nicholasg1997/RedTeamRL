@@ -16,7 +16,8 @@ def _write_json_atomic(path, obj):
 	os.replace(tmp, path)
 
 def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, out_dir, max_turns,
-			 task_transform=None, post_completion_turns=None):
+			 task_transform=None, post_completion_turns=None,
+			 redaction_enforcement="unshielded"):
 	key = f"{spec.id}#{rollout_index}"
 	path = os.path.join(out_dir, f"{key}.json")
 	if os.path.exists(path):
@@ -32,6 +33,7 @@ def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, 
 			sandbox,
 			max_turns=max_turns,
 			post_completion_turns=post_completion_turns,
+			redaction_enforcement=redaction_enforcement,
 		)
 	finally:
 		sandbox.close()
@@ -43,6 +45,7 @@ def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, 
 		            "record_id": f"{key}:decision-{decision_index}",
 		            "system": defender.system, "forbidden": episode_spec.forbidden,
 		            "required": episode_spec.required, "true_role": episode_spec.episode_type,
+			          "redaction_enforcement": redaction_enforcement,
 			          "episode_leaked": leaked, "episode_required_delivered": delivered,
 			          "episode_policy_leaked": ep.policy_leak,
 		            "episode_complete_at_turn": ep.complete_at_turn,
@@ -56,7 +59,8 @@ def _run_one(spec, rollout_index, agent_for, defender_factory, sandbox_factory, 
 
 def collect_episodes(tasks, n_collect, agent_for, defender_factory, sandbox_factory,
 					 out_dir, max_turns, max_workers=1, commit=None, commit_every=None,
-					 task_transform=None, post_completion_turns=None):
+					 task_transform=None, post_completion_turns=None,
+					 redaction_enforcement="unshielded"):
 	"""Collect independent episodes concurrently and persist completed waves.
 
 	Only newly written episodes count toward commits. Work is submitted one worker-sized wave at a
@@ -80,7 +84,7 @@ def collect_episodes(tasks, n_collect, agent_for, defender_factory, sandbox_fact
 			wave = work[start:start + max_workers]
 			futures = [pool.submit(_run_one, spec, r, agent_for, defender_factory,
 			                       sandbox_factory, out_dir, max_turns, task_transform,
-			                       post_completion_turns)
+			                       post_completion_turns, redaction_enforcement)
 			           for spec, r in wave]
 			for fut in as_completed(futures):
 				if fut.result():
@@ -123,15 +127,23 @@ class RecordingDefender(PromptedDefender):
 					and record.get("action") == action.model_dump()):
 				record["paired_raw_result"] = raw_result
 				break
+		# Persist the literal model-policy output, before an optional fail-closed deployment shield.
+		# Older episode banks do not have this field; blind_review reconstructs it from the saved
+		# verdict/content for backward compatibility.
+		policy_returned = (
+			raw_result if decision.verdict == "pass" else (decision.content or "")
+		)
 		self.records.append({"decision_type": "result", "observable_prompt": prompt,
 		                     "raw_result": raw_result,
+		                     "policy_returned": policy_returned,
 		                     "turn": sum(message.get("role") == "agent" for message in conversation),
 		                     "action": action.model_dump(),
 		                     "decision": decision.model_dump()})
 		return decision
 
 def collect_records(tasks, attack_factory, benign_factory, defender_factory, sandbox_factory,
-					n_rollouts, max_turns, post_completion_turns=None):
+					n_rollouts, max_turns, post_completion_turns=None,
+					redaction_enforcement="unshielded"):
 	out = []
 	for spec in tasks:
 		factory = attack_factory if spec.episode_type == "attack" else benign_factory
@@ -146,6 +158,7 @@ def collect_records(tasks, attack_factory, benign_factory, defender_factory, san
 					sandbox,
 					max_turns=max_turns,
 					post_completion_turns=post_completion_turns,
+					redaction_enforcement=redaction_enforcement,
 				)
 			finally:
 				sandbox.close()
@@ -155,6 +168,7 @@ def collect_records(tasks, attack_factory, benign_factory, defender_factory, san
 				r.update({"task_id": spec.id, "episode_type": spec.episode_type,
 				          "system": defender.system, "forbidden": spec.forbidden,
 				          "required": spec.required, "true_role": spec.episode_type,
+					          "redaction_enforcement": redaction_enforcement,
 					          "episode_leaked": leaked, "episode_required_delivered": delivered,
 					          "episode_policy_leaked": ep.policy_leak,
 				          "episode_complete_at_turn": ep.complete_at_turn,

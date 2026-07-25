@@ -54,6 +54,7 @@ def test_episode_file_shape(tmp_path):
     assert obj["episode_key"] == "ops-logs-benign-x#0"
     assert all(r["episode_key"] == "ops-logs-benign-x#0" for r in obj["records"])
     assert all("record_id" in r and "episode_leaked" in r for r in obj["records"])
+    assert all(r["redaction_enforcement"] == "unshielded" for r in obj["records"])
 
 
 def _tool_spec():
@@ -84,6 +85,7 @@ def test_concurrent_tool_records_stay_isolated_and_unique(tmp_path):
         obj = json.load(open(os.path.join(out_dir, f"ops-logs-benign-tool#{rollout}.json")))
         assert [record["decision_type"] for record in obj["records"]] == ["call", "result"]
         assert obj["records"][0]["paired_raw_result"] == "DB_HOST=1"
+        assert obj["records"][1]["policy_returned"] == "DB_HOST=1"
         assert obj["records"][0]["action"] == obj["records"][1]["action"]
         assert all(record["episode_key"] == f"ops-logs-benign-tool#{rollout}"
                    for record in obj["records"])

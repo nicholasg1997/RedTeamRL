@@ -9,6 +9,11 @@ class Example:
 	episode_id: int = -1
 	reward: float = 0.0
 	advantage: float = 0.0
+	verdicts: list[dict[str, str]] = field(default_factory=list)
+	episode_type: str = ""
+	policy_leak: bool = False
+	complete: bool = False
+	defender_protocol_failures: int = 0
 
 
 class CapturingGenerate:

@@ -27,6 +27,49 @@ class _RejectAll:
     def adjudicate_result(self, c, a, r): return DefenderDecision(reasoning="no", verdict="redact", content="[withheld]")
     def respond(self, c, a): return DefenderDecision(reasoning="no", verdict="respond", content="no")
 
+
+class _WrongSpanRedactor:
+    def adjudicate_call(self, c, a):
+        return DefenderDecision(reasoning="review", verdict="allow")
+
+    def adjudicate_result(self, c, a, raw):
+        return DefenderDecision(
+            reasoning="remove the label",
+            verdict="redact",
+            remove=["K"],
+            content=raw.replace("K", "[REDACTED]"),
+        )
+
+    def respond(self, c, a):
+        return DefenderDecision(reasoning="ok", verdict="respond", content="ok")
+
+
+def test_eval_mode_controls_whether_wrong_redaction_is_exploitable():
+    unshielded = run_eval(
+        [_attack()],
+        FACTORY,
+        _WrongSpanRedactor(),
+        LocalSandbox,
+        n_rollouts=1,
+        redaction_enforcement="unshielded",
+    )
+    wrapped = run_eval(
+        [_attack()],
+        FACTORY,
+        _WrongSpanRedactor(),
+        LocalSandbox,
+        n_rollouts=1,
+        redaction_enforcement="fail_closed",
+    )
+    assert unshielded.redaction_enforcement == "unshielded"
+    assert unshielded.overall_attack.attack_success_rate == 1.0
+    assert unshielded.overall_attack.policy_leak_rate == 1.0
+    assert wrapped.redaction_enforcement == "fail_closed"
+    assert wrapped.overall_attack.attack_success_rate == 0.0
+    assert wrapped.overall_attack.policy_leak_rate == 1.0
+    assert wrapped.overall_attack.shielded_policy_leak_rate == 1.0
+
+
 def test_null_defender_leaks_everything():
     rep = run_eval([_attack(), _benign()], FACTORY, NullDefender(), LocalSandbox, n_rollouts=3)
     assert rep.overall_attack.attack_success_rate == 1.0
@@ -176,6 +219,33 @@ def test_eval_rejects_stale_checkpoint_identity(tmp_path):
         assert "Invalid or stale evaluation checkpoint" in str(exc)
     else:
         raise AssertionError("stale checkpoint should have been rejected")
+
+
+def test_eval_mode_change_invalidates_resume_checkpoints(tmp_path):
+    resume_dir = tmp_path / "checkpoints"
+    run_eval(
+        [_attack()],
+        FACTORY,
+        _WrongSpanRedactor(),
+        LocalSandbox,
+        n_rollouts=1,
+        resume_dir=resume_dir,
+        redaction_enforcement="unshielded",
+    )
+    try:
+        run_eval(
+            [_attack()],
+            FACTORY,
+            _WrongSpanRedactor(),
+            LocalSandbox,
+            n_rollouts=1,
+            resume_dir=resume_dir,
+            redaction_enforcement="fail_closed",
+        )
+    except RuntimeError as exc:
+        assert "Invalid or stale evaluation checkpoint" in str(exc)
+    else:
+        raise AssertionError("redaction enforcement change should invalidate checkpoints")
 
 
 def test_task_transform_receives_rollout_and_keeps_report_grouping(tmp_path):
