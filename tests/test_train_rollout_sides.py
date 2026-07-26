@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -7,12 +8,23 @@ from redteamrl.train.train import rollout
 
 
 class _Cap:
+    """Mirrors CapturingGenerate's episode-scoped capture interface."""
+
     def __init__(self):
         self.buffer = []
+        self._scoped = None
+
+    @contextmanager
+    def episode_capture(self):
+        self._scoped = []
+        try:
+            yield self._scoped
+        finally:
+            self._scoped = None
 
     def emit(self):
-        self.buffer.append(SimpleNamespace(task_id=None, episode_id=None, reward=None,
-                                           advantage=0.0))
+        sink = self.buffer if self._scoped is None else self._scoped
+        sink.append(SimpleNamespace(task_id=None, episode_id=None, reward=None, advantage=0.0))
 
 
 def _spec(task_id, episode_type):
@@ -20,7 +32,8 @@ def _spec(task_id, episode_type):
 
 
 def _patched(monkeypatch, cap, defender_reward, attacker_reward):
-    def fake_run_episode(spec, agent, defender, sandbox, max_turns, redaction_enforcement):
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                         post_completion_turns=None, redaction_enforcement="unshielded"):
         cap.emit()
         return SimpleNamespace(defender_reward=defender_reward, attacker_reward=attacker_reward,
                                n_turns=3, steps=[])
@@ -58,7 +71,8 @@ def test_verdicts_are_captured_for_diversity(monkeypatch):
     # verdict_entropy were structurally zero — the constant-policy signal measured nothing.
     cap = _Cap()
 
-    def fake_run_episode(spec, agent, defender, sandbox, max_turns, redaction_enforcement):
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                         post_completion_turns=None, redaction_enforcement="unshielded"):
         cap.emit()
         return SimpleNamespace(
             defender_reward=-2.0, attacker_reward=0.9, n_turns=2,

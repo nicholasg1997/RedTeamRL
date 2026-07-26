@@ -1,8 +1,10 @@
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from redteamrl.harness.episode import RedactionEnforcement, run_episode
 from redteamrl.train.capture import Example
+from redteamrl.train.episode_store import read_episodes, write_episode
 from redteamrl.train.grpo import group_advantages, example_loss
 from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT, _DEFENDER_FAIL_MARKER
 
@@ -25,10 +27,48 @@ def _tally_invalid(diag: dict, episode_type: str, result) -> None:
 					diag["def_fail"] += 1
 
 
+def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factory,
+                     capturing_generate, max_turns, post_completion_turns,
+                     redaction_enforcement, trained_side):
+	"""Run one episode into its OWN capture buffer and tag every example it produced."""
+	agent = factory(spec)
+	sandbox = sandbox_factory()
+	with capturing_generate.episode_capture() as episode_examples:
+		try:
+			result = run_episode(
+				spec,
+				agent,
+				defender_factory(),
+				sandbox,
+				max_turns=max_turns,
+				post_completion_turns=post_completion_turns,
+				redaction_enforcement=redaction_enforcement,
+			)
+		finally:
+			sandbox.close()
+
+	reward = result.defender_reward if trained_side == "defender" else result.attacker_reward
+	verdicts = episode_verdicts(result)
+	tally = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0, "turns": []}
+	_tally_invalid(tally, spec.episode_type, result)
+	tally["turns"] = result.n_turns
+	for ex in episode_examples:
+		ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, reward
+		ex.verdicts = verdicts
+		ex.episode_type = spec.episode_type
+		ex.policy_leak = bool(getattr(result, "policy_leak", False))
+		ex.complete = bool(getattr(result, "complete", False))
+		ex.defender_protocol_failures = int(getattr(result, "defender_protocol_failures", 0))
+	return {"episode_id": episode_id, "task_id": spec.id, "reward": reward,
+	        "tally": tally, "examples": episode_examples}
+
+
 def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
             sandbox_factory, capturing_generate, n_rollouts: int, max_turns: int = 12,
             redaction_enforcement: RedactionEnforcement = "unshielded",
-            trained_side: str = "defender") -> list[Example]:
+            trained_side: str = "defender", post_completion_turns: int | None = None,
+            max_workers: int = 1, episode_store: str | None = None,
+            commit=None) -> list[Example]:
 	"""Run n_rollouts episodes per task; tag every captured Example with that episode's reward for
 	the side being trained.
 
@@ -36,49 +76,65 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 	`trained_side` selects which reward tags those examples, so the same loop serves the defender
 	phase and the attacker phase. Keeping the opponent frozen is what makes within-group reward
 	variance attributable to the trained model; turning both sides live before the loop is proven
-	makes a dead group undiagnosable."""
+	makes a dead group undiagnosable.
+
+	`max_workers` > 1 runs a task's episodes concurrently so the frozen opponent's vLLM server
+	batches instead of serving one request at a time — that server is ~85% of wall clock at
+	batch-1. Episode ids are derived from (task index, rollout index), so attribution does not
+	depend on completion order.
+
+	`episode_store` persists each finished episode, so a preemption mid-rollout costs one episode
+	rather than the whole iteration. Banked episodes stay valid on resume because the policy does
+	not move during a rollout. `commit` is invoked once per task FROM THIS THREAD — never from a
+	worker — to flush the store durably."""
 	if trained_side not in {"defender", "attacker"}:
 		raise ValueError("trained_side must be 'defender' or 'attacker'")
+	if max_workers < 1:
+		raise ValueError("max_workers must be positive")
+	banked = read_episodes(episode_store) if episode_store else {}
+	if banked:
+		print(f"    [rollout] resuming with {len(banked)} banked episodes", flush=True)
 	examples: list[Example] = []
-	episode_id = 0
-	for ti, spec in enumerate(tasks):
-		task_rewards = []
-		td = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0, "turns": []}
-		for _ in range(n_rollouts):
-			start = len(capturing_generate.buffer)
-			factory = attack_agent_factory if spec.episode_type == "attack" else benign_agent_factory
-			agent = factory(spec)
-			sandbox = sandbox_factory()
-			try:
-				result = run_episode(
-					spec,
-					agent,
-					defender_factory(),
-					sandbox,
-					max_turns=max_turns,
-					redaction_enforcement=redaction_enforcement,
-				)
-			finally:
-				sandbox.close()
 
-			reward = (
-				result.defender_reward if trained_side == "defender" else result.attacker_reward
+	for ti, spec in enumerate(tasks):
+		factory = attack_agent_factory if spec.episode_type == "attack" else benign_agent_factory
+		td = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0, "turns": []}
+
+		def run(rollout_index):
+			episode_id = ti * n_rollouts + rollout_index
+			if episode_id in banked:
+				return banked[episode_id]
+			outcome = _run_one_episode(
+				spec, episode_id, factory, defender_factory,
+				sandbox_factory, capturing_generate, max_turns, post_completion_turns,
+				redaction_enforcement, trained_side,
 			)
-			verdicts = episode_verdicts(result)
-			for ex in capturing_generate.buffer[start:]:
-				ex.task_id, ex.episode_id, ex.reward = spec.id, episode_id, reward
-				ex.verdicts = verdicts
-				ex.episode_type = spec.episode_type
-				ex.policy_leak = bool(getattr(result, "policy_leak", False))
-				ex.complete = bool(getattr(result, "complete", False))
-				ex.defender_protocol_failures = int(
-					getattr(result, "defender_protocol_failures", 0)
-				)
-			examples.extend(capturing_generate.buffer[start:])
-			task_rewards.append(reward)
-			_tally_invalid(td, spec.episode_type, result)
-			episode_id += 1
-		
+			if episode_store:
+				write_episode(episode_store, outcome)
+			return outcome
+
+		if max_workers == 1:
+			outcomes = [run(r) for r in range(n_rollouts)]
+		else:
+			with ThreadPoolExecutor(max_workers=max_workers) as pool:
+				# Materialize in submission order: diagnostics stay deterministic even though the
+				# episodes themselves finish out of order.
+				outcomes = list(pool.map(run, range(n_rollouts)))
+
+		task_rewards = []
+		for outcome in outcomes:
+			examples.extend(outcome["examples"])
+			task_rewards.append(outcome["reward"])
+			for key, value in outcome["tally"].items():
+				if key == "turns":
+					td["turns"].append(value)
+				else:
+					td[key] += value
+		# Flush from THIS thread: a Modal Volume commit from a worker is not obviously safe, and
+		# a task boundary is a small enough unit of loss.
+		if commit is not None:
+			commit()
+
 		# per task: rewards (all-identical = dead group; mixed = live) + WHERE invalid JSON came
 		# from (agent truncating vs defender fail-closing) + avg episode length — no guessing.
 		agent_inv, agent_acts = td["atk_inv"] + td["ben_inv"], td["atk_act"] + td["ben_act"]
@@ -87,6 +143,7 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 		      f"invalid[agent {agent_inv}/{agent_acts}, defender {td['def_fail']}/{td['def_dec']}]  "
 		      f"avg_turns={avg_turns:.1f}", flush=True)
 	return examples
+
 
 def episode_verdicts(result) -> list[dict[str, str]]:
 	"""Every typed defender verdict this episode produced, for within-group diversity.

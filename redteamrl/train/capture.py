@@ -1,3 +1,5 @@
+import contextlib
+import threading
 from dataclasses import dataclass, field
 import torch
 
@@ -24,7 +26,30 @@ class CapturingGenerate:
 		self.temperature = temperature
 		self.max_new_tokens = max_new_tokens
 		self.enable_thinking = enable_thinking          # OFF by default: a monitor emits reasoning+JSON, not a think block
-		self.buffer: list[Example] = []
+		self.buffer: list[Example] = []                 # fallback sink when no episode is scoped
+		self._local = threading.local()
+
+	@contextlib.contextmanager
+	def episode_capture(self):
+		"""Route this thread's captures into a private buffer for the duration of one episode.
+
+		Concurrent episodes share one CapturingGenerate. Slicing a single shared buffer by index
+		interleaves examples across episodes and tags them with another episode's reward -- silent
+		credit-assignment corruption. Giving each episode its own sink is what makes concurrency
+		safe, and concurrency is what lets vLLM batch the frozen opponent instead of serving it
+		one request at a time.
+		"""
+		episode_buffer: list[Example] = []
+		previous = getattr(self._local, "buffer", None)
+		self._local.buffer = episode_buffer
+		try:
+			yield episode_buffer
+		finally:
+			self._local.buffer = previous
+
+	def _sink(self) -> list[Example]:
+		scoped = getattr(self._local, "buffer", None)
+		return self.buffer if scoped is None else scoped
 
 	def __call__(self, system: str, messages: list[dict]) -> str:
 		chat = [{"role": "system", "content": system}, *messages]
@@ -40,7 +65,7 @@ class CapturingGenerate:
 			)
 		n = prompt_ids.shape[1]
 		completions_ids = full[0, n:].tolist()
-		self.buffer.append(Example(
+		self._sink().append(Example(
 			prompt_ids=prompt_ids[0].tolist(),
 			completion_ids=completions_ids,
 		))

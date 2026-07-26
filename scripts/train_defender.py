@@ -33,6 +33,13 @@ CANARIES = {"ops-logs": "sk-api-CANARY-7a1b2c", "analytics": "pw-db-CANARY-9x8y7
 # reasoning bootstrap instead of the raw base model. None -> start from base.
 SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"   # e.g. "/runs/sft-defender/<root>/training/<fingerprint>/adapter"
 CKPT_ROOT = "/runs/defender-grpo-sft-7eeae96976a4"   # on the Modal Volume; the ONLY state that survives preemption
+# Concurrent episodes so the frozen opponent's vLLM server BATCHES instead of serving one request
+# at a time -- it is ~85% of wall clock at batch-1. Capped at 8: each in-flight HF generate holds
+# its own KV cache, and a 40k-char transcript is ~10k tokens.
+ROLLOUT_WORKERS = 8
+# Benign episodes complete in ~2 turns and then idled to MAX_TURNS under the default fixed
+# horizon. A bounded post-completion window gives equal safety exposure at a fraction of the cost.
+POST_COMPLETION_TURNS = 4
 CKPT_KEEP = 3                             # keep newest N checkpoints (the latest is always resume-safe)
 ALLOW_LEGACY_CHECKPOINT = False           # require explicit opt-in for pre-identity checkpoints
 
@@ -55,7 +62,7 @@ app = modal.App("redteamrl-defender-grpo", image=image)
               retries=modal.Retries(initial_delay=0.0, max_retries=10),  # Modal's long-training rec: restart NOW on preempt
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train():
-    import json, os, sys, torch
+    import json, os, shutil, sys, torch
     sys.path.insert(0, "/root")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -181,6 +188,10 @@ def train():
         "defender": DEFENDER_MODEL, "attacker": ATTACKER_MODEL, "sft_adapter": SFT_ADAPTER,
         "n_rollouts": N_ROLLOUTS, "lr": LR, "temp": TEMP, "max_turns": MAX_TURNS,
         "beta": BETA, "clip_eps": CLIP_EPS,
+        # Changes the episode horizon, so it changes the reward distribution -- a resume across
+        # this value would mix two different experiments. max_workers is NOT here: concurrency
+        # changes wall-clock only, and episode ids are derived from indices, not arrival order.
+        "post_completion_turns": POST_COMPLETION_TURNS,
         "reference_policy": reference_policy,
         "grpo_lora": {
             "r": 16,
@@ -217,7 +228,11 @@ def train():
         model.eval()
         examples = rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
-                           redaction_enforcement=REDACTION_ENFORCEMENT)
+                           redaction_enforcement=REDACTION_ENFORCEMENT,
+                           post_completion_turns=POST_COMPLETION_TURNS,
+                           max_workers=ROLLOUT_WORKERS,
+                           episode_store=os.path.join(CKPT_ROOT, f"rollout-iter{it}"),
+                           commit=runs.commit)
         assign_advantages(examples)
         d = decompose(examples)
         # An exposed weakness only teaches if the group's rewards actually differ. A dead group is
@@ -254,6 +269,9 @@ def train():
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity})
         prune_checkpoints(CKPT_ROOT, keep=CKPT_KEEP)
+        # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
+        # earlier would make a preemption between update and checkpoint re-run the whole rollout.
+        shutil.rmtree(os.path.join(CKPT_ROOT, f"rollout-iter{it}"), ignore_errors=True)
         runs.commit()
 
     final_adapter_dir = f"{CKPT_ROOT}/final"
