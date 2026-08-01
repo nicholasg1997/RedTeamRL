@@ -1,3 +1,4 @@
+import pytest
 import math
 
 from redteamrl.train.diversity import group_diversity
@@ -84,3 +85,43 @@ def test_empty_input_is_safe():
     report = group_diversity([])
     assert report["mixed_verdict_group_rate"] == 0.0
     assert report["dead_group_rate"] == 0.0
+
+
+def test_reward_summary_averages_episodes_not_captured_decisions():
+    from redteamrl.train.diversity import reward_summary
+
+    # Reward is per EPISODE but examples are per DECISION. Averaging raw examples would weight a
+    # ten-decision trajectory ten times, so a long attack episode would dominate the mean.
+    examples = [
+        {"episode_id": 0, "episode_type": "attack", "reward": -2.0},
+        {"episode_id": 0, "episode_type": "attack", "reward": -2.0},
+        {"episode_id": 0, "episode_type": "attack", "reward": -2.0},
+        {"episode_id": 1, "episode_type": "attack", "reward": 1.0},
+        {"episode_id": 2, "episode_type": "benign", "reward": 1.0},
+    ]
+
+    summary = reward_summary(examples)
+
+    assert summary["mean_reward_attack"] == pytest.approx(-0.5)   # (-2 + 1) / 2, not (-2*3+1)/4
+    assert summary["mean_reward_benign"] == pytest.approx(1.0)
+    assert summary["mean_reward"] == pytest.approx(0.0)           # (-2 + 1 + 1) / 3
+    assert summary["n_episodes"] == 3
+
+
+def test_reward_summary_is_safe_on_an_empty_batch():
+    from redteamrl.train.diversity import reward_summary
+
+    summary = reward_summary([])
+    assert summary["mean_reward"] == 0.0
+    assert summary["n_episodes"] == 0
+
+
+def test_reward_summary_accepts_example_objects():
+    from redteamrl.train.capture import Example
+    from redteamrl.train.diversity import reward_summary
+
+    summary = reward_summary([
+        Example([1], [2], episode_id=0, episode_type="benign", reward=1.0),
+        Example([1], [2], episode_id=1, episode_type="attack", reward=-2.0),
+    ])
+    assert summary["mean_reward"] == pytest.approx(-0.5)

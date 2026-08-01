@@ -166,3 +166,107 @@ def test_commit_runs_once_per_task_from_the_calling_thread(monkeypatch, tmp_path
 
     assert len(threads) == 2                      # one per task
     assert set(threads) == {threading.main_thread().name}   # never from a worker
+
+
+def test_episodes_from_different_tasks_run_at_the_same_time(monkeypatch, tmp_path):
+    # Tasks used to run one after another, so peak concurrency was capped at n_rollouts (6) no
+    # matter how many workers existed. vLLM batches by in-flight request count, so a queue of one
+    # leaves the engine at batch-1 -- the whole throughput advantage unused.
+    cap = _cap()
+    peak = 0
+    live = 0
+    lock = threading.Lock()
+
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                        post_completion_turns=None, redaction_enforcement="unshielded"):
+        nonlocal peak, live
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.05)
+        cap("sys", [{"role": "user", "content": spec.id}])
+        with lock:
+            live -= 1
+        return SimpleNamespace(defender_reward=1.0, attacker_reward=0.0, n_turns=2, steps=[],
+                               policy_leak=False, complete=True, defender_protocol_failures=0)
+
+    monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
+    specs = [SimpleNamespace(id=f"t{i}", episode_type="benign") for i in range(4)]
+
+    rollout(specs, lambda s: None, lambda s: None, lambda: None,
+            lambda: SimpleNamespace(close=lambda: None),
+            cap, n_rollouts=3, max_workers=12)
+
+    assert peak > 3, f"peak concurrency {peak} never exceeded one task's worth of episodes"
+
+
+def test_examples_stay_in_deterministic_task_order_despite_completion_order(monkeypatch):
+    cap = _cap()
+
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                        post_completion_turns=None, redaction_enforcement="unshielded"):
+        # Later tasks finish FIRST, so arrival order is the reverse of task order.
+        time.sleep(0.02 * (3 - int(spec.id[-1])))
+        cap("sys", [{"role": "user", "content": spec.id}])
+        return SimpleNamespace(defender_reward=1.0, attacker_reward=0.0, n_turns=1, steps=[],
+                               policy_leak=False, complete=True, defender_protocol_failures=0)
+
+    monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
+    specs = [SimpleNamespace(id=f"t{i}", episode_type="benign") for i in range(3)]
+
+    examples = rollout(specs, lambda s: None, lambda s: None, lambda: None,
+                       lambda: SimpleNamespace(close=lambda: None),
+                       cap, n_rollouts=2, max_workers=8)
+
+    assert [e.task_id for e in examples] == ["t0", "t0", "t1", "t1", "t2", "t2"]
+    assert [e.episode_id for e in examples] == [0, 1, 2, 3, 4, 5]
+
+
+def test_task_transform_gives_each_rollout_its_own_task_without_breaking_attribution(monkeypatch):
+    # SFT randomized the planted canary per episode; GRPO never did, so it ran against the literal
+    # template `tok-deploy-CANARY-3m2n1k` -- a low-entropy string that reads like a placeholder.
+    # The two phases were measuring different environments.
+    cap = _cap()
+    seen = []
+
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                        post_completion_turns=None, redaction_enforcement="unshielded"):
+        seen.append(spec.forbidden[0])
+        cap("sys", [{"role": "user", "content": spec.id}])
+        return SimpleNamespace(defender_reward=1.0, attacker_reward=0.0, n_turns=1, steps=[],
+                               policy_leak=False, complete=True, defender_protocol_failures=0)
+
+    monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
+    spec = SimpleNamespace(id="t0", episode_type="benign", forbidden=["TEMPLATE"])
+
+    def transform(original, rollout_index):
+        return SimpleNamespace(id=original.id, episode_type=original.episode_type,
+                               forbidden=[f"secret-{rollout_index}"])
+
+    examples = rollout([spec], lambda s: None, lambda s: None, lambda: None,
+                       lambda: SimpleNamespace(close=lambda: None),
+                       cap, n_rollouts=3, task_transform=transform)
+
+    assert sorted(seen) == ["secret-0", "secret-1", "secret-2"]
+    # The transform must preserve identity: attribution keys off the task, not the secret.
+    assert {e.task_id for e in examples} == {"t0"}
+    assert [e.episode_id for e in examples] == [0, 1, 2]
+
+
+def test_no_transform_leaves_the_task_untouched(monkeypatch):
+    cap = _cap()
+    seen = []
+
+    def fake_run_episode(spec, agent, defender, sandbox, max_turns,
+                        post_completion_turns=None, redaction_enforcement="unshielded"):
+        seen.append(spec.forbidden[0])
+        cap("sys", [{"role": "user", "content": spec.id}])
+        return SimpleNamespace(defender_reward=1.0, attacker_reward=0.0, n_turns=1, steps=[],
+                               policy_leak=False, complete=True, defender_protocol_failures=0)
+
+    monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
+    rollout([SimpleNamespace(id="t0", episode_type="benign", forbidden=["TEMPLATE"])],
+            lambda s: None, lambda s: None, lambda: None,
+            lambda: SimpleNamespace(close=lambda: None), cap, n_rollouts=2)
+
+    assert seen == ["TEMPLATE", "TEMPLATE"]

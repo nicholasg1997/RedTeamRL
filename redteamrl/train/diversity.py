@@ -50,6 +50,42 @@ def _typed_verdict(entry: Any) -> tuple[str, str] | None:
     return "unknown", verdict
 
 
+def reward_summary(examples: list[Any]) -> dict:
+    """Mean episode reward, overall and per track — the scalar the policy is actually optimizing.
+
+    `loss` is ~0 by construction in GRPO (group-normalized advantages sum to zero), so it says
+    nothing about progress. The component rates (attack leak, benign leak) move independently and
+    can trade against each other, which makes "is this improving?" hard to read from them alone.
+    Mean reward is the single number that separates a policy climbing from one cycling between
+    failure modes: an oscillating policy shows anti-correlated components with a FLAT mean, a
+    learning one shows a rising mean even while the components wobble.
+
+    Deduplicated by episode: reward is per episode but examples are per decision, so averaging raw
+    examples would weight long trajectories by their length.
+    """
+    by_episode: dict[Any, tuple[str, float]] = {}
+    for example in examples:
+        episode_id = _field(example, "episode_id")
+        if episode_id not in by_episode:
+            by_episode[episode_id] = (
+                str(_field(example, "episode_type")), float(_field(example, "reward"))
+            )
+
+    rewards = [reward for _, reward in by_episode.values()]
+    attack = [reward for kind, reward in by_episode.values() if kind == "attack"]
+    benign = [reward for kind, reward in by_episode.values() if kind == "benign"]
+
+    def mean(values):
+        return sum(values) / len(values) if values else 0.0
+
+    return {
+        "n_episodes": len(by_episode),
+        "mean_reward": mean(rewards),
+        "mean_reward_attack": mean(attack),
+        "mean_reward_benign": mean(benign),
+    }
+
+
 def group_diversity(examples: list[Any]) -> dict:
     """Aggregate per-task groups into diversity and liveness rates.
 
