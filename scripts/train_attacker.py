@@ -269,13 +269,30 @@ def _train_impl(active_servers):
             add_generation_prompt=True, enable_thinking=False, tokenize=False)
         ids = tok(probe_prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
         model.eval()
-        with torch.no_grad():
-            local_out = model.generate(**ids, do_sample=False, max_new_tokens=32)
+        # prepare_for_long_context_training set use_cache=False for checkpointing. Generating
+        # WITHOUT the KV cache recomputes the whole forward each step: same arithmetic in theory,
+        # different kernels in practice, and greedy argmax flips on near-tied logits -- after which
+        # every later token diverges. This is a no_grad diagnostic, so checkpointing is a no-op
+        # here and the cache is safe to restore for it.
+        cached = getattr(model.config, "use_cache", None)
+        try:
+            model.config.use_cache = True
+            with torch.no_grad():
+                local_out = model.generate(**ids, do_sample=False, max_new_tokens=32)
+        finally:
+            if cached is not None:
+                model.config.use_cache = cached
         local = tok.decode(local_out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
         if served.strip() != local.strip():
+            shared = len(os.path.commonprefix([served.strip(), local.strip()]))
             raise RuntimeError(
-                f"[{tag}] vLLM is not serving the trained policy -- the adapter swap did not take. "
-                f"vLLM greedy: {served.strip()[:160]!r} vs HF greedy: {local.strip()[:160]!r}")
+                f"[{tag}] vLLM is not serving the trained policy -- the adapter swap did not take.\n"
+                f"  common prefix: {shared} chars\n"
+                f"  vLLM greedy: {served.strip()[:160]!r}\n"
+                f"  HF   greedy: {local.strip()[:160]!r}\n"
+                f"  READ THIS: a LONG common prefix means the two stacks diverged numerically on a "
+                f"near-tied logit, not a stale adapter. A SHORT one (or zero) means the swap really "
+                f"did not take and the run must not continue.")
         print(f"[{tag}] served policy verified against the trainer", flush=True)
 
     # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
