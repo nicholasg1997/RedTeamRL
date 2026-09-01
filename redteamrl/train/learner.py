@@ -36,3 +36,31 @@ class Learner:
 		logp = torch.log_softmax(logits, dim=-1)
 		targets = torch.tensor(completion_ids, device=self.model.device)
 		return logp.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+
+def prepare_for_long_context_training(model):
+	"""Make a LoRA model survive a backward pass over a long sequence. Returns `model`.
+
+	Qwen3-8B saves ~1.14 GiB of activations per layer at 15k tokens -- 41.2 GiB across 36 layers,
+	for ONE backward pass, on top of 16.4 GiB of weights. That does not fit on an 80GB card shared
+	with two vLLM engines at any memory split. Checkpointing recomputes activations during backward
+	instead of storing them: ~30% more compute for roughly 10x less memory.
+
+	The defender phase never needed this (its ~3k-token sequences save ~8.2 GiB), which is why the
+	same training code ran fine for a full phase before the attacker's transcripts exposed it.
+
+	Three parts, and the middle one is the trap:
+	  1. enable checkpointing;
+	  2. `enable_input_require_grads` -- the base model is FROZEN, so a checkpointed segment's
+	     inputs do not require grad, its recomputed graph is detached, and backward produces NO
+	     LoRA gradient. The run looks healthy and learns nothing;
+	  3. disable the KV cache, which checkpointing cannot use.
+	"""
+	model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+	enable_input_grads = getattr(model, "enable_input_require_grads", None)
+	if enable_input_grads is not None:
+		enable_input_grads()
+	config = getattr(model, "config", None)
+	if config is not None:
+		config.use_cache = False
+	return model

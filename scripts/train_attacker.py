@@ -163,7 +163,7 @@ def _train_impl(active_servers):
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
     from redteamrl.train.capture import VLLMCapturingGenerate
-    from redteamrl.train.learner import Learner
+    from redteamrl.train.learner import Learner, prepare_for_long_context_training
     from redteamrl.train.train import rollout, assign_advantages, update_step
     from redteamrl.train.diversity import group_diversity, reward_summary
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
@@ -230,7 +230,10 @@ def _train_impl(active_servers):
     lora = LoraConfig(r=16, lora_alpha=32,
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                       "gate_proj", "up_proj", "down_proj"], task_type="CAUSAL_LM")
-    model = get_peft_model(base, lora)
+    # 15k-token sequences (40k-char transcript + 2048 completion) save ~41 GiB of activations
+    # across 36 layers without this -- more than the whole trainer budget. See the helper for
+    # why enable_input_require_grads is not optional under PEFT.
+    model = prepare_for_long_context_training(get_peft_model(base, lora))
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=LR)
     learner = Learner(model, tok, opt, reward_key="attacker_reward")
     # ---- serve the SAME policy on vLLM: base backbone + the live GRPO adapter ----
