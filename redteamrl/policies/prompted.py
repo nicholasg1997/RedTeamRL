@@ -277,9 +277,14 @@ class PromptedAttacker:
 
 
 class PromptedDefender:
-    def __init__(self, generate, max_context_chars: int | None = None):
+    def __init__(self, generate, max_context_chars: int | None = None,
+                 system_template: str | None = None):
         self.generate = generate
-        self.system = DEFENDER_SYSTEM
+        # `system_template` lets the ATTACKER phase vary the frozen defender's phrasing per task so
+        # the trainee cannot overfit one wording of its opponent (see prompt_pool.DEFENDER_STYLES).
+        # Every style shares the same verdict vocabulary and JSON shape, so parsing is unchanged.
+        # Defaults to the canonical prompt: probes and defender training must stay comparable.
+        self.system = system_template or DEFENDER_SYSTEM
         self.max_context_chars = max_context_chars
 
     def adjudicate_call(self, conversation, action) -> DefenderDecision:

@@ -145,3 +145,27 @@ def test_benign_agent_prompt_is_honest_and_substitutes_the_request():
     assert "How many ERROR lines are in logs/app.log?" in agent.system   # request fills {goal}
     assert "{goal}" not in agent.system
     assert "submit" not in agent.system.lower()   # honest agent has no exfil channel
+
+
+def test_prompted_defender_defaults_to_the_canonical_system_prompt():
+    from redteamrl.policies.prompted import PromptedDefender, DEFENDER_SYSTEM
+    assert PromptedDefender(generate=lambda s, m: "").system == DEFENDER_SYSTEM
+
+
+def test_prompted_defender_accepts_a_style_template():
+    """The attacker phase varies the FROZEN defender's phrasing so the trainee cannot overfit one
+    wording of its opponent. The defender is not learning then, so this is opponent diversity
+    rather than distribution shift on the model under training."""
+    from redteamrl.policies.prompted import PromptedDefender
+    from redteamrl.policies.prompt_pool import DEFENDER_STYLES
+    style = DEFENDER_STYLES["reviewer"]
+    assert PromptedDefender(generate=lambda s, m: "", system_template=style).system == style
+
+
+def test_defender_styles_are_interchangeable_with_the_canonical_prompt():
+    """Every style must carry the same verdict vocabulary, or swapping one changes what the
+    defender is even allowed to say and the phase stops being comparable to the others."""
+    from redteamrl.policies.prompt_pool import DEFENDER_STYLES
+    for name, style in DEFENDER_STYLES.items():
+        for verdict in ("allow", "reject", "pass", "redact"):
+            assert f'"{verdict}"' in style, (name, verdict)
