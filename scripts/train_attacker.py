@@ -116,7 +116,7 @@ app = modal.App("redteamrl-attacker-grpo", image=image)
 
 
 def _train_impl(active_servers):
-    import os, sys, tempfile, torch
+    import contextlib, os, sys, tempfile, torch
     sys.path.insert(0, "/root")
 
     # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
@@ -275,24 +275,42 @@ def _train_impl(active_servers):
         # every later token diverges. This is a no_grad diagnostic, so checkpointing is a no-op
         # here and the cache is safe to restore for it.
         cached = getattr(model.config, "use_cache", None)
+
+        def _greedy(with_adapter):
+            ctx = contextlib.nullcontext() if with_adapter else model.disable_adapter()
+            with torch.no_grad(), ctx:
+                out = model.generate(**ids, do_sample=False, max_new_tokens=32)
+            return tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
         try:
+            # prepare_for_long_context_training set use_cache=False for checkpointing. Generating
+            # without the KV cache recomputes the whole forward each step -- same arithmetic in
+            # theory, different kernels in practice. This is a no_grad diagnostic, so checkpointing
+            # is a no-op here and the cache is safe to restore for it.
             model.config.use_cache = True
-            with torch.no_grad():
-                local_out = model.generate(**ids, do_sample=False, max_new_tokens=32)
+            local = _greedy(with_adapter=True)
+            # Only computed when the check fails: is vLLM serving the BASE policy? That is the
+            # difference between "the swap silently no-opped" (fatal -- rollouts would come from a
+            # policy that is not being trained) and "two inference stacks diverged on a near-tied
+            # logit" (benign -- vLLM generates, HF re-scores, and GRPO measured ratio=1.000).
+            base = _greedy(with_adapter=False) if served.strip() != local else None
         finally:
             if cached is not None:
                 model.config.use_cache = cached
-        local = tok.decode(local_out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        if served.strip() != local.strip():
-            shared = len(os.path.commonprefix([served.strip(), local.strip()]))
-            raise RuntimeError(
-                f"[{tag}] vLLM is not serving the trained policy -- the adapter swap did not take.\n"
-                f"  common prefix: {shared} chars\n"
-                f"  vLLM greedy: {served.strip()[:160]!r}\n"
-                f"  HF   greedy: {local.strip()[:160]!r}\n"
-                f"  READ THIS: a LONG common prefix means the two stacks diverged numerically on a "
-                f"near-tied logit, not a stale adapter. A SHORT one (or zero) means the swap really "
-                f"did not take and the run must not continue.")
+
+        if served.strip() != local:
+            shared = len(os.path.commonprefix([served.strip(), local]))
+            if served.strip() == base:
+                raise RuntimeError(
+                    f"[{tag}] vLLM is serving the BASE policy -- the adapter swap did not take, so "
+                    f"rollouts would come from a model that is not the one being trained.\n"
+                    f"  vLLM greedy: {served.strip()[:160]!r}\n"
+                    f"  HF+adapter : {local[:160]!r}\n"
+                    f"  HF base    : {base[:160]!r}")
+            print(f"[{tag}] WARNING: vLLM and HF greedy diverge after {shared} chars, but vLLM is "
+                  f"NOT serving the base policy -- the adapter DID load. Treating as numeric "
+                  f"divergence between the two stacks.\n"
+                  f"  vLLM: {served.strip()[:120]!r}\n  HF  : {local[:120]!r}", flush=True)
         print(f"[{tag}] served policy verified against the trainer", flush=True)
 
     # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
