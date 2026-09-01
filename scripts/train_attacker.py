@@ -55,7 +55,11 @@ DEF_MEM_FRAC = 0.15
 # 0.45 left the trainer only ~31.6GB and it OOM'd. Measured KV cache usage on this engine peaked at
 # 3.6% of a 19GB pool (~0.7GB), so 0.45 was ~25x over-provisioned: 0.30 still leaves ~7.4GB of KV,
 # about 10x the observed peak, and hands the trainer ~12GB back.
-ATK_MEM_FRAC = 0.30
+# 0.30 was set to survive the OOM BEFORE gradient checkpointing existed. Checkpointing cut the
+# trainer's need to ~22.7GB, leaving ~21GB idle. A 15k-token late-episode request holds 2.06GB
+# of KV, so 0.30's 7.4GB pool capped LATE-episode concurrency at ~3.6 requests -- utilisation
+# collapsed exactly as transcripts grew. 0.42 gives ~8.2 and still leaves the trainer +11GB.
+ATK_MEM_FRAC = 0.42
 ATK_MAX_MODEL_LEN = 16384
 ATK_MAX_NUM_SEQS = 16      # >= ROLLOUT_WORKERS so concurrent episodes batch
 # MEASURED 2026-08-31 (attacker_viability): thinking-6144 and no-thinking-2048 gave
