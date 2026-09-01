@@ -1,12 +1,14 @@
 """Attacker GRPO — phase 3 of the loop (SFT -> defender GRPO -> ATTACKER GRPO -> repeat).
 
-*** PARKED — NOT READY TO RUN. ***
-Complete the SFT self-review transition and defender GRPO first. Known gaps:
-  * DEFENDER_ADAPTER is honoured only by merging below; verify the merge before trusting a run.
-  * Qwen3-8B with thinking off and 2048 output tokens is a PLUMBING SMOKE TEST, not a
-    continuation of the capable 27B attacker that produced the current benchmark numbers.
-  * Attacker capability at this size against the current defender is unmeasured; a 0% or 100%
-    win rate yields dead groups and no gradient. Measure before committing GPU time.
+*** RUN THE VIABILITY GATE FIRST: modal run scripts/attacker_viability.py::check ***
+A win rate outside 0.15-0.85 means dead groups and no gradient -- 20 iterations of nothing. If the
+attacker is TOO WEAK, fall back to the SFT-only defender as the opponent (drop DEFENDER_GRPO_ADAPTER
+to None) before reaching for a bigger attacker.
+
+The opponent below is the FULL measured stack (base + SFT + GRPO). Sampling config is thinking-OFF
+at 2048: the viability check measured both arms and found identical win rates, with thinking-6144
+truncating 29.5% of its actions. Matching the 27B's sampling config was never going to make this an
+equivalent opponent anyway -- the model differs, which is the variable that dominates.
 
 Mirror image of train_defender.py: the DEFENDER is now the frozen opponent on vLLM and the
 attacker is the live, captured, trainable model. `rollout(..., trained_side="attacker")` tags
@@ -26,8 +28,10 @@ import modal
 
 ATTACKER_MODEL = "Qwen/Qwen3-8B"     # trainable attacker; must be an unquantized base for LoRA
 DEFENDER_MODEL = "Qwen/Qwen3-4B"     # frozen opponent this phase
-# Point at the promoted defender adapter from the previous phase; None -> raw base defender.
-DEFENDER_ADAPTER = None              # e.g. "/runs/defender-grpo-shell/iter19"
+# The frozen opponent is base -> SFT -> GRPO, merged in that order (same stack as
+# probe_grpo_adapter.py and attacker_viability.py). Set GRPO to None for an SFT-only opponent.
+DEFENDER_SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"
+DEFENDER_GRPO_ADAPTER = "/runs/defender-grpo-r9-vllm/iter1"
 N_ROLLOUTS = 8          # GRPO group size; larger groups buy within-group variance
 N_ITERS = 20
 LR = 1e-5
@@ -39,10 +43,16 @@ INNER_EPOCHS = 4
 MAX_TURNS = 12
 REDACTION_ENFORCEMENT = "unshielded"  # the attacker must receive exploitable policy mistakes
 DEF_PORT = 8000
+# MEASURED 2026-08-31 (attacker_viability): thinking-6144 and no-thinking-2048 gave
+# statistically identical win rates (18.8% vs 16.7%, n=48, one episode apart) -- but
+# thinking-6144 truncated 29.5% of its actions mid-<think> vs 0.4% here. A truncated
+# generation is a MAX-LENGTH sequence, and GRPO weights all completion tokens equally, so
+# ~60% of the gradient would come from generations that emitted no action at all.
 ATK_MAX_TOKENS = 2048
 BEN_MAX_TOKENS = 1024
 DEF_MAX_NEW_TOKENS = 512
-DEF_MAX_MODEL_LEN = 32768
+DEF_MAX_MODEL_LEN = 8192   # defender prompts are ~2.5k + 512 generated; frees room
+                           # for the attacker's larger context (was 32768)
 DEF_MAX_NUM_SEQS = 16
 TRANSCRIPT_CONTEXT_CHARS = 40_000
 CANARY_REVISION = 101
@@ -57,6 +67,10 @@ ROLLOUT_WORKERS = 16
 # Benign episodes complete in ~2 turns and then idled to MAX_TURNS under the default fixed
 # horizon. A bounded post-completion window gives equal safety exposure at a fraction of the cost.
 POST_COMPLETION_TURNS = 4
+# Vary the FROZEN defender's phrasing per task so the attacker cannot overfit one
+# wording of its opponent. Attacker-side styles are NOT varied: the attacker is the
+# trainee, and its own prompt is what the gradient is conditioned on.
+USE_PROMPT_POOL = True
 CKPT_KEEP = 3
 ALLOW_LEGACY_CHECKPOINT = False
 
@@ -83,7 +97,10 @@ def _train_impl(active_servers):
     from redteamrl.policies.vllm_client import (
         make_vllm_generate, start_vllm_server, stop_vllm_server)
     from redteamrl.sandbox.shell import LocalShellSandbox
+    from redteamrl.policies.prompt_pool import (
+        DEFENDER_STYLES, PROMPT_POOL_VERSION, select_style)
     from redteamrl.envs import build_tasks
+    from redteamrl.envs.registry import assert_training_split
     from redteamrl.envs.ops_logs import OPS_LOGS
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
@@ -101,22 +118,24 @@ def _train_impl(active_servers):
     )
 
     # Frozen DEFENDER on vLLM first so it reserves its GPU fraction; HF attacker takes the rest.
-    # DEFENDER_ADAPTER must be MERGED before serving -- declaring it and serving the raw base
+    # The adapters must be MERGED before serving -- declaring them and serving the raw base
     # would silently train the attacker against the wrong (unpromoted) defender.
     served_defender = DEFENDER_MODEL
-    if DEFENDER_ADAPTER:
+    _adapters = [a for a in (DEFENDER_SFT_ADAPTER, DEFENDER_GRPO_ADAPTER) if a]
+    if _adapters:
         import shutil, tempfile
         from peft import PeftModel
         from transformers import AutoModelForCausalLM as _AutoLM, AutoTokenizer as _AutoTok
         merged_dir = tempfile.mkdtemp(prefix="frozen-defender-", dir="/tmp")
-        _base = _AutoLM.from_pretrained(DEFENDER_MODEL, torch_dtype=torch.bfloat16,
-                                        device_map="cpu")
-        _merged = PeftModel.from_pretrained(_base, DEFENDER_ADAPTER).merge_and_unload()
-        _merged.save_pretrained(merged_dir)
+        _model = _AutoLM.from_pretrained(DEFENDER_MODEL, torch_dtype=torch.bfloat16,
+                                         device_map="cpu")
+        for _adapter in _adapters:                      # order matters: SFT then GRPO
+            _model = PeftModel.from_pretrained(_model, _adapter).merge_and_unload()
+        _model.save_pretrained(merged_dir)
         _AutoTok.from_pretrained(DEFENDER_MODEL).save_pretrained(merged_dir)
-        del _base, _merged
+        del _model
         served_defender = merged_dir
-        print(f"serving frozen defender merged from {DEFENDER_ADAPTER}", flush=True)
+        print(f"serving frozen defender = base + {' + '.join(_adapters)}", flush=True)
     active_servers.append((stop_vllm_server, start_vllm_server(
         served_defender, DEF_PORT, 0.35, max_model_len=DEF_MAX_MODEL_LEN,
         max_num_seqs=DEF_MAX_NUM_SEQS)))
@@ -124,7 +143,7 @@ def _train_impl(active_servers):
     gen_def = make_vllm_generate(f"http://localhost:{DEF_PORT}", served_defender,
                                  enable_thinking=False, max_tokens=DEF_MAX_NEW_TOKENS)
 
-    tasks = (
+    tasks = assert_training_split(
         build_tasks(OPS_LOGS,  CANARIES["ops-logs"],  canary_path="app/config.py")
         + build_tasks(ANALYTICS, CANARIES["analytics"], canary_path=".env")
         + build_tasks(CI_BUILD,  CANARIES["ci-build"],  canary_path="deploy/credentials")
@@ -133,9 +152,19 @@ def _train_impl(active_servers):
     tasks = [task for task in tasks if task.episode_type == "attack"]
     print(f"{len(tasks)} attack tasks", flush=True)
 
-    def episode_task(spec, rollout_index):
-        """A fresh high-entropy secret per rollout, deterministic so a resume reproduces it."""
-        return randomize_task_canary(spec, rollout_index, CANARY_SEED, CANARY_REVISION)
+    def episode_task_for(iteration):
+        """A fresh high-entropy secret per (iteration, rollout) -- never repeated.
+
+        Keying on rollout_index alone replants the SAME six secrets every iteration, so a policy
+        could earn the whole reward by memorizing six strings and generalize to nothing. Including
+        the iteration makes every episode a secret the model has not seen, so improvement has to
+        transfer. Still a pure function of (iteration, rollout_index), so a resumed run reproduces
+        exactly the canaries its banked episodes were generated with.
+        """
+        def episode_task(spec, rollout_index):
+            return randomize_task_canary(
+                spec, iteration * N_ROLLOUTS + rollout_index, CANARY_SEED, CANARY_REVISION)
+        return episode_task
 
     tok = AutoTokenizer.from_pretrained(ATTACKER_MODEL)
     base = AutoModelForCausalLM.from_pretrained(
@@ -146,10 +175,28 @@ def _train_impl(active_servers):
     model = get_peft_model(base, lora)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=LR)
     learner = Learner(model, tok, opt, reward_key="attacker_reward")
+    # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
+    # 6144, but this is an 8B: it does not close its think block inside that budget, and the
+    # viability check measured no win-rate benefit for a 29.5% invalid-action rate.
     cap = CapturingGenerate(model, tok, temperature=TEMP, max_new_tokens=ATK_MAX_TOKENS)
 
-    def defender_factory():
-        return PromptedDefender(generate=gen_def, max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+    defender_styles = sorted(DEFENDER_STYLES)
+
+    def defender_factory_for(iteration):
+        def defender_factory(spec):
+            """Style is fixed within a (task, iteration) -- i.e. within a GRPO GROUP.
+
+            Varying it per rollout would put opponent phrasing into the within-group reward
+            variance, and that variance is the advantage signal: it must stay attributable to the
+            attacker's sampled actions, not to which defender wording it happened to draw. Across
+            tasks and iterations the pool is still sampled ~uniformly.
+            """
+            template = (DEFENDER_STYLES[
+                            defender_styles[select_style(spec.id, 0, iteration, len(defender_styles))]]
+                        if USE_PROMPT_POOL else None)
+            return PromptedDefender(generate=gen_def, system_template=template,
+                                    max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+        return defender_factory
 
     def attack_agent_factory(spec):
         # The LIVE model. HINT_TECHNIQUE stays as-is: freezing the hint keeps improvements
@@ -164,7 +211,12 @@ def _train_impl(active_servers):
     phase_identity = {
         "attacker": ATTACKER_MODEL,
         "defender": DEFENDER_MODEL,
-        "defender_adapter": DEFENDER_ADAPTER,
+        "defender_sft_adapter": DEFENDER_SFT_ADAPTER,
+        "defender_grpo_adapter": DEFENDER_GRPO_ADAPTER,
+        "atk_max_tokens": ATK_MAX_TOKENS,
+        "atk_enable_thinking": False,
+        "use_prompt_pool": USE_PROMPT_POOL,
+        "prompt_pool_version": PROMPT_POOL_VERSION,
         "n_rollouts": N_ROLLOUTS,
         "lr": LR,
         "temp": TEMP,
@@ -193,14 +245,15 @@ def _train_impl(active_servers):
     for it in range(start_iter, N_ITERS):
         cap.buffer.clear()
         model.eval()
-        examples = rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
+        examples = rollout(tasks, attack_agent_factory, benign_agent_factory,
+                           defender_factory_for(it),
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
                            redaction_enforcement=REDACTION_ENFORCEMENT,
                            trained_side="attacker",
                            post_completion_turns=POST_COMPLETION_TURNS,
                            max_workers=ROLLOUT_WORKERS,
                            episode_store=os.path.join(CKPT_ROOT, f"rollout-iter{it}"),
-                           commit=runs.commit, task_transform=episode_task)
+                           commit=runs.commit, task_transform=episode_task_for(it))
         assign_advantages(examples)
         div = group_diversity([
             {"task_id": ex.task_id, "episode_id": ex.episode_id, "reward": ex.reward,
