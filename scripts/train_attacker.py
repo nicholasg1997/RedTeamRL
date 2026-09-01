@@ -50,10 +50,12 @@ DEF_PORT = 8000
 ATK_PORT = 8001
 # Frozen 4B: ~8GB of weights, prompts ~2.5k + 512 generated, so its KV need is small.
 DEF_MEM_FRAC = 0.15
-# Live 8B: ~16.4GB of weights + KV. Prompt is ~13k tokens (40k chars of transcript)
-# plus ATK_MAX_TOKENS generated, so 16384 covers a full request without paying for
-# 32k of unused per-sequence headroom. Leaves ~0.40 of the card for the HF trainer.
-ATK_MEM_FRAC = 0.45
+# Live 8B: ~16.4GB of weights + KV. gpu_memory_utilization is a HARD UP-FRONT RESERVATION --
+# vLLM takes it and never returns it -- so every point here is a point the HF trainer cannot have.
+# 0.45 left the trainer only ~31.6GB and it OOM'd. Measured KV cache usage on this engine peaked at
+# 3.6% of a 19GB pool (~0.7GB), so 0.45 was ~25x over-provisioned: 0.30 still leaves ~7.4GB of KV,
+# about 10x the observed peak, and hands the trainer ~12GB back.
+ATK_MEM_FRAC = 0.30
 ATK_MAX_MODEL_LEN = 16384
 ATK_MAX_NUM_SEQS = 16      # >= ROLLOUT_WORKERS so concurrent episodes batch
 # MEASURED 2026-08-31 (attacker_viability): thinking-6144 and no-thinking-2048 gave

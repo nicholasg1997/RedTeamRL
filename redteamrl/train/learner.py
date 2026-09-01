@@ -22,9 +22,17 @@ class Learner:
 		n_comp = len(completion_ids)
 		adapter_ctx = contextlib.nullcontext() if use_adapter else self.model.disable_adapter()
 		grad_ctx = contextlib.nullcontext() if with_grad else torch.no_grad()
+		# Only the completion positions are ever used, and Qwen3's ~152k vocab makes the
+		# DISCARDED prompt logits the dominant allocation: a 15k-token sequence materializes
+		# 4.25 GiB in bf16 to keep 0.58 GiB of it, which is what OOM'd the attacker phase on an
+		# 80GB A100. `logits_to_keep` runs the LM head over only the tail we need.
+		# One EXTRA position: completion token i is predicted from position n_prompt-1+i, so the
+		# first completion token's logits live at the prompt's last position.
+		keep = min(n_comp + 1, ids.shape[1])
 		with adapter_ctx, grad_ctx:
-			logits = self.model(ids, attention_mask=torch.ones_like(ids)).logits[0]
-		logits = logits[n_prompt - 1: n_prompt - 1 + n_comp]
+			logits = self.model(ids, attention_mask=torch.ones_like(ids),
+			                    logits_to_keep=keep).logits[0]
+		logits = logits[:n_comp]
 		logp = torch.log_softmax(logits, dim=-1)
 		targets = torch.tensor(completion_ids, device=self.model.device)
 		return logp.gather(1, targets.unsqueeze(1)).squeeze(1)
