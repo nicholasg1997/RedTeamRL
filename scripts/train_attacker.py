@@ -43,6 +43,15 @@ INNER_EPOCHS = 4
 MAX_TURNS = 12
 REDACTION_ENFORCEMENT = "unshielded"  # the attacker must receive exploitable policy mistakes
 DEF_PORT = 8000
+ATK_PORT = 8001
+# Frozen 4B: ~8GB of weights, prompts ~2.5k + 512 generated, so its KV need is small.
+DEF_MEM_FRAC = 0.15
+# Live 8B: ~16.4GB of weights + KV. Prompt is ~13k tokens (40k chars of transcript)
+# plus ATK_MAX_TOKENS generated, so 16384 covers a full request without paying for
+# 32k of unused per-sequence headroom. Leaves ~0.40 of the card for the HF trainer.
+ATK_MEM_FRAC = 0.45
+ATK_MAX_MODEL_LEN = 16384
+ATK_MAX_NUM_SEQS = 16      # >= ROLLOUT_WORKERS so concurrent episodes batch
 # MEASURED 2026-08-31 (attacker_viability): thinking-6144 and no-thinking-2048 gave
 # statistically identical win rates (18.8% vs 16.7%, n=48, one episode apart) -- but
 # thinking-6144 truncated 29.5% of its actions mid-<think> vs 0.4% here. A truncated
@@ -87,7 +96,7 @@ app = modal.App("redteamrl-attacker-grpo", image=image)
 
 
 def _train_impl(active_servers):
-    import os, sys, torch
+    import os, sys, tempfile, torch
     sys.path.insert(0, "/root")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
@@ -95,7 +104,7 @@ def _train_impl(active_servers):
         PromptedDefender, PromptedAttacker, ATTACKER_SYSTEM_SHELL, HINT_TECHNIQUE,
         BENIGN_AGENT_SYSTEM)
     from redteamrl.policies.vllm_client import (
-        make_vllm_generate, start_vllm_server, stop_vllm_server)
+        load_lora_adapter, make_vllm_generate, start_vllm_server, stop_vllm_server)
     from redteamrl.sandbox.shell import LocalShellSandbox
     from redteamrl.policies.prompt_pool import (
         DEFENDER_STYLES, PROMPT_POOL_VERSION, select_style)
@@ -104,7 +113,7 @@ def _train_impl(active_servers):
     from redteamrl.envs.ops_logs import OPS_LOGS
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
-    from redteamrl.train.capture import CapturingGenerate
+    from redteamrl.train.capture import VLLMCapturingGenerate
     from redteamrl.train.learner import Learner
     from redteamrl.train.train import rollout, assign_advantages, update_step
     from redteamrl.train.diversity import group_diversity, reward_summary
@@ -123,7 +132,7 @@ def _train_impl(active_servers):
     served_defender = DEFENDER_MODEL
     _adapters = [a for a in (DEFENDER_SFT_ADAPTER, DEFENDER_GRPO_ADAPTER) if a]
     if _adapters:
-        import shutil, tempfile
+        import shutil
         from peft import PeftModel
         from transformers import AutoModelForCausalLM as _AutoLM, AutoTokenizer as _AutoTok
         merged_dir = tempfile.mkdtemp(prefix="frozen-defender-", dir="/tmp")
@@ -137,7 +146,7 @@ def _train_impl(active_servers):
         served_defender = merged_dir
         print(f"serving frozen defender = base + {' + '.join(_adapters)}", flush=True)
     active_servers.append((stop_vllm_server, start_vllm_server(
-        served_defender, DEF_PORT, 0.35, max_model_len=DEF_MAX_MODEL_LEN,
+        served_defender, DEF_PORT, DEF_MEM_FRAC, max_model_len=DEF_MAX_MODEL_LEN,
         max_num_seqs=DEF_MAX_NUM_SEQS)))
     hf_cache.commit()
     gen_def = make_vllm_generate(f"http://localhost:{DEF_PORT}", served_defender,
@@ -175,10 +184,55 @@ def _train_impl(active_servers):
     model = get_peft_model(base, lora)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=LR)
     learner = Learner(model, tok, opt, reward_key="attacker_reward")
+    # ---- serve the SAME policy on vLLM: base backbone + the live GRPO adapter ----
+    # An HF `model.generate` trainee is why the first attempt ran at ~7% GPU utilisation: every
+    # ROLLOUT_WORKER thread calls generate() on one model, the GIL and CUDA streams serialise them
+    # into batch-1 generations, and the opponent's engine idles at `Running: 0 reqs` waiting for
+    # work. vLLM batches by in-flight request count, which is what makes concurrency pay.
+    adapter_serve_dir = tempfile.mkdtemp(prefix="grpo-live-adapter-", dir="/tmp")
+    model.save_pretrained(adapter_serve_dir)
+    # Started LAST: the defender engine and the HF trainer are both resident and static by now, so
+    # this engine's memory profiling measures only its own allocation.
+    active_servers.append((stop_vllm_server, start_vllm_server(
+        ATTACKER_MODEL, ATK_PORT, ATK_MEM_FRAC, max_model_len=ATK_MAX_MODEL_LEN,
+        max_num_seqs=ATK_MAX_NUM_SEQS, lora_name="attacker", lora_path=adapter_serve_dir,
+    )))
+
+    def publish_policy(tag):
+        """Push the current adapter to vLLM and PROVE the served policy matches the trained one.
+
+        A swap that silently no-ops would keep generating from a stale policy while HF reports a
+        healthy KL -- rollouts and gradients would quietly describe different models.
+        """
+        model.save_pretrained(adapter_serve_dir)
+        load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", adapter_serve_dir)
+        probe_system, probe_user = "You are an agent.", "Reply with one short JSON object."
+        served = VLLMCapturingGenerate(
+            base_url=f"http://localhost:{ATK_PORT}", model="attacker", tokenizer=tok,
+            temperature=0.0, max_new_tokens=32,
+        )(probe_system, [{"role": "user", "content": probe_user}])
+        probe_prompt = tok.apply_chat_template(
+            [{"role": "system", "content": probe_system},
+             {"role": "user", "content": probe_user}],
+            add_generation_prompt=True, enable_thinking=False, tokenize=False)
+        ids = tok(probe_prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
+        model.eval()
+        with torch.no_grad():
+            local_out = model.generate(**ids, do_sample=False, max_new_tokens=32)
+        local = tok.decode(local_out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
+        if served.strip() != local.strip():
+            raise RuntimeError(
+                f"[{tag}] vLLM is not serving the trained policy -- the adapter swap did not take. "
+                f"vLLM greedy: {served.strip()[:160]!r} vs HF greedy: {local.strip()[:160]!r}")
+        print(f"[{tag}] served policy verified against the trainer", flush=True)
+
     # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
     # 6144, but this is an 8B: it does not close its think block inside that budget, and the
     # viability check measured no win-rate benefit for a 29.5% invalid-action rate.
-    cap = CapturingGenerate(model, tok, temperature=TEMP, max_new_tokens=ATK_MAX_TOKENS)
+    cap = VLLMCapturingGenerate(
+        base_url=f"http://localhost:{ATK_PORT}", model="attacker", tokenizer=tok,
+        temperature=TEMP, max_new_tokens=ATK_MAX_TOKENS,
+    )
 
     defender_styles = sorted(DEFENDER_STYLES)
 
@@ -242,6 +296,7 @@ def _train_impl(active_servers):
     else:
         print("no checkpoint found — starting fresh at iter 0", flush=True)
 
+    publish_policy(f"iter{start_iter} pre-rollout")
     for it in range(start_iter, N_ITERS):
         cap.buffer.clear()
         model.eval()
@@ -283,6 +338,7 @@ def _train_impl(active_servers):
         model.save_pretrained(ckpt)
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity})
+        publish_policy(f"iter{it} post-update")
         prune_checkpoints(CKPT_ROOT, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.
