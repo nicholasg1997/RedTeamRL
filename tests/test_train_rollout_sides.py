@@ -45,7 +45,7 @@ def _run(monkeypatch, trained_side):
     _patched(monkeypatch, cap, defender_reward=-2.0, attacker_reward=0.9)
     return rollout(
         [_spec("t-attack", "attack")],
-        lambda spec: None, lambda spec: None, lambda: None,
+        lambda spec: None, lambda spec: None, lambda spec: None,
         lambda: SimpleNamespace(close=lambda: None),
         cap, n_rollouts=2, trained_side=trained_side,
     )
@@ -84,7 +84,7 @@ def test_verdicts_are_captured_for_diversity(monkeypatch):
     monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
     examples = rollout(
         [_spec("t-attack", "attack")],
-        lambda spec: None, lambda spec: None, lambda: None,
+        lambda spec: None, lambda spec: None, lambda spec: None,
         lambda: SimpleNamespace(close=lambda: None),
         cap, n_rollouts=1, trained_side="defender",
     )

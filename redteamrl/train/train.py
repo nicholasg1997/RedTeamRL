@@ -30,7 +30,12 @@ def _tally_invalid(diag: dict, episode_type: str, result) -> None:
 def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factory,
                      capturing_generate, max_turns, post_completion_turns,
                      redaction_enforcement, trained_side):
-	"""Run one episode into its OWN capture buffer and tag every example it produced."""
+	"""Run one episode into its OWN capture buffer and tag every example it produced.
+
+	`defender_factory(spec)` mirrors `attack_agent_factory(spec)`: the attacker phase varies the
+	frozen defender's system prompt per task, so the trainee cannot overfit one phrasing of its
+	opponent. (sft/collect.py keeps its own no-arg contract; it has separate callers.)
+	"""
 	agent = factory(spec)
 	sandbox = sandbox_factory()
 	with capturing_generate.episode_capture() as episode_examples:
@@ -38,7 +43,7 @@ def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factor
 			result = run_episode(
 				spec,
 				agent,
-				defender_factory(),
+				defender_factory(spec),
 				sandbox,
 				max_turns=max_turns,
 				post_completion_turns=post_completion_turns,

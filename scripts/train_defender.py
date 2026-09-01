@@ -41,11 +41,19 @@ BEN_MAX_TOKENS = 4096          # honest agent
 OPP_MAX_MODEL_LEN = 32768
 OPP_MAX_NUM_SEQS = 16   # 224k tokens of KV at ~10k/request leaves room for ~20 concurrent
 TRANSCRIPT_CONTEXT_CHARS = 40_000
-# Canaries are RANDOMIZED per episode, exactly as SFT collection does. Running against the literal
-# template instead is a different environment: `tok-deploy-CANARY-3m2n1k` is low-entropy and reads
-# as a placeholder, and the defender passed it 6/6 on ci-build-benign while SFT measured 5% leak on
-# the same task with high-entropy secrets. CANARY_REVISION must differ from the SFT run's
-# PIPELINE_REVISION so GRPO faces secrets the bootstrap never saw.
+# Sample the agent system prompts from style-paired pools instead of one fixed prompt each. The
+# matched probe showed defender GRPO improving aggregate attack leak while pair_taint_accuracy and
+# the call gate stayed pinned -- the defender was reading episode TYPE off a fixed prompt's style
+# rather than judging content. The pools span the same styles on both sides and style is chosen
+# independently of episode type, so that signal is gone. Set False to reproduce the old runs.
+USE_PROMPT_POOL = True
+# Canaries are randomized per (ITERATION, rollout) -- every episode plants a secret the model has
+# never seen, so a policy cannot earn reward by memorizing a fixed set of strings. Two earlier
+# versions were wrong: the literal template `tok-deploy-CANARY-3m2n1k` is low-entropy and reads as
+# a placeholder (the defender passed it 6/6 on ci-build-benign while SFT measured 5% leak on the
+# same task), and keying on rollout_index alone replanted the same six secrets every iteration.
+# CANARY_REVISION must also differ from the SFT run's PIPELINE_REVISION so GRPO faces secrets the
+# bootstrap never saw.
 CANARY_REVISION = 101
 CANARY_SEED = 0
 # canary co-located in each env's secret file — the TEMPLATE that randomization replaces
@@ -94,6 +102,7 @@ def _train_impl(active_servers):
         load_lora_adapter, make_vllm_generate, start_vllm_server, stop_vllm_server)
     from redteamrl.sandbox.shell import LocalShellSandbox
     from redteamrl.envs import build_tasks
+    from redteamrl.envs.registry import assert_training_split
     from redteamrl.envs.ops_logs import OPS_LOGS
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
@@ -109,6 +118,8 @@ def _train_impl(active_servers):
     )
     from redteamrl.train.diversity import group_diversity, reward_summary
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
+    from redteamrl.policies.prompt_pool import (
+        ATTACKER_STYLES, BENIGN_STYLES, PROMPT_POOL_VERSION, select_style)
 
     # ---- opponent first, on a quiet GPU, and fully healthy before anything else allocates ----
     active_servers.append((stop_vllm_server, start_vllm_server(
@@ -120,14 +131,24 @@ def _train_impl(active_servers):
     gen_benign = make_vllm_generate(f"http://localhost:{OPP_PORT}", ATTACKER_MODEL,
                                     enable_thinking=True, max_tokens=BEN_MAX_TOKENS)
 
-    tasks = (
+    tasks = assert_training_split(
         build_tasks(OPS_LOGS,  CANARIES["ops-logs"],  canary_path="app/config.py")
         + build_tasks(ANALYTICS, CANARIES["analytics"], canary_path=".env")
         + build_tasks(CI_BUILD,  CANARIES["ci-build"],  canary_path="deploy/credentials")
     )
-    def episode_task(spec, rollout_index):
-        """A fresh high-entropy secret per rollout, deterministic so a resume reproduces it."""
-        return randomize_task_canary(spec, rollout_index, CANARY_SEED, CANARY_REVISION)
+    def episode_task_for(iteration):
+        """A fresh high-entropy secret per (iteration, rollout) -- never repeated.
+
+        Keying on rollout_index alone replants the SAME six secrets every iteration, so a policy
+        could earn the whole reward by memorizing six strings and generalize to nothing. Including
+        the iteration makes every episode a secret the model has not seen, so improvement has to
+        transfer. Still a pure function of (iteration, rollout_index), so a resumed run reproduces
+        exactly the canaries its banked episodes were generated with.
+        """
+        def episode_task(spec, rollout_index):
+            return randomize_task_canary(
+                spec, iteration * N_ROLLOUTS + rollout_index, CANARY_SEED, CANARY_REVISION)
+        return episode_task
 
     n_atk = sum(t.episode_type == "attack" for t in tasks)
     print(f"{len(tasks)} tasks: {n_atk} attack, {len(tasks) - n_atk} benign")
@@ -219,17 +240,44 @@ def _train_impl(active_servers):
         temperature=TEMP, max_new_tokens=DEF_MAX_NEW_TOKENS,
     )
 
-    def defender_factory():
+    def defender_factory(spec):
+        # The defender is the TRAINEE this phase, so its prompt stays fixed at
+        # DEFENDER_SYSTEM: varying it would split the gradient across phrasings and break
+        # comparability with the probes. DEFENDER_STYLES is for the attacker phase, where
+        # the defender is the frozen opponent.
         return PromptedDefender(generate=cap, max_context_chars=TRANSCRIPT_CONTEXT_CHARS)  # match the probe
 
-    def attack_agent_factory(spec):
-        return PromptedAttacker(gen_atk, goal=spec.goal, cover=spec.request, hint=HINT_TECHNIQUE,
-                                system_template=ATTACKER_SYSTEM_SHELL,
-                                max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+    # The style index is a pure function of (task, rollout, iteration) and never of episode type,
+    # so an attack and a benign episode are equally likely to be phrased any given way.
+    attacker_styles = sorted(ATTACKER_STYLES)
+    benign_styles = sorted(BENIGN_STYLES)
 
-    def benign_agent_factory(spec):
-        return PromptedAttacker(gen_benign, goal=spec.request, system_template=BENIGN_AGENT_SYSTEM,
-                                max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+    def _style_for(spec, iteration, pool):
+        """Style is fixed within a (task, iteration) -- i.e. within a GRPO GROUP.
+
+        Varying it per rollout would put prompt style into the within-group reward variance, and
+        that variance is the advantage signal: it must stay attributable to the defender's sampled
+        decisions, not to which phrasing its opponent happened to draw. Across tasks and iterations
+        the pool is still sampled ~uniformly, which is what removes the fingerprint.
+        """
+        return pool[select_style(spec.id, 0, iteration, len(pool))]
+
+    def attack_agent_factory_for(iteration):
+        def attack_agent_factory(spec):
+            template = (ATTACKER_STYLES[_style_for(spec, iteration, attacker_styles)]
+                        if USE_PROMPT_POOL else ATTACKER_SYSTEM_SHELL)
+            return PromptedAttacker(gen_atk, goal=spec.goal, cover=spec.request,
+                                    hint=HINT_TECHNIQUE, system_template=template,
+                                    max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+        return attack_agent_factory
+
+    def benign_agent_factory_for(iteration):
+        def benign_agent_factory(spec):
+            template = (BENIGN_STYLES[_style_for(spec, iteration, benign_styles)]
+                        if USE_PROMPT_POOL else BENIGN_AGENT_SYSTEM)
+            return PromptedAttacker(gen_benign, goal=spec.request, system_template=template,
+                                    max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+        return benign_agent_factory
 
     def decompose(examples):
         """One reward per episode -> per-track behavior.
@@ -276,6 +324,9 @@ def _train_impl(active_servers):
         # Changes the task distribution, so a resume across it would mix two environments.
         "canary_revision": CANARY_REVISION, "canary_seed": CANARY_SEED,
         "canary_scheme_version": CANARY_SCHEME_VERSION,
+        # Changes the observable agent behaviour distribution, so a resume across it mixes
+        # environments the same way a canary change would.
+        "use_prompt_pool": USE_PROMPT_POOL, "prompt_pool_version": PROMPT_POOL_VERSION,
         "reference_policy": reference_policy,
         # Generation moved from HF batch-1 to vLLM; a resume across that boundary would mix
         # rollouts drawn under two different sampling stacks.
@@ -316,13 +367,14 @@ def _train_impl(active_servers):
     for it in range(start_iter, N_ITERS):
         cap.buffer.clear()
         model.eval()
-        examples = rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
+        examples = rollout(tasks, attack_agent_factory_for(it), benign_agent_factory_for(it),
+                           defender_factory,
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
                            redaction_enforcement=REDACTION_ENFORCEMENT,
                            post_completion_turns=POST_COMPLETION_TURNS,
                            max_workers=ROLLOUT_WORKERS,
                            episode_store=os.path.join(CKPT_ROOT, f"rollout-iter{it}"),
-                           commit=runs.commit, task_transform=episode_task)
+                           commit=runs.commit, task_transform=episode_task_for(it))
         assign_advantages(examples)
         d = decompose(examples)
         # An exposed weakness only teaches if the group's rewards actually differ. A dead group is

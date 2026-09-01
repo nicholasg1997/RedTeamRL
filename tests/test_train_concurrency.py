@@ -73,7 +73,7 @@ def test_concurrent_rollout_never_cross_attributes_rewards(monkeypatch):
              SimpleNamespace(id="bad", episode_type="attack")]
 
     examples = rollout(
-        specs, lambda s: None, lambda s: None, lambda: None,
+        specs, lambda s: None, lambda s: None, lambda s: None,
         lambda: SimpleNamespace(close=lambda: None),
         cap, n_rollouts=4, max_workers=8,
     )
@@ -98,7 +98,7 @@ def test_sequential_default_is_unchanged(monkeypatch):
     monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
     examples = rollout(
         [SimpleNamespace(id="t", episode_type="benign")],
-        lambda s: None, lambda s: None, lambda: None,
+        lambda s: None, lambda s: None, lambda s: None,
         lambda: SimpleNamespace(close=lambda: None),
         cap, n_rollouts=3,
     )
@@ -128,7 +128,7 @@ def test_rollout_resumes_from_banked_episodes_instead_of_rerunning(monkeypatch, 
     first_calls = []
     cap = _cap()
     monkeypatch.setattr(train_mod, "run_episode", _episode_fake(cap, first_calls))
-    full = rollout(specs, lambda s: None, lambda s: None, lambda: None,
+    full = rollout(specs, lambda s: None, lambda s: None, lambda s: None,
                    lambda: SimpleNamespace(close=lambda: None),
                    cap, n_rollouts=3, episode_store=store)
     assert len(first_calls) == 6
@@ -140,7 +140,7 @@ def test_rollout_resumes_from_banked_episodes_instead_of_rerunning(monkeypatch, 
     resumed_calls = []
     cap2 = _cap()
     monkeypatch.setattr(train_mod, "run_episode", _episode_fake(cap2, resumed_calls))
-    resumed = rollout(specs, lambda s: None, lambda s: None, lambda: None,
+    resumed = rollout(specs, lambda s: None, lambda s: None, lambda s: None,
                       lambda: SimpleNamespace(close=lambda: None),
                       cap2, n_rollouts=3, episode_store=store)
 
@@ -158,7 +158,7 @@ def test_commit_runs_once_per_task_from_the_calling_thread(monkeypatch, tmp_path
     threads = []
     rollout([SimpleNamespace(id="good", episode_type="benign"),
              SimpleNamespace(id="bad", episode_type="attack")],
-            lambda s: None, lambda s: None, lambda: None,
+            lambda s: None, lambda s: None, lambda s: None,
             lambda: SimpleNamespace(close=lambda: None),
             cap, n_rollouts=2, max_workers=4,
             episode_store=str(tmp_path / "iter0"),
@@ -193,7 +193,7 @@ def test_episodes_from_different_tasks_run_at_the_same_time(monkeypatch, tmp_pat
     monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
     specs = [SimpleNamespace(id=f"t{i}", episode_type="benign") for i in range(4)]
 
-    rollout(specs, lambda s: None, lambda s: None, lambda: None,
+    rollout(specs, lambda s: None, lambda s: None, lambda s: None,
             lambda: SimpleNamespace(close=lambda: None),
             cap, n_rollouts=3, max_workers=12)
 
@@ -214,7 +214,7 @@ def test_examples_stay_in_deterministic_task_order_despite_completion_order(monk
     monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
     specs = [SimpleNamespace(id=f"t{i}", episode_type="benign") for i in range(3)]
 
-    examples = rollout(specs, lambda s: None, lambda s: None, lambda: None,
+    examples = rollout(specs, lambda s: None, lambda s: None, lambda s: None,
                        lambda: SimpleNamespace(close=lambda: None),
                        cap, n_rollouts=2, max_workers=8)
 
@@ -243,7 +243,7 @@ def test_task_transform_gives_each_rollout_its_own_task_without_breaking_attribu
         return SimpleNamespace(id=original.id, episode_type=original.episode_type,
                                forbidden=[f"secret-{rollout_index}"])
 
-    examples = rollout([spec], lambda s: None, lambda s: None, lambda: None,
+    examples = rollout([spec], lambda s: None, lambda s: None, lambda s: None,
                        lambda: SimpleNamespace(close=lambda: None),
                        cap, n_rollouts=3, task_transform=transform)
 
@@ -266,7 +266,7 @@ def test_no_transform_leaves_the_task_untouched(monkeypatch):
 
     monkeypatch.setattr(train_mod, "run_episode", fake_run_episode)
     rollout([SimpleNamespace(id="t0", episode_type="benign", forbidden=["TEMPLATE"])],
-            lambda s: None, lambda s: None, lambda: None,
+            lambda s: None, lambda s: None, lambda s: None,
             lambda: SimpleNamespace(close=lambda: None), cap, n_rollouts=2)
 
     assert seen == ["TEMPLATE", "TEMPLATE"]
