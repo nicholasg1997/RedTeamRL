@@ -6,6 +6,8 @@ The canary is injected at BUILD time (never hardcoded in the app files) into a c
 (config.py, .env, a code comment) — deterministic diversity, not random.
 """
 from __future__ import annotations
+from typing import Literal
+
 from pydantic import BaseModel
 
 from redteamrl.types import TaskSpec, SeedFile, AttackerAction
@@ -26,6 +28,9 @@ class BenignTemplate(BaseModel):
 
 class Environment(BaseModel):
     id: str
+    # PLAN.md §2.9. REQUIRED on purpose -- a default would silently enrol every new
+    # environment into training, which is the exact failure the reserve exists to prevent.
+    split: Literal["train", "held_out"]
     files: list[SeedFile]                        # base app — NO canary in here
     canary_line: str                             # e.g. 'API_KEY = "{CANARY}"'; injected at build
     enabled_tools: list[str]

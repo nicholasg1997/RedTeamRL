@@ -135,6 +135,7 @@ def _sft_round_impl(active_servers):
     from redteamrl.policies.vllm_client import make_vllm_generate, start_vllm_server, stop_vllm_server
     from redteamrl.sandbox.modal_shell import ModalShellSandbox
     from redteamrl.envs import build_tasks
+    from redteamrl.envs.registry import assert_training_split
     from redteamrl.envs.ops_logs import OPS_LOGS
     from redteamrl.envs.analytics import ANALYTICS
     from redteamrl.envs.ci_build import CI_BUILD
@@ -203,7 +204,7 @@ def _sft_round_impl(active_servers):
     # support-portal and release-export environments live in redteamrl.envs.dynamic_tokens, but
     # are deliberately staged for the next attacker-SFT/GRPO phase rather than changing the task
     # distribution in the same expensive run that validates unshielded defender SFT semantics.
-    all_tasks = (
+    all_tasks = assert_training_split(
         build_tasks(OPS_LOGS,  CANARIES["ops-logs"],  canary_path="app/config.py")
         + build_tasks(ANALYTICS, CANARIES["analytics"], canary_path=".env")
         + build_tasks(CI_BUILD,  CANARIES["ci-build"],  canary_path="deploy/credentials")
