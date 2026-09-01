@@ -87,7 +87,13 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
     .pip_install("vllm==0.21.0", "requests", "torch>=2.2", "transformers<5", "peft>=0.11",
                  "accelerate>=0.30", "pydantic", "pyyaml", "tqdm")
-    .env({"HF_HOME": "/cache/huggingface", "PYTHONUNBUFFERED": "1"})
+    # expandable_segments reduces fragmentation between the vLLM reservations and the HF trainer,
+    # which share one A100 and allocate in very different block sizes.
+    .env({"HF_HOME": "/cache/huggingface", "PYTHONUNBUFFERED": "1",
+          "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+          # Required for /v1/load_lora_adapter: without it vLLM does not register the route at all
+          # and the swap 404s. Startup --lora-modules works regardless, so the server looks healthy.
+          "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"})
     .add_local_dir("redteamrl", remote_path="/root/redteamrl")
 )
 hf_cache = modal.Volume.from_name("redteamrl-hf-cache", create_if_missing=True)
@@ -98,6 +104,15 @@ app = modal.App("redteamrl-attacker-grpo", image=image)
 def _train_impl(active_servers):
     import os, sys, tempfile, torch
     sys.path.insert(0, "/root")
+
+    # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
+    # /v1/load_lora_adapter when this is set, and publish_policy's swap 404s without it -- correct
+    # (a stale adapter must never be served) but discovered far too late to be cheap.
+    if os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "").lower() not in ("1", "true"):
+        raise RuntimeError(
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING is not set on the image. vLLM will not expose "
+            "/v1/load_lora_adapter, so the per-iteration adapter swap cannot work. Add it to the "
+            "image .env({...}) block.")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
     from redteamrl.policies.prompted import (
