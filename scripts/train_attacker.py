@@ -422,7 +422,12 @@ def _train_impl(active_servers):
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
                         inner_epochs=INNER_EPOCHS)
+        # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish
+        # "the gradient is tiny, raise LR" from "the gradient is fine, we need more steps" --
+        # ratio alone cannot, and this script was silently dropping both.
         print(f"iter {it:3d} update   loss={m['loss']:.4f}  ratio={m['mean_ratio']:.3f}  "
+              f"kl={m['mean_kl']:.5f}  grad={m['grad_norm']:.4f}  "
+              f"epoch_ratios={[round(r, 4) for r in m['epoch_ratios']]}  "
               f"live={m['n_live_examples']}/{m['n_examples']}", flush=True)
 
         ckpt = os.path.join(CKPT_ROOT, f"iter{it}")
