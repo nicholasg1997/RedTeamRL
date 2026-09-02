@@ -97,3 +97,36 @@ def test_defender_json_weights_decision_suffix_more_than_reasoning():
 
     # The stub tokenizer emits one token per segment: reasoning JSON prefix, decision suffix, EOS.
     assert supervised == [1.0, 5.0, 5.0]
+
+
+class _Tok:
+    eos_token_id = 0
+
+    def apply_chat_template(self, chat, add_generation_prompt, enable_thinking):
+        return [1, 2]
+
+    def __call__(self, seg, add_special_tokens=False):
+        # one id per character keeps the mapping trivial to assert on
+        return {"input_ids": [ord(c) % 50 + 3 for c in seg]}
+
+
+def test_masked_attacker_action_gets_zero_weight_on_the_json_span():
+    ex = {"system": "s", "prompt": "p",
+          "target": 'too direct\n{"kind": "tool_call"}', "action_loss_weight": 0.0}
+    input_ids, labels, weights = encode_example(_Tok(), ex)
+    # the reasoning span 'too direct\n' has weight 1.0; the JSON span has weight 0.0; eos > 0? see below
+    assert any(w == 1.0 for w in weights) and any(w == 0.0 for w in weights)
+    # the trailing JSON characters must all be zero-weighted
+    json_len = len('{"kind": "tool_call"}')
+    assert all(w == 0.0 for w in weights[-(json_len + 1):])   # +1 for eos, also 0 when masked
+
+
+def test_unmasked_attacker_action_weight_one():
+    ex = {"system": "s", "prompt": "p",
+          "target": 'good move\n{"kind": "submit", "value": "x"}', "action_loss_weight": 1.0}
+    tok = _Tok()
+    _, _, weights = encode_example(tok, ex)
+    # weights[:len(prompt_ids)] are the (always-0.0) prompt positions; everything from the start of
+    # the target (reasoning + JSON action + eos) must be trained at 1.0 when the action is unmasked.
+    prompt_len = len(tok.apply_chat_template([], True, False))
+    assert all(w == 1.0 for w in weights[prompt_len:])  # everything trained

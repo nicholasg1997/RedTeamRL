@@ -26,6 +26,44 @@ def _target_segments(target: str, decision_loss_weight: float) -> list[tuple[str
 	return [(reasoning_segment, 1.0), (decision_segment, decision_loss_weight)]
 
 
+def _last_json_span(raw: str) -> tuple[int, int] | None:
+	"""Return the (start, end) char span of the LAST top-level JSON object in `raw`, or None.
+
+	Mirrors the scan in `redteamrl.harness.protocol._extract_json`, but returns the object's
+	position instead of the parsed object itself, so a caller can split `raw` into a reasoning
+	prefix and an action suffix. On each decode we jump the cursor past the consumed span, so a
+	nested object (like an `args` dict) is never mistaken for a top-level one.
+	"""
+	decoder = json.JSONDecoder()
+	found = None
+	i, n = 0, len(raw)
+	while i < n:
+		if raw[i] == "{":
+			try:
+				obj, end = decoder.raw_decode(raw[i:])
+			except json.JSONDecodeError:
+				i += 1
+				continue
+			if isinstance(obj, dict):
+				found = (i, i + end)
+				i += end
+				continue
+		i += 1
+	return found
+
+
+def _attacker_target_segments(target: str, action_loss_weight: float) -> list[tuple[str, float]]:
+	"""Split an attacker target `reasoning\n{json action}` into a reasoning prefix trained at
+	weight 1.0 and the trailing JSON-action span trained at `action_loss_weight` (0.0 masks a
+	rejected/undesirable action out of the gradient entirely). Falls back to training the whole
+	target at 1.0 if no JSON object can be found."""
+	span = _last_json_span(target)
+	if span is None:
+		return [(target, 1.0)]
+	start, stop = span
+	return [(target[:start], 1.0), (target[start:stop], action_loss_weight)]
+
+
 def encode_example(
 	tok,
 	ex: dict,
@@ -39,13 +77,19 @@ def encode_example(
 	)
 	target_ids: list[int] = []
 	target_weights: list[float] = []
-	segments = _target_segments(ex["target"], decision_loss_weight)
+	is_attacker_example = "action_loss_weight" in ex
+	if is_attacker_example:
+		segments = _attacker_target_segments(ex["target"], ex["action_loss_weight"])
+	else:
+		segments = _target_segments(ex["target"], decision_loss_weight)
 	for segment, weight in segments:
 		segment_ids = tok(segment, add_special_tokens=False)["input_ids"]
 		target_ids.extend(segment_ids)
 		target_weights.extend([weight] * len(segment_ids))
 	target_ids.append(tok.eos_token_id)
-	target_weights.append(segments[-1][1])
+	# A masked action masks its terminator too, so the eos weight always tracks the action weight
+	# for an attacker example — including the (rare) fallback where no JSON span was found.
+	target_weights.append(ex["action_loss_weight"] if is_attacker_example else segments[-1][1])
 	input_ids = prompt_ids + target_ids
 	labels = [-100] * len(prompt_ids) + target_ids
 	loss_weights = [0.0] * len(prompt_ids) + target_weights
