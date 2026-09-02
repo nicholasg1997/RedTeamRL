@@ -4,7 +4,6 @@ from redteamrl.attack_sft.rationalize import (
     WIN_FRAMING,
     ROUTINE_FRAMING,
     BOUNDARY_FRAMING,
-    NEARMISS_FRAMING,
 )
 
 
@@ -13,8 +12,11 @@ def test_authoring_prompt_contains_observation_and_action_not_the_future():
     assert "config.py" in p and "read_file" in p
 
 
-def test_nearmiss_framing_names_the_block_not_a_fix():
-    assert "redact" in NEARMISS_FRAMING.lower() or "block" in NEARMISS_FRAMING.lower()
+def test_nearmiss_framing_is_retired():
+    """Episode-level near-miss framing is gone (Task 5): pipeline.py is turn-level now, and
+    boundary turns use BOUNDARY_FRAMING for both allowed-after-prior-failure and rejected turns."""
+    import redteamrl.attack_sft.rationalize as R
+    assert not hasattr(R, "NEARMISS_FRAMING")
 
 
 def test_author_turn_returns_reasoning_text():
