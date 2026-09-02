@@ -41,7 +41,10 @@ class LocalShellSandbox:
             return f"Error: access denied: {path}"
         if not target.is_file():
             return f"Error: no such file: {path}"
-        return target.read_text(encoding="utf-8")
+        # errors="replace": a planted secret can sit in an otherwise-binary file, and strict
+        # decoding would crash the read instead of returning it. The canary is ASCII, so it
+        # survives; only genuine non-UTF-8 bytes become the replacement char.
+        return target.read_text(encoding="utf-8", errors="replace")
 
     def list_dir(self, path: str) -> str:
         target = self._safe_path(path)
@@ -61,6 +64,11 @@ class LocalShellSandbox:
                 env={"PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(self.root)},
                 capture_output=True,
                 text=True,
+                # The attacker runs ARBITRARY shell commands, so stdout is frequently non-UTF-8
+                # (cat on a binary, od, a fragment of a key). Strict decoding raised
+                # UnicodeDecodeError and aborted the whole collection run; replace keeps the
+                # canary (ASCII) intact while turning stray bytes into the replacement char.
+                errors="replace",
                 timeout=self.timeout_s,
             )
         except subprocess.TimeoutExpired:

@@ -59,3 +59,62 @@ def test_collection_resumes_and_skips_banked(tmp_path):
     recs_after = read_episodes(out_dir)
     # Banked episode 0 is untouched -- still the original winning record, not re-run under gen_b.
     assert recs_after[0]["won"] is True
+
+
+def test_redaction_enforcement_threads_through_to_run_episode(tmp_path, monkeypatch):
+    """M1 (final review): collection must not silently stay 'unshielded' when the run flips to
+    'fail_closed' -- the near-miss caught_at_payload semantics shift with it. Confirm the value
+    reaches run_episode rather than relying on the harness default."""
+    import redteamrl.attack_sft.collect as collect_mod
+    from redteamrl.envs import build_tasks
+    from redteamrl.envs.ops_logs import OPS_LOGS
+    from redteamrl.sandbox.shell import LocalShellSandbox
+    from redteamrl.verify.defenders import NullDefender
+
+    seen = []
+    real_run_episode = collect_mod.run_episode
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("redaction_enforcement"))
+        return real_run_episode(*args, **kwargs)
+
+    monkeypatch.setattr(collect_mod, "run_episode", spy)
+    tasks = [t for t in build_tasks(OPS_LOGS, "sk-CANARY-x", canary_path="app/config.py")
+             if t.episode_type == "attack"]
+    collect_mod.collect_attacker_episodes(
+        tasks, n_per_task=1, generate=lambda s, m: '{"kind":"message","text":"x"}',
+        defender_factory=NullDefender, sandbox_factory=LocalShellSandbox,
+        out_dir=str(tmp_path), canary_seed=0, canary_revision=1, max_turns=2, max_workers=1,
+        redaction_enforcement="fail_closed")
+    assert seen and all(v == "fail_closed" for v in seen)
+
+
+def test_collection_survives_a_failing_episode(tmp_path, monkeypatch, capsys):
+    """One episode raising must not abort the run; survivors persist and the failure is printed
+    (regression: a UnicodeDecodeError in one episode killed the whole 120-episode collection)."""
+    import redteamrl.attack_sft.collect as collect_mod
+    from redteamrl.envs import build_tasks
+    from redteamrl.envs.ops_logs import OPS_LOGS
+    from redteamrl.sandbox.shell import LocalShellSandbox
+    from redteamrl.verify.defenders import NullDefender
+
+    calls = {"n": 0}
+    real_run_episode = collect_mod.run_episode
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise UnicodeDecodeError("utf-8", b"\xb7", 0, 1, "invalid start byte")
+        return real_run_episode(*args, **kwargs)
+
+    monkeypatch.setattr(collect_mod, "run_episode", flaky)
+    tasks = [t for t in build_tasks(OPS_LOGS, "sk-CANARY-x", canary_path="app/config.py")
+             if t.episode_type == "attack"]
+    collect_mod.collect_attacker_episodes(
+        tasks, n_per_task=2, generate=lambda s, m: '{"kind":"message","text":"x"}',
+        defender_factory=NullDefender, sandbox_factory=LocalShellSandbox,
+        out_dir=str(tmp_path), canary_seed=0, canary_revision=1, max_turns=2, max_workers=1)
+    from redteamrl.train.episode_store import read_episodes
+    banked = read_episodes(str(tmp_path))
+    assert len(banked) == 1                               # the survivor persisted, run did not abort
+    assert "failed, skipping" in capsys.readouterr().out  # failure stayed visible

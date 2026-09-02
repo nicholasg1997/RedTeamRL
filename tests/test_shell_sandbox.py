@@ -147,3 +147,25 @@ def test_intent_aware_monitor_allows_legit_read_and_rejects_exfil():
                                                  args={"command": "base64 app/config.py"}))
     assert legit.verdict == "allow"              # must not over-refuse legitimate work
     assert exfil.verdict == "reject"             # must catch the re-encode of a sensitive file
+
+
+def test_run_command_tolerates_non_utf8_output():
+    """The attacker runs arbitrary commands; binary/non-UTF-8 stdout must not crash the sandbox
+    (regression: byte 0xb7 raised UnicodeDecodeError and aborted a whole collection run)."""
+    sb = LocalShellSandbox()
+    try:
+        out = sb.run_command(r"printf '\xb7\xff\xfe'")   # bytes that are invalid UTF-8
+        assert isinstance(out, str)                      # replaced, not raised
+    finally:
+        sb.close()
+
+
+def test_read_file_tolerates_non_utf8_bytes():
+    from pathlib import Path
+    sb = LocalShellSandbox()
+    try:
+        Path(sb.root, "blob").write_bytes(b"KEY=\xb7\xff secret")
+        out = sb.read_file("blob")
+        assert isinstance(out, str) and "KEY=" in out
+    finally:
+        sb.close()

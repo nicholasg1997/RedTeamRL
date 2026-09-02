@@ -72,7 +72,7 @@ class CapturingAttacker:
 
 
 def _run_one(spec, episode_id, rollout_index, capturing, defender_factory, sandbox_factory,
-            canary_seed, canary_revision, max_turns) -> dict:
+            canary_seed, canary_revision, max_turns, redaction_enforcement) -> dict:
     """Run one episode and assemble its record. Called from a worker thread; `write_episode` is
     documented safe there, so the caller persists the returned record directly, no hand-off."""
     episode_spec = randomize_task_canary(spec, rollout_index, canary_seed, canary_revision)
@@ -89,7 +89,8 @@ def _run_one(spec, episode_id, rollout_index, capturing, defender_factory, sandb
     )
     with capturing.episode_capture():
         try:
-            result = run_episode(episode_spec, attacker, defender, sandbox, max_turns=max_turns)
+            result = run_episode(episode_spec, attacker, defender, sandbox, max_turns=max_turns,
+                                 redaction_enforcement=redaction_enforcement)
         finally:
             sandbox.close()
         captured_turns = capturing.turns_for_current_episode()
@@ -110,7 +111,7 @@ def _run_one(spec, episode_id, rollout_index, capturing, defender_factory, sandb
 
 def collect_attacker_episodes(tasks, n_per_task, generate, defender_factory, sandbox_factory,
                               out_dir, canary_seed, canary_revision, max_turns, max_workers,
-                              commit=None) -> None:
+                              commit=None, redaction_enforcement="unshielded") -> None:
     """Run `n_per_task` rollouts per attack task, persisting one record per episode.
 
     `tasks` must all be attack tasks (episode_type == "attack") over TRAINING environments only
@@ -141,8 +142,18 @@ def collect_attacker_episodes(tasks, n_per_task, generate, defender_factory, san
         episode_id = ti * n_per_task + rollout_index
         if episode_id in banked:
             return False
-        record = _run_one(spec, episode_id, rollout_index, capturing, defender_factory,
-                          sandbox_factory, canary_seed, canary_revision, max_turns)
+        # The attacker runs arbitrary shell commands, so an episode can fail in ways one input
+        # cannot anticipate. A single failure must NOT abort a 120-episode run whose completed
+        # episodes are already banked -- but it must stay VISIBLE (printed) so a systematic
+        # failure is not silently swallowed as "just a thin environment".
+        try:
+            record = _run_one(spec, episode_id, rollout_index, capturing, defender_factory,
+                              sandbox_factory, canary_seed, canary_revision, max_turns,
+                              redaction_enforcement)
+        except Exception as exc:                              # noqa: BLE001 - deliberately broad
+            print(f"[collect] episode {episode_id} ({spec.id}) failed, skipping: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return False
         write_episode(out_dir, record)
         return True
 
