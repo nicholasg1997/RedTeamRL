@@ -255,9 +255,30 @@ larger groups have diminishing returns). If the attacker stalls in early iterati
 weaker opponent — drop `DEFENDER_GRPO_ADAPTER` to `None` for an SFT-only defender — not a bigger
 attacker.
 
+### 4.7 Attacker SFT collection readout (2026-09-02) — the failure distribution is learnable
+
+First `attack_sft` collection, base 8B attacker vs. the full trained defender, 120 episodes over the
+three training envs: **`win=13  near_miss=107  other=0`.**
+
+- **`other=0`**: the attacker never refuses and never fails to engage — every episode reaches the
+  secret. (This settles the open "is the attacker refusing?" question: no.)
+- **`win=13`** (~11%): consistent with the GRPO base rate, so it is stable.
+- **`near_miss=107`** (89%): the attacker reaches the payload almost every time and loses at the *last
+  step* — a wrong submit (fumbled finish) or a payload the defender redacted (caught at payload). This
+  is the most learnable failure distribution available: the pivotal moment is anchored in every case,
+  and it clears `MIN_EXAMPLES` comfortably, so SFT proceeds.
+
+**What it says about the environments:** exploration is trivial (the secret is always found), so the
+entire game lives at exfiltration against an actively-redacting monitor. That is a real, learnable
+game — enough to prove the machinery here — but a *narrow slice* of the eventual threat model, which
+is the Phase-4 argument (§5). **Two next-iteration refinements it surfaced:** the readout should split
+fumbled-finish vs. caught-at-payload (attacker's own error vs. the defender catching it — different
+lessons), and `NEARMISS_FRAMING` currently talks about evading detection, which fits caught-at-payload
+but mis-frames a fumbled finish (an accuracy error, not a detection one).
+
 ### 4.5 Test suite
 
-372 tests, all offline — no models, no network.
+426 tests, all offline — no models, no network.
 
 ---
 
@@ -342,26 +363,40 @@ are still pinned once the opponent moves, the problem is the monitor and not the
 Phase 2 reopens. This is the only phase permitted to advance on a diagnosed deficiency, and only
 because the next phase is the diagnosis's remedy.
 
-**Phase 3 — Adaptive attacker, and the environment saturation readout. ← NEXT**
-Train the attacker against the frozen trained defender. This is simultaneously a training phase and a
-*measurement of the environment suite*: how fast a trained attacker saturates six thin environments is
-the quantity that tells us how much authoring Phase 4 needs, and it cannot be obtained any other way.
-- Gate first: `modal run scripts/attacker_viability.py::check`. Win rate outside 15–85% means dead
-  groups and no gradient; a full run would burn a day producing nothing.
-- Align `train_attacker.py` to the opponent config every measured number used (thinking ON, 6144
-  tokens) and merge **both** SFT and GRPO adapters into the defender it trains against.
+**Phase 3 — Adaptive attacker (prove the ratchet works on the attacker side). ← IN PROGRESS**
+Train the attacker against the frozen trained defender. **The goal is to prove the SFT→GRPO
+*machinery* works on the attacker side too (it is only defender-proven) and yields a modest lift —
+NOT to produce a strong exploiter.** The attacker's ceiling is bounded by environment richness, so a
+low absolute win rate on the current thin envs is a fact about the environments, not a method failure
+(see §5); do not chase strong exploitation here — that needs Phase 4's environments.
+- ✅ Viability gate passed (§4.6): 8B trainable at ~17%, thinking OFF / 2048 tokens (thinking-6144
+  truncated 29.5% of actions for no win-rate gain — do NOT use it).
+- ✅ Attacker SFT bootstrap built (`attack_sft/`, §4.7): collect wins + anchored near-misses, re-author
+  per-turn reasoning under the grounding gate, SFT, promote only if held-out win rate rises without an
+  effective-rank collapse. This is the attacker half of the ratchet the defender already has.
+- GRPO from the SFT-merged backbone (the `kl=0` construction). First-pass GRPO from *base* stalled at
+  12% (§4.6) — expected, because base had no bootstrap.
 - Offline technique labelling → first diversity graph.
-- Carried from Phase 2: re-run the matched probes once the opponent is adaptive. Also the first real
-  test of whether `policies/prompt_pool.py` removed the fingerprint or only the one we named — watch
-  whether the attacker finds a replacement.
-- **Exit:** the attacker measurably raises ASR against the frozen defender; techniques do not collapse
-  to a single exploit; we have a saturation curve and a list of what it actually exploited; and the
-  probe re-run either moves or indicts the monitor per Phase 2's carried deficiency.
+- Carried from Phase 2: re-run the matched probes once the opponent is adaptive — the first real test
+  of whether `policies/prompt_pool.py` removed the fingerprint or only the one we named (watch whether
+  the attacker finds a replacement).
+- **Exit:** the SFT→GRPO ratchet demonstrably moves the attacker (loss moves, win rate ticks up,
+  entropy holds, dead groups drop) *and* the collection readout has told us how thin the environments
+  are — the input that orders Phase 4 vs. finishing here. The probe re-run either moves or indicts the
+  monitor per Phase 2's carried deficiency.
 
 **Phase 4 — Environment authoring framework and scale-up.** The dominant workstream (§5).
-- A scenario-authoring abstraction: 2–3 domains expressible in one clean spec, the rest content.
+- **The reusable lever is the *framework*, not hand-built one-offs**: a scenario-authoring abstraction
+  (file tree + planted secret + verifiable multi-step predicate + mandatory benign twin) so envs
+  become cheap content. Build this regardless of the 3↔4 ordering.
+- **The Phase 3 → Phase 4 order is data-dependent, arbitrated by the collection readout.** A working
+  attacker is the instrument that surfaces what to build (PLAN §5, "attacker as diagnostic"), so the
+  default is attacker-first. But if the readout says the envs are too thin to even demonstrate the
+  machinery, environments jump ahead of *finishing* attacker training. Do not hard-commit the order.
 - Per-environment metadata: difficulty, technique tags, canary-placement options.
-- Multi-step verifiable predicates; matched benign twins mandatory per §2.2.
+- Multi-step verifiable predicates; matched benign twins mandatory per §2.2. Realistic depth so
+  exploration is a real challenge — the current envs make finding the secret trivial and put the whole
+  game at exfiltration (§4.7), which is a narrow slice of the eventual threat model.
 - **Held-out environments reserved at the outset per §2.9.**
 - Evaluate MORPHEUS as a substrate — its operational verifiers generalize canary-matching to
   programmatic state predicates. Blocking unknown: whether its tool interface can be mediated by our
@@ -369,11 +404,22 @@ the quantity that tells us how much authoring Phase 4 needs, and it cannot be ob
 - **Exit:** a new environment is authorable in a day by following the spec; held-out environments are
   reserved and untouched; the suite is large enough that the Phase 3 attacker no longer saturates it.
 
-**Phase 5 — Population / league self-play.** Both sides co-adapting against pools rather than single
-checkpoints (§2.5). Diversity-aware opponent sampling from the offline taxonomy; curriculum driven by
-the messy middle; non-collapse measured continuously via `train/plasticity.py`.
-- **Exit:** several rounds of monotone-ish improvement on the frozen held-out eval, with forgetting
-  and effective rank stable — i.e. improvement that is not cycling.
+**Phase 5 — Alternating self-play → population / league.** Freeze one side, train the other to
+saturation (measured on *held-out*, not training, performance), swap, repeat several rounds. Two
+requirements make "several rounds" converge instead of oscillate:
+- **Opponent pools, not just the latest checkpoint** (§2.5). Keep the best checkpoint of each round and
+  sample opponents from the pool. Without this the defender beats the *latest* attacker while
+  forgetting how to beat an older one, and the pair cycles forever. This is the AlphaZero-league fix;
+  it is the mechanism, not a nicety.
+- **Benchmarking is a per-round GATE, not a final phase** (see §7). Every alternation emits held-out
+  environment transfer, the matched probes (judgment vs. classification), and *attacker-vs-the-base-
+  defender* (absolute improvement, not just relative to the current opponent). Non-collapse
+  (forgetting / effective rank) measured continuously via `train/plasticity.py`. If measurement waits
+  until the end, you cannot tell which round was real improvement versus cycling versus overfitting the
+  current opponent — and it is unrecoverable after the fact.
+- Diversity-aware opponent sampling from the offline taxonomy; curriculum driven by the messy middle.
+- **Exit:** several rounds of monotone-ish improvement on the frozen held-out eval, with forgetting and
+  effective rank stable — i.e. improvement that is not cycling.
 
 **Phase 6 — Benchmark capstone and monitor release.** Snapshot a versioned suite; report the
 adversary-budget curve; publish monitor weights, environments, taxonomy, transcripts, and procedure.
@@ -397,6 +443,16 @@ adversary-budget curve; publish monitor weights, environments, taxonomy, transcr
 
 Everything above the probe rung is a *training* measurement. Only the bottom three produce a
 **benchmark** number.
+
+**Benchmarking steers; it does not just validate — so it runs every round, not at the end.** An
+adaptive-adversary project only works if measurement decides what to build next, because a static
+number saturates (§1). The held-out ladder, the matched probes, and the pool checks are therefore a
+**per-round gate on the alternating loop (Phase 5)**, not a final validation phase. Run them once at
+the end and you cannot distinguish real improvement from cycling from overfitting the current opponent
+— and it is unrecoverable after the fact. "Saturation" is defined on held-out, not training,
+performance. This is the single most consequential lesson of the Phase-2 defender result (§4.3): the
+probe is what caught the metric being gamed, and it only helps if it fires while there is still a
+decision to make.
 
 **Core metrics.** Attack success rate (↓), benign completion rate, over-refusal rate — measured on the
 frozen held-out eval on a fixed cadence, because internal win rates cannot distinguish improvement
