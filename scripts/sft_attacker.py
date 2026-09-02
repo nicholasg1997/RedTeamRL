@@ -45,8 +45,13 @@ MIN_EXAMPLES = 100                 # below this, the envs are too thin -> Phase 
 
 # ---- SFT: deliberately small. The whole risk is over-writing entropy and starving GRPO of the
 # within-group variance that IS its gradient, so match the defender's proven 1e-6 / 1 epoch ----
-SFT_EPOCHS = 1
-SFT_LR = 1e-6
+# The first run (LR 1e-6, 1 epoch) was a no-op: loss -0.19%, eff_rank -0.2% -- under-trained. Unlike
+# the defender, whose gradient concentrates on the verdict token (decision_loss_weight=5), the
+# attacker target is long reasoning+action weighted uniformly, so the same LR moves it far less. The
+# near-zero rank change proved huge headroom, so push 10x harder over more epochs; the rank_floor
+# acceptance gate is the safety net that catches an over-correction into collapse.
+SFT_EPOCHS = 3
+SFT_LR = 1e-5
 SFT_BATCH = 8
 # 1, not 2: attacker examples carry ~13k-token observable prompts (40k-char transcripts), so two at
 # once is the activation-memory blow-up that OOM'd GRPO. With gradient checkpointing (applied below)
@@ -55,7 +60,10 @@ SFT_MICROBATCH = 1
 DECISION_LOSS_WEIGHT = 1.0         # attacker target is prose+action uniformly; no verdict token to upweight
 
 # ---- acceptance ----
-EVAL_ROLLOUTS = 20                 # held-out attack rollouts/task, before & after
+# Held-out attack rollouts/task, before & after. The accept gate compares AGGREGATE win rate over
+# all 4 held-out attack tasks, so 32 gives n=128 each side (SE ~3% at p~0.15). Per-env resolution
+# is 32-64 (billing has 2 attack tasks, the others 1); raise to 48 for full spec §11 per-env power.
+EVAL_ROLLOUTS = 32
 RANK_FLOOR = 0.9                   # promote only if post rank >= 0.9 * pre rank (no entropy collapse)
 RANK_PROBE_SIZE = 32               # fixed observable-prompts sampled from collection for the rank probe
 CKPT_ROOT = "/runs/attacker-sft"
@@ -185,7 +193,8 @@ def _impl(active_servers):
         train_tasks, n_per_task=N_PER_TASK, generate=gen_atk_base,
         defender_factory=defender_factory, sandbox_factory=LocalShellSandbox,
         out_dir=collect_dir, canary_seed=CANARY_SEED, canary_revision=CANARY_REVISION,
-        max_turns=MAX_TURNS, max_workers=WORKERS, commit=runs.commit)
+        max_turns=MAX_TURNS, max_workers=WORKERS, commit=runs.commit,
+        redaction_enforcement=REDACTION_ENFORCEMENT)   # lock collection to eval + GRPO
     records = list(read_episodes(collect_dir).values())
     counts = {"win": 0, "near_miss": 0, "other": 0}
     for record in records:
@@ -254,6 +263,10 @@ def _impl(active_servers):
     model.train()
     model.config.use_cache = False
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=SFT_LR)
+    # Snapshot the trainable params so the update MAGNITUDE is reported directly, never inferred from
+    # a loss delta again (the first run's tiny loss move hid that nothing had really changed).
+    before_params = {n: p.detach().float().cpu().clone()
+                     for n, p in model.named_parameters() if p.requires_grad}
     import random
     for epoch in range(SFT_EPOCHS):
         random.shuffle(examples)
@@ -268,13 +281,18 @@ def _impl(active_servers):
     post_loss = sft_loss(model, tok, examples, microbatch_size=SFT_MICROBATCH,
                          decision_loss_weight=DECISION_LOSS_WEIGHT)
     rank_after = probe_rank()
+    delta_l2 = sum(float((p.detach().float().cpu() - before_params[n]).square().sum())
+                   for n, p in model.named_parameters() if p.requires_grad) ** 0.5
+    if not delta_l2 > 0:
+        raise RuntimeError("SFT changed no trainable parameter — the update did not take")
     print(f"sft: pre_loss={pre_loss:.4f} post_loss={post_loss:.4f}  "
-          f"eff_rank {rank_before:.2f} -> {rank_after:.2f}", flush=True)
+          f"eff_rank {rank_before:.2f} -> {rank_after:.2f}  lora_delta_l2={delta_l2:.4f}", flush=True)
 
     adapter_dir = os.path.join(CKPT_ROOT, "adapter")
     model.save_pretrained(adapter_dir)
-    # Free the HF 8B before serving the SFT'd attacker on vLLM, or three 8B-ish residents collide.
-    del base, model
+    # Free the HF 8B + optimizer state before serving the SFT'd attacker on vLLM, or three
+    # 8B-ish residents collide. opt holds only the small LoRA moments, but free it too.
+    del base, model, opt
     torch.cuda.empty_cache()
 
     # ---- 5. after-eval: serve the SFT'd attacker on vLLM, win rate over held-out ----
