@@ -3,10 +3,11 @@
 Harvests attacker episodes over the TRAINING environments only (PLAN.md §2.9,
 `assert_training_split`), writing one atomic JSON record per episode
 (`redteamrl.train.episode_store`) so a preempted collection run resumes by skipping episode ids
-already on disk rather than re-running them (spec §4/§10). Every record is directly classifiable
-by `nearmiss.classify_episode`: each `turns[i]` IS the harness's own per-step dict (`turn`,
-`action`, `redaction_status`, ...) with the captured `observable_prompt` and raw `output` merged
-in, so downstream selection and rationalization see exactly what the attacker saw and emitted.
+already on disk rather than re-running them (spec §4/§10). Every record's turns are directly
+classifiable by `turn_selection.classify_turn`: each `turns[i]` IS the harness's own per-step dict
+(`turn`, `action`, `redaction_status`, ...) with the captured `observable_prompt` and raw `output`
+merged in, so downstream selection and rationalization see exactly what the attacker saw and
+emitted.
 
 No training happens here -- `generate` is any `generate(system, messages) -> str` closure (MLX,
 vLLM, or a fake for tests). Weight updates are a later task's job; this module only harvests and

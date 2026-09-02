@@ -1,5 +1,5 @@
 from redteamrl.attack_sft.collect import collect_attacker_episodes
-from redteamrl.attack_sft.nearmiss import classify_episode
+from redteamrl.attack_sft.turn_selection import classify_turn
 from redteamrl.train.episode_store import read_episodes
 from redteamrl.envs import build_tasks
 from redteamrl.envs.ops_logs import OPS_LOGS
@@ -25,7 +25,7 @@ def test_collection_writes_records_with_per_turn_prompts(tmp_path):
     rec = next(iter(recs.values()))
     assert set(rec) >= {"episode_id", "task_id", "canary", "won", "turns"}
     assert rec["turns"][0]["observable_prompt"]                 # captured, non-empty
-    classify_episode(rec)                                        # record shape is classifiable
+    classify_turn(rec, 0)                                        # record shape is classifiable
 
 
 def test_collection_resumes_and_skips_banked(tmp_path):

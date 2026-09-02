@@ -1,14 +1,14 @@
 """Attacker SFT bootstrap — the missing first half of the ratchet (PLAN §3, §4.6).
 
-Collect the BASE attacker's verified wins and anchored near-misses against the frozen trained
-defender, re-author the per-turn reasoning behind them (grounded), and SFT on it, so GRPO starts
-from a policy that wins more than 12% and has fewer dead groups.
+Collect the BASE attacker's episodes (wins and losses alike) against the frozen trained defender,
+re-author the per-turn reasoning behind every trainable turn (grounded), and SFT on it, so GRPO
+starts from a policy that wins more than 12% and has fewer dead groups.
 
-The DECISIVE output of the first run is the win / near-miss / other COUNT after collection
-(spec §11): it says whether the three training environments are rich enough to bootstrap the
-attacker at all, or whether Phase-4 environment authoring must come first. The gradient step only
-matters if collection clears MIN_EXAMPLES — below it, this STOPS and reports, which is a result,
-not a failure.
+The DECISIVE output of the first run is the reflective example COUNT after collection (spec §11):
+it says whether the three training environments are rich enough to bootstrap the attacker at all,
+or whether Phase-4 environment authoring must come first. The gradient step only matters if
+collection clears MIN_EXAMPLES — below it, this STOPS and reports, which is a result, not a
+failure.
 
 Memory: one 8B copy resident at a time (base attacker on vLLM for collection, torn down, HF for the
 gradient step + effective_rank, then the SFT'd attacker on vLLM for the after-eval). The frozen 4B
@@ -41,11 +41,11 @@ WORKERS = 16
 # ---- collection ----
 N_PER_TASK = 40                    # inference rollouts per training attack task
 CANARY_SEED, CANARY_REVISION = 0, 101
-# Wins-only. First run: 13 wins -> 33 examples (~2.5 turns/win; wins are SHORT because exploration
-# is trivial on these envs). 30 lets a thin-but-real wins-only set through for a direction check;
-# below it the win set is genuinely too sparse to train. Not "the attacker can't win" (it engages
-# every episode) -- "wins-only is data-starved here; the rich signal is the deferred near-misses."
-MIN_EXAMPLES = 30
+# Turn-level (spec Tasks 1-5): every trainable turn of every episode -- win or loss -- is a
+# candidate example, not just wins, so collection now yields hundreds of examples rather than a
+# few dozen. 120 sits well below that expected yield; below it signals a genuinely empty collection
+# (environments too thin, or the attacker not engaging), not just a thin win set.
+MIN_EXAMPLES = 120
 
 # ---- SFT: deliberately small. The whole risk is over-writing entropy and starving GRPO of the
 # within-group variance that IS its gradient, so match the defender's proven 1e-6 / 1 epoch ----
@@ -127,7 +127,6 @@ def _impl(active_servers):
     from redteamrl.train.episode_store import read_episodes
     from redteamrl.train.plasticity import effective_rank
     from redteamrl.attack_sft.collect import collect_attacker_episodes
-    from redteamrl.attack_sft.nearmiss import classify_episode
     from redteamrl.attack_sft.pipeline import records_to_examples
     from redteamrl.attack_sft.acceptance import accept
     from concurrent.futures import ThreadPoolExecutor
@@ -200,34 +199,26 @@ def _impl(active_servers):
         max_turns=MAX_TURNS, max_workers=WORKERS, commit=runs.commit,
         redaction_enforcement=REDACTION_ENFORCEMENT)   # lock collection to eval + GRPO
     records = list(read_episodes(collect_dir).values())
-    counts = {"win": 0, "near_miss": 0, "other": 0}
-    for record in records:
-        counts[classify_episode(record)[0]] += 1
-    print(f"\n===== COLLECTION READOUT ({len(records)} episodes) =====", flush=True)
-    print(f"  win={counts['win']}  near_miss={counts['near_miss']}  other={counts['other']}",
-          flush=True)
-    print("  A high 'other' share with few wins means the environments are too thin to bootstrap "
-          "the attacker -- that is the signal to author environments (Phase 4) before more "
-          "attacker training. Refusals, if any, surface here as 'other'.", flush=True)
+    won = sum(1 for r in records if r.get("won"))
+    print(f"\n===== COLLECTION READOUT ({len(records)} episodes, {won} won) =====", flush=True)
 
-    # ---- 2. BUILD EXAMPLES; STOP if too thin ----
-    # include_near_misses=False: a near-miss's pivotal turn is the FAILING action, and training on
-    # it crashed held-out win rate 13.3% -> 2.3%. Wins-only until near-misses can supply a CORRECT
-    # action via branch-and-verify (deferred). See pipeline.records_to_examples.
-    examples = records_to_examples(records, ATTACKER_SYSTEM_SHELL, gen_atk_base,
-                                   include_near_misses=False)
-    print(f"  grounded SFT examples: {len(examples)}", flush=True)
+    # ---- 2. BUILD EXAMPLES (turn-level, spec Tasks 1-5); STOP if too thin ----
+    # Every turn of every collected episode -- win or loss -- is a candidate; classify_turn decides
+    # per turn whether it trains and whether its action is masked. See pipeline.records_to_examples.
+    examples = records_to_examples(records, ATTACKER_SYSTEM_SHELL, gen_atk_base)
+    n_action = sum(1 for e in examples if e.get("action_loss_weight", 1.0) == 1.0)
+    print(f"  reflective examples: {len(examples)}  (action-trained {n_action}, "
+          f"reasoning-only {len(examples) - n_action})", flush=True)
     with open(os.path.join(CKPT_ROOT, "readout.json"), "w") as handle:
-        json.dump({"counts": counts, "n_examples": len(examples),
-                   "n_episodes": len(records)}, handle)
+        json.dump({"n_episodes": len(records), "won": won, "n_examples": len(examples),
+                   "n_action": n_action}, handle)
     runs.commit()
     if len(examples) < MIN_EXAMPLES:
-        print(f"\nSTOP: {len(examples)} wins-only examples < MIN_EXAMPLES={MIN_EXAMPLES}. This is a "
-              "WIN-DATA-VOLUME limit, not proof the attacker can't win (it engaged every episode). "
-              "Levers: collect more episodes for more wins (cheap inference, but changing N_PER_TASK "
-              "needs a fresh collect dir), unlock the near-misses via the successful-prefix redesign "
-              "(spec §12), or move to richer environments (Phase 4). No gradient step taken.",
-              flush=True)
+        print(f"\nSTOP: {len(examples)} reflective examples < MIN_EXAMPLES={MIN_EXAMPLES}. This is "
+              "a genuinely empty/thin collection, not proof the attacker can't win (it engaged "
+              "every episode). Levers: collect more episodes (cheap inference, but changing "
+              "N_PER_TASK needs a fresh collect dir), or move to richer environments (Phase 4). "
+              "No gradient step taken.", flush=True)
         return
 
     # A fixed probe batch for the entropy check, sampled AFTER collection so it is identical
@@ -322,7 +313,7 @@ def _impl(active_servers):
     after = {"win_rate": win_after, "effective_rank": rank_after}
     ok, reasons = accept(before, after, rank_floor=RANK_FLOOR)
     result = {"before": before, "after": after, "accepted": ok, "reasons": reasons,
-              "counts": counts, "n_examples": len(examples)}
+              "won": won, "n_examples": len(examples)}
     with open(os.path.join(CKPT_ROOT, "result.json"), "w") as handle:
         json.dump(result, handle)
     runs.commit()

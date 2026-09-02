@@ -12,7 +12,7 @@ def test_authoring_prompt_contains_observation_and_action_not_the_future():
     assert "config.py" in p and "read_file" in p
 
 
-def test_nearmiss_framing_is_retired():
+def test_near_miss_framing_is_retired():
     """Episode-level near-miss framing is gone (Task 5): pipeline.py is turn-level now, and
     boundary turns use BOUNDARY_FRAMING for both allowed-after-prior-failure and rejected turns."""
     import redteamrl.attack_sft.rationalize as R
