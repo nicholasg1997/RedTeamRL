@@ -10,7 +10,7 @@ Conversation = list[dict]   # ordered turn records; each policy renders its own 
 
 @runtime_checkable
 class AttackerPolicy(Protocol):
-    def act(self, conversation: Conversation) -> AttackerAction:
+    def act(self, conversation: Conversation, turns_taken: int = 0) -> AttackerAction:
         """Produce the attacker's next move (already parsed)."""
         ...
 

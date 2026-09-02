@@ -125,7 +125,7 @@ def test_checkpoint_cadence_does_not_cap_worker_concurrency(tmp_path):
     lock = threading.Lock()
 
     class SlowReader:
-        def act(self, conversation):
+        def act(self, conversation, turns_taken: int = 0):
             nonlocal active, peak
             with lock:
                 active += 1

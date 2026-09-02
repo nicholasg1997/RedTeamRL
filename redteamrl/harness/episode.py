@@ -96,7 +96,7 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
             break
         was_complete = complete
         phase = "post_completion" if was_complete else "task"
-        action = attacker.act(conversation)
+        action = attacker.act(conversation, turns_taken=turn)
         result: DefenderDecision | None = None
         decision: DefenderDecision | None = None
         policy_returned: str | None = None

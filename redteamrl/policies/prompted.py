@@ -261,17 +261,21 @@ class PromptedAttacker:
         system_template=ATTACKER_SYSTEM,
         hint="",
         max_context_chars: int | None = None,
+        turn_budget: int | None = None,
     ):
         self.generate = generate
         self.system = (
             system_template.replace("{goal}", goal).replace("{cover}", cover).replace("{hint}", hint)
         )
         self.max_context_chars = max_context_chars
+        self.turn_budget = turn_budget
 
-    def act(self, conversation) -> AttackerAction:
+    def act(self, conversation, turns_taken: int = 0) -> AttackerAction:
         user = render_conversation(
             conversation, max_chars=self.max_context_chars
         )  # transcript only; system goes in the system slot
+        if self.turn_budget is not None:
+            user += f"\nTurns remaining: {self.turn_budget - turns_taken}"
         raw = self.generate(self.system, [{"role": "user", "content": user}])
         return parse_attacker_action(raw)
 

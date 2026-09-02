@@ -91,7 +91,7 @@ class _AdaptiveExfil:
     def __init__(self, command, transform):
         self.command, self.transform, self.turn = command, transform, 0
 
-    def act(self, conversation):
+    def act(self, conversation, turns_taken: int = 0):
         self.turn += 1
         if self.turn == 1:
             return AttackerAction(kind="tool_call", tool="run_command", args={"command": self.command})

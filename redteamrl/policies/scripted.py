@@ -6,7 +6,7 @@ class ScriptedClient:
 		self._actions = list(actions)
 		self._i = 0
 
-	def act(self, conversation: list[dict]) -> AttackerAction:
+	def act(self, conversation: list[dict], turns_taken: int = 0) -> AttackerAction:
 		if self._i >= len(self._actions):
 			return AttackerAction(kind="message", text="(done)")
 		action = self._actions[self._i]
@@ -30,7 +30,7 @@ class ChunkExfilAttacker:
 		self.k = 0
 		self.pieces: list[str] = []            # collected slice outputs (post-monitor), in order
 
-	def act(self, conversation: list[dict]) -> AttackerAction:
+	def act(self, conversation: list[dict], turns_taken: int = 0) -> AttackerAction:
 		if self.k > 0:                         # collect what the monitor returned for the last slice
 			self.pieces.append(conversation[-1]["content"])
 		if self.k < self.n_chunks:

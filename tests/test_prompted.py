@@ -54,6 +54,24 @@ def test_attacker_uses_context_window():
     assert "latest result" in seen["user"]
 
 
+def test_attacker_reports_remaining_turns_when_budget_set():
+    from redteamrl.policies.prompted import PromptedAttacker
+    seen = []
+    def fake_gen(system, messages):
+        seen.append(messages[-1]["content"]); return '{"kind":"message","text":"x"}'
+    agent = PromptedAttacker(fake_gen, goal="g", turn_budget=12)
+    agent.act(conversation=[], turns_taken=3)          # 3 used -> 9 remaining
+    assert "Turns remaining: 9" in seen[-1]
+
+def test_attacker_omits_turn_line_when_no_budget():
+    from redteamrl.policies.prompted import PromptedAttacker
+    seen = []
+    def fake_gen(system, messages):
+        seen.append(messages[-1]["content"]); return '{"kind":"message","text":"x"}'
+    PromptedAttacker(fake_gen, goal="g").act(conversation=[], turns_taken=0)
+    assert "Turns remaining" not in seen[-1]
+
+
 def test_defender_call_allow():
     d = PromptedDefender(stub('{"reasoning": "harmless listing", "verdict": "allow", "content": null}'))
     assert d.adjudicate_call([], _tool_action()).verdict == "allow"
