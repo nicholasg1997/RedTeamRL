@@ -41,7 +41,11 @@ WORKERS = 16
 # ---- collection ----
 N_PER_TASK = 40                    # inference rollouts per training attack task
 CANARY_SEED, CANARY_REVISION = 0, 101
-MIN_EXAMPLES = 100                 # below this, the envs are too thin -> Phase 4 (spec §11); STOP
+# Wins-only. First run: 13 wins -> 33 examples (~2.5 turns/win; wins are SHORT because exploration
+# is trivial on these envs). 30 lets a thin-but-real wins-only set through for a direction check;
+# below it the win set is genuinely too sparse to train. Not "the attacker can't win" (it engages
+# every episode) -- "wins-only is data-starved here; the rich signal is the deferred near-misses."
+MIN_EXAMPLES = 30
 
 # ---- SFT: deliberately small. The whole risk is over-writing entropy and starving GRPO of the
 # within-group variance that IS its gradient, so match the defender's proven 1e-6 / 1 epoch ----
@@ -207,16 +211,23 @@ def _impl(active_servers):
           "attacker training. Refusals, if any, surface here as 'other'.", flush=True)
 
     # ---- 2. BUILD EXAMPLES; STOP if too thin ----
-    examples = records_to_examples(records, ATTACKER_SYSTEM_SHELL, gen_atk_base)
+    # include_near_misses=False: a near-miss's pivotal turn is the FAILING action, and training on
+    # it crashed held-out win rate 13.3% -> 2.3%. Wins-only until near-misses can supply a CORRECT
+    # action via branch-and-verify (deferred). See pipeline.records_to_examples.
+    examples = records_to_examples(records, ATTACKER_SYSTEM_SHELL, gen_atk_base,
+                                   include_near_misses=False)
     print(f"  grounded SFT examples: {len(examples)}", flush=True)
     with open(os.path.join(CKPT_ROOT, "readout.json"), "w") as handle:
         json.dump({"counts": counts, "n_examples": len(examples),
                    "n_episodes": len(records)}, handle)
     runs.commit()
     if len(examples) < MIN_EXAMPLES:
-        print(f"\nSTOP: {len(examples)} examples < MIN_EXAMPLES={MIN_EXAMPLES}. The environment "
-              "suite is too thin to bootstrap the attacker; author environments before training "
-              "(spec §11). No gradient step taken.", flush=True)
+        print(f"\nSTOP: {len(examples)} wins-only examples < MIN_EXAMPLES={MIN_EXAMPLES}. This is a "
+              "WIN-DATA-VOLUME limit, not proof the attacker can't win (it engaged every episode). "
+              "Levers: collect more episodes for more wins (cheap inference, but changing N_PER_TASK "
+              "needs a fresh collect dir), unlock the near-misses via the successful-prefix redesign "
+              "(spec §12), or move to richer environments (Phase 4). No gradient step taken.",
+              flush=True)
         return
 
     # A fixed probe batch for the entropy check, sampled AFTER collection so it is identical

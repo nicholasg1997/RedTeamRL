@@ -14,13 +14,22 @@ def records_to_examples(
     records: list[dict],
     attacker_system: str,
     generate,
+    include_near_misses: bool = True,
 ) -> list[dict]:
     """Convert collected episode records into grounded SFT examples.
 
     For each record:
     - Win: author all turns with WIN_FRAMING, include all that are grounded.
-    - Near-miss: author only the pivotal turn with NEARMISS_FRAMING.
+    - Near-miss: author only the pivotal turn with NEARMISS_FRAMING (ONLY when
+      `include_near_misses` is True).
     - Other: skip entirely.
+
+    WARNING on near-misses (`include_near_misses`): a near-miss's pivotal turn is the FAILING
+    action -- a wrong submit, or the read the monitor redacted -- and this function keeps that
+    action verbatim as the SFT target. Training on it teaches the model to reproduce its own
+    failures; the first run that actually absorbed it (LR 1e-5) crashed held-out win rate 13.3%
+    -> 2.3%. Using a near-miss correctly needs a CORRECT action (branch-and-verify, deferred),
+    not the failing one. Callers should pass `include_near_misses=False` until that exists.
 
     Args:
         records: List of episode records, each with keys:
@@ -61,8 +70,9 @@ def records_to_examples(
                 if example is not None:
                     examples.append(example)
 
-        elif episode_type == "near_miss":
-            # Contribute only the pivotal turn
+        elif episode_type == "near_miss" and include_near_misses:
+            # Contribute only the pivotal turn -- BUT this trains the FAILING action (see the
+            # warning in the docstring). Gated off by default in the entrypoint.
             piv_turn_idx = pivotal_turn(record)
             if piv_turn_idx is not None:
                 # Find the turn dict with this turn index
