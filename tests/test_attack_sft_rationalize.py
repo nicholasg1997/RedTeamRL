@@ -56,9 +56,15 @@ def test_author_turn_returns_generate_output():
 def test_boundary_framing_forbids_empty_route_around_and_demands_a_different_action():
     low = BOUNDARY_FRAMING.lower()
     assert "repeating" in low                      # teaches: repeating changes nothing
-    assert "different" in low or "next action" in low   # demands a concrete new move
+    assert "different" in low                      # demands a concrete different technique
+    assert "next action" in low                    # ends by naming the next action
+    assert "infer" in low and "observed" in low    # teaches: infer the mechanism from observation
     assert "route around it" not in low            # the old vague phrasing is gone
 
 
 def test_routine_framing_stays_short():
     assert "few words" in ROUTINE_FRAMING.lower()
+
+
+def test_win_framing_ends_by_naming_the_next_action():
+    assert WIN_FRAMING.strip().lower().endswith("next action.")
