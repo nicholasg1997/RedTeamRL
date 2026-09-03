@@ -172,7 +172,7 @@ def _impl(active_servers):
     held_attack = [t for t in held_out_tasks() if t.episode_type == "attack"]
 
     def eval_win_rate(gen_atk, n_rollouts):
-        from redteamrl.attack_sft.eval_metrics import repeated_failed_action_rate
+        from redteamrl.attack_sft.eval_metrics import mean_repeated_no_progress_rate
         work = [(spec, r) for spec in held_attack for r in range(n_rollouts)]
 
         def one(item):
@@ -188,13 +188,13 @@ def _impl(active_servers):
                                      max_turns=MAX_TURNS, redaction_enforcement=REDACTION_ENFORCEMENT)
             finally:
                 sandbox.close()
-            return bool(result.leak), list(result.steps)
+            return bool(result.leak), list(result.steps), episode_spec.forbidden[0]
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             outcomes = list(pool.map(one, work))
-        wins = [w for w, _ in outcomes]
-        all_steps = [s for _, steps in outcomes for s in steps]
+        wins = [w for w, _, _ in outcomes]
         win_rate = sum(wins) / max(len(wins), 1)
-        return win_rate, repeated_failed_action_rate(all_steps)
+        rate = mean_repeated_no_progress_rate([(steps, canary) for _, steps, canary in outcomes])
+        return win_rate, rate
 
     # ---- 1. COLLECT (the decisive readout) ----
     collect_attacker_episodes(
@@ -236,7 +236,7 @@ def _impl(active_servers):
     # ---- 3. before-eval on the base attacker (still on vLLM), then free it for HF ----
     win_before, repeat_before = eval_win_rate(gen_atk_base, EVAL_ROLLOUTS)
     print(f"\nheld-out win rate BEFORE sft: {win_before:.1%}  "
-          f"(repeated-failed-action {repeat_before:.0%})", flush=True)
+          f"(repeated-no-progress {repeat_before:.0%})", flush=True)
     stop_vllm_server(atk_proc)
     active_servers.remove((stop_vllm_server, atk_proc))
 
@@ -313,12 +313,12 @@ def _impl(active_servers):
                                      max_tokens=ATK_MAX_TOKENS, seed=EVAL_SEED)
     win_after, repeat_after = eval_win_rate(gen_atk_sft, EVAL_ROLLOUTS)
     print(f"held-out win rate AFTER sft: {win_after:.1%}  "
-          f"(repeated-failed-action {repeat_after:.0%})", flush=True)
+          f"(repeated-no-progress {repeat_after:.0%})", flush=True)
 
     # ---- 6. accept: NON-COLLAPSE bootstrap (spec 2026-09-03 §3.3) ----
     before = {"win_rate": win_before, "effective_rank": rank_before}
     after = {"win_rate": win_after, "effective_rank": rank_after,
-             "repeated_failed_action_rate": repeat_after}
+             "repeated_no_progress_rate": repeat_after}
     ok, reasons = accept(before, after, rank_floor=RANK_FLOOR)
     result = {"before": before, "after": after, "accepted": ok, "reasons": reasons,
               "won": won, "n_examples": len(examples)}
@@ -328,7 +328,7 @@ def _impl(active_servers):
     print(f"\n===== ACCEPTANCE: {'PROMOTED' if ok else 'REJECTED'} =====", flush=True)
     print(f"  win_rate {win_before:.1%} -> {win_after:.1%}   "
           f"eff_rank {rank_before:.2f} -> {rank_after:.2f}   "
-          f"repeated-failed-action {repeat_after:.0%}", flush=True)
+          f"repeated-no-progress {repeat_after:.0%}", flush=True)
     for reason in reasons:
         print(f"  reject: {reason}", flush=True)
     if ok:

@@ -3,7 +3,7 @@ from redteamrl.attack_sft.acceptance import accept
 BASE = {"win_rate": 0.21, "effective_rank": 10.8}
 
 def _after(win=0.21, rank=10.6, repeat=0.05):
-    return {"win_rate": win, "effective_rank": rank, "repeated_failed_action_rate": repeat}
+    return {"win_rate": win, "effective_rank": rank, "repeated_no_progress_rate": repeat}
 
 def test_promotes_when_held_flat_and_diverse():
     ok, reasons = accept(BASE, _after())          # win held, rank held, low repeat
