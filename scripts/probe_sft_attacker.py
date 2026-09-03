@@ -242,7 +242,8 @@ def _probe(active_servers):
     print(f"  allow+CLEAN:     {bd['allow_clean']}/{bd['n_tool_calls']} ({100*bd['allow_clean']/n:.0f}%)"
           "   <-- validated-good actions Option B will yield", flush=True)
     print("\n########## WINNING STRATEGIES (base episodes) ##########", flush=True)
-    seqs = winning_action_sequences(base_eps)
+    seqs = winning_action_sequences(
+        [{"won": ep["won"], "turns": ep["steps"]} for ep in base_eps])
     if not seqs:
         print("  (no base wins in this sample — raise N_EPISODES_PER_TASK)", flush=True)
     for i, seq in enumerate(seqs):
