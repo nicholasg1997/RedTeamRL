@@ -22,6 +22,7 @@ DEFENDER_MODEL = "Qwen/Qwen3-4B"
 SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"
 GRPO_ADAPTER = "/runs/defender-grpo-r9-vllm/iter1"
 ATTACKER_MODEL = "Qwen/Qwen3-8B"     # the trainable candidate (unquantized base, LoRA-able)
+ATTACKER_ADAPTER = None    # set to the SFT adapter dir (e.g. "/runs/attacker-sft/adapter") to gate hand-off to GRPO
 
 DEF_PORT, ATK_PORT = 8001, 8000
 # No HF trainer is resident here (the merge runs on CPU and is freed), unlike train_defender.py
@@ -108,9 +109,12 @@ def _check_impl(active_servers):
 
     # Sequential starts: vLLM sizes its cache against a MOVING baseline, so an engine that profiles
     # while another is still allocating charges the other's memory to itself.
+    _atk_lora = {"lora_name": "attacker-sft", "lora_path": ATTACKER_ADAPTER} if ATTACKER_ADAPTER else {}
     active_servers.append((stop_vllm_server, start_vllm_server(
         ATTACKER_MODEL, ATK_PORT, ATK_MEM_FRAC, max_model_len=ATK_MAX_MODEL_LEN,
-        max_num_seqs=WORKERS)))
+        max_num_seqs=WORKERS, **_atk_lora)))
+    _atk_served = "attacker-sft" if ATTACKER_ADAPTER else ATTACKER_MODEL
+    print(f"attacker = {ATTACKER_MODEL}" + (f" + {ATTACKER_ADAPTER}" if ATTACKER_ADAPTER else " (base)"), flush=True)
     active_servers.append((stop_vllm_server, start_vllm_server(
         merged_dir, DEF_PORT, DEF_MEM_FRAC, max_model_len=DEF_MAX_MODEL_LEN,
         max_num_seqs=WORKERS)))
@@ -128,7 +132,7 @@ def _check_impl(active_servers):
 
     report = {}
     for label, thinking, max_tokens in CONFIGS:
-        gen_atk = make_vllm_generate(f"http://localhost:{ATK_PORT}", ATTACKER_MODEL,
+        gen_atk = make_vllm_generate(f"http://localhost:{ATK_PORT}", _atk_served,
                                      enable_thinking=thinking, max_tokens=max_tokens)
 
         def one(item):
