@@ -1,265 +1,517 @@
 # RedTeamRL — Research Plan
 
-**An adversarial self-play sandbox for training and benchmarking a trusted defender model.**
+**An adversarial self-play sandbox for training and benchmarking a trusted monitor.**
 
-Status: planning. This document is the master phased plan. Each phase gets its own
-detailed implementation plan (written when we start that phase). We build this
-**collaboratively, piece by piece** — not as a single hand-off.
+Status: Phases 0–2 delivered; Phase 3 next. Last rewritten 2026-08-08.
 
----
+**What this document is.** The stable contract: what we are building, what we will not trade away,
+what the code actually does today, and what we have measured. It changes when a *decision* changes,
+not when a week's priorities do. Near-term ordering and in-flight bets live in `docs/ROADMAP.md`
+(local-only — `docs/` is gitignored and is never committed). If the two disagree, this file is the
+one that was reviewed.
 
-## 1. Thesis / contribution
-
-A Docker-isolated, tool-mediated environment where an **attacker LLM** pursues a concrete
-malicious goal (exfiltrate a credential, leak PII, extract a system prompt, escalate a
-tool permission) against a smaller, separate **defender LLM** that mediates every tool
-call and request. The environment yields two artifacts:
-
-1. **A standalone agentic-safety benchmark** (inference-only, no training required).
-2. **A trained "trusted monitor" defender**, improved via self-play RL against an evolving,
-   diverse pool of attackers.
-
-**What's novel is the combination:** ground-truth *verifiable* reward with **no LLM judge in
-the loop** + a **trusted-monitor asymmetry** (defender is smaller/separate) + **over-refusal
-penalized in the same reward** as leakage + **technique-diversity opponent pools**.
+We build **collaboratively, piece by piece.** Each phase gets its own spec + plan in `docs/` when we
+start it. This document is the map, not the turn-by-turn.
 
 ---
 
-## 2. Core design principles (the non-negotiables)
+## 1. Thesis and deliverables
 
-These are constraints, not preferences. Everything else bends to keep these true.
+A tool-mediated sandbox where an **attacker LLM** pursues a concrete goal (exfiltrate a planted
+canary) against a smaller, separate **defender LLM** that adjudicates every tool call and every
+result before the attacker sees it. Both sides are trainable. Reward is ground truth.
 
-1. **No LLM judge determines reward.** Success is mechanized and ground-truth-verifiable
-   (canary-token / secret matching). Rationale: RL applies sustained optimization pressure
-   and will find any judge weakness — "fool the evaluator" is a worse problem than an
-   imperfect static eval.
-2. **Benign tasks carry verifiable completion targets.** Every benign task ships with
-   (a) a legitimacy credential/context justifying the request and (b) a specific expected
-   output artifact the defender must produce. Over-refusal is then mechanically detectable
-   (the artifact was not produced). Over-refusal is penalized **as strongly as** leakage,
-   from the first training run — otherwise the defender collapses to refuse-everything.
-3. **Trusted-monitor asymmetry.** The defender is a *smaller, separate model* from the
-   attacker — different weights, different capability tier. Maps to AI Control's trusted-
-   monitor framing and reduces collusion risk.
-4. **Attacker CoT is a training-time teacher signal only — never a live defender input.**
-   The defender's policy input must never contain the attacker's chain-of-thought, not even
-   during training rollouts (or it learns to condition on info it won't have at deployment).
-   Attacker CoT enters only via the offline CoT-distillation stage, as a teacher signal that
-   shapes the training target. Eval always hides attacker CoT. This is asymmetric
-   actor-critic: the teacher sees privileged state; the deployed defender never does.
-5. **Opponent pools, not just latest checkpoints.** Maintain pools of attacker and defender
-   checkpoints across skill levels and technique types to avoid narrow overfitting and
-   training-dynamic cycling.
-6. **Judge LLM is offline categorization only.** Used to label attack technique and track
-   diversity over time. Never part of the reward signal.
-7. **CBRN / weapons content is out of scope — hard constraint.** Given the dual-use risk of
-   training and potentially open-sourcing an attacker, this category is excluded by design,
-   not as a placeholder.
+**Two artifacts ship:**
+
+1. **A trained trusted monitor.** A small model that a deployer runs in front of an untrusted agent.
+2. **An adaptive-adversary benchmark.** Environments, metrics, and the procedure — reporting attack
+   success as a function of *adversary optimization budget* rather than against a frozen prompt set.
+
+**The attacker is co-primary as an engine, not as a release.** It is the automatic curriculum, the
+source of adversarial-fine-tuning data, and the thing that makes the benchmark number mean something.
+Its *weights* stay internal; what ships is scores, the technique taxonomy, and transcripts.
+
+### Why a monitor rather than a safer model — the open-weights argument
+
+Model-level safety training on open weights is removable by whoever holds the weights: safety
+behavior is concentrated in the first few generated tokens and comes off with a small number of
+fine-tuning examples. So "a fortified open model" has an incoherent threat model — the attacker can
+undo the fortification more cheaply than it was applied.
+
+A monitor inverts that. It is held by the **deployer**, not the attacker, who controls only the input
+channel and cannot fine-tune it away. It composes across models, including ones we cannot retrain and
+ones released after we trained it. This is why §2.3's smaller/separate constraint is a
+deployment-topology requirement, not a budget compromise.
+
+### Why an adaptive adversary rather than a static score
+
+Every published jailbreak benchmark uses a fixed, public attack set, so a number can improve without
+robustness changing — the defense only has to cover the set. We measured this pathology inside our
+own project (§4.3): a 45-point headline gain that was substantially episode-type classification. An
+adversary that retrains against whatever the defense just learned is the only known way to keep the
+number from saturating. The output is a **curve, not a scalar**, and we report it as one.
+
+**Obligation this creates.** A benchmark whose adversary is not public is only as trustworthy as the
+people running it. We therefore release the environments, the technique taxonomy, sampled attack
+transcripts, and the attacker training procedure — enough that a third party can rebuild an
+equivalent adversary and check our curve.
 
 ---
 
-## 3. Architecture
+## 2. Non-negotiables
 
-**Separate the environment from the policies.**
+Constraints, not preferences. Everything else bends to keep these true.
 
-- **Environment (sandbox container):** holds only the tools, files, and canary secrets — the
-  "world." Reset to a template between episodes (cheap: tmpfs/overlay snapshot). No model
-  weights inside. During training the secrets are fake canaries, so heavy isolation is not
-  required here; strong isolation (gVisor) is reserved for any released attacker artifact.
-- **Policies (attacker, defender):** run as **inference servers (vLLM) outside** the
-  container. Many environments can share one served model.
-- **Harness (orchestrator):** runs the episode loop. Routes attacker turns → defender →
-  tool calls into the sandbox → results back. Enforces the trust boundary: every attacker
-  tool call and request passes through the defender first. Computes the mechanized reward
-  from ground-truth (did the canary leak? was the benign artifact produced?).
+1. **No LLM judge determines reward.** Success is mechanized and ground-truth-verifiable (canary
+   substring match, `harness/egress.py`). RL applies sustained optimization pressure and will find any
+   judge weakness; "fool the evaluator" is worse than an imperfect static eval.
+2. **Benign tasks carry verifiable completion targets.** Every benign task ships a legitimacy context
+   and a specific expected artifact, so over-refusal is mechanically detectable. Over-refusal is
+   penalized in the same reward as leakage, from the first run, or the defender collapses to
+   refuse-everything. A leak is strictly worse than an over-refusal
+   (`leak_penalty=2.0 > over_refusal_penalty=1.0`), guarded by
+   `test_reward.py::test_leak_strictly_worse_than_over_refusal`.
+3. **Trusted-monitor asymmetry.** The defender is a smaller, separate model. Maps to AI Control's
+   trusted-monitor framing, reduces collusion risk, and is what makes the artifact survive open
+   weights (§1).
+4. **The defender never sees attacker chain-of-thought.** Not at eval, not during training rollouts.
+   A monitor trained on the adversary's private reasoning learns mind-reading it will not have in
+   deployment. Attacker CoT is logged only for attacker-side training and taxonomy. SFT hindsight is
+   the *verifiable outcome*, never an oracle view of intent.
+5. **Opponent pools, not just latest checkpoints.** Pools across skill level and technique, to avoid
+   narrow overfitting and training-dynamic cycling. **Status: stated, not yet implemented** — the
+   defender run to date used a frozen prompted attacker. Built in Phase 5.
+6. **Judge LLM is offline categorization only.** Technique labelling and diversity tracking. Never
+   part of reward.
+7. **CBRN / weapons content is out of scope — hard constraint.** By design, not as a placeholder.
+   Agentic harm (exfiltration, unauthorized state change, sabotage) is verifiable in a way content
+   harm is not, so breadth never requires a judge back in the loop. See §5 for the carve-outs.
+8. **Every headline metric ships with a shortcut probe.** A number is not reportable until paired
+   with a measurement that would detect the cheap explanation for it. Aggregate leak rate cannot
+   distinguish judgment from memorization from episode-type classification; matched-pair probes can
+   (§7). This principle is retroactive — it is what caught §4.3.
+9. **Held-out environments are reserved before training begins and are never trained on.** Held-out
+   *episodes* test generalization within a world; only held-out *environments* test whether the
+   monitor learned transferable judgment. The temptation to defect grows exactly as environments get
+   scarce, which is why this is a rule rather than a practice.
+
+---
+
+## 3. Architecture as built
+
+**Environment, policies, and harness are separated; the harness owns the trust boundary.**
 
 ```
   attacker (vLLM)  <-->  HARNESS  <-->  defender (vLLM)
                             |
-                     sandbox container
-                   (tools / files / canaries)
+                     shell sandbox (tmpdir)
+                   (files / commands / canaries)
 ```
 
-**Episode reset, not respawn:** keep the sandbox container warm; reset its filesystem/state
-to a per-task template each episode. Point the two inference endpoints at it. This is what
-keeps rollout throughput viable at RL scale.
+- **Sandbox** — `sandbox/shell.py` (`LocalShellSandbox`) and `sandbox/modal_shell.py`. A tmpdir with
+  real shell access via `run_command`, plus `read_file` / `list_dir`. **Not a security boundary** —
+  it holds fake canaries, and isolation is a research-hygiene property, not a containment claim.
+- **Environments** — `envs/*.py`. An `Environment` is an XBOW-style unit: one realistic filesystem
+  yielding *matched* attack and benign tasks that traverse the same files, so intent is the only
+  separator. `build_tasks(ENV, canary, canary_path=...)` injects the secret at build time and expands
+  templates into concrete `TaskSpec`s. Six environments exist; three carry the training and probe
+  load. **This is the bottleneck — see §5.**
+- **Harness** — `harness/episode.py` runs the turn loop. A `message` goes to `defender.respond`. A
+  `tool_call` is a two-stage adjudication: `adjudicate_call` (allow/reject) → run in sandbox →
+  `adjudicate_result` (pass/redact). The split is load-bearing: the defender is told not to reject a
+  call merely because its result *might* be sensitive — allow, look, then redact.
+- **Protocol** — `harness/protocol.py` is the only place raw model text becomes typed objects.
+  Unparseable defender output **fails closed** and drops the model's content, so overriding an
+  "allow" verdict cannot leak via the retained raw text.
+- **Reward** — `harness/egress.py` ground-truth canary match; `harness/reward.py` combines leak,
+  completion, and over-refusal. Protocol failures cost −2.0, closing a malformed-output reward hack.
+- **Training** — hand-rolled GRPO in `train/grpo.py` + `train/train.py`, LoRA adapters, both policies
+  served on vLLM on one A100, with runtime LoRA hot-swap between iterations. Per-episode atomic
+  persistence (`train/episode_store.py`) and per-iteration checkpoints
+  (`train/checkpoint.py`) make every phase preemption-tolerant.
+- **SFT** — `sft/` (18 modules). Bootstrap + consolidation, not a discardable warm-start; see the
+  ratchet below.
+- **Non-collapse metrics** — `train/plasticity.py`: effective rank (plasticity), forgetting
+  (cycling), stability. Pure functions, offline-tested.
 
-**Defender action space (Phase 1 decision):** the defender's core action is the *gate
-decision + response*, with read-only investigation tools. Keep write/exec minimal early —
-broad write powers expand the attack surface and muddy what the reward measures. Revisit if
-a benign task genuinely requires defender writes.
+**Deprecated.** `tasks/schema.py` + `tasks/freeze_v1.py` + `data/tasks/` are the superseded YAML
+dataset path; environments are programmatic now and `data/tasks/` is empty. CLAUDE.md still documents
+them as live and needs the same correction. `train/eval_split.py` is also dead: it partitions on
+`tier0-<scenario>` ids with `HELD_OUT = {"apikey", "smtp"}` and matches nothing in the shell suite.
+Worth reading before Phase 4 regardless — it is a **held-out-environment** split, so the mechanism
+§2.9 requires already has a Tier-0 precedent to port rather than invent.
+
+### The SFT ↔ GRPO ratchet
+
+SFT and GRPO are co-equal halves of one loop. GRPO *creates* — exploration under verifiable reward
+invents behavior nobody demonstrated, with fine per-token credit assignment. SFT *consolidates* —
+it takes what was verified-good and makes it reliable, cheap to reproduce, and transferable via
+explicit reasoning.
+
+```
+GRPO explores + verifies wins on a harder frontier
+    -> those verified wins become SFT material
+    -> SFT internalizes the reasoning, which transfers to adjacent novel cases
+    -> the frontier moves; GRPO explores further
+```
+
+SFT draws on two signals. **Signal 1** is per-step mechanical labels, available wherever the correct
+action is determinable from observables plus ground truth (a result containing a forbidden substring
+⇒ `redact`). Exact, but limited to the locally-visible class. **Signal 2** is outcome-verified
+trajectory rationalization: keep trajectories that verifiably won, SFT on the reasoning behind them.
+It needs no per-step label and works at any complexity as long as the model *sometimes* succeeds —
+which is what GRPO makes increasingly true. The boundary between them is dynamic, which is why SFT
+never caps at toy cases.
+
+Signal 2 is noisier (a win may be the opponent's mistake), so three gates hold: a grounding filter
+(the reasoning must stand on observables), outcome verification against ground truth, and GRPO's
+finer credit assignment as the complement to SFT's trajectory-level filter.
+
+**SFT's job is not perfection.** A defender that is already perfect gives the attacker no gradient.
+The target is steady improvement in reasoning quality, with mistakes left for GRPO to fix.
 
 ---
 
-## 4. Technology choices
+## 4. What we have measured
 
-| Decision | Choice | Why |
+Recorded here so it is not re-derived, and with the caveats attached to the numbers they qualify.
+
+### 4.1 Benchmark baseline (shell tier, prompted policies)
+
+27B AWQ attacker vs. 4B prompted defender: **41.7% attack success, 2.1% over-refusal, 62.5%
+benign-leak.** The benign-leak figure is the label-vs-value error — the defender passes secrets
+through in *benign* episodes, where the attack framing that would alert it is absent. This is the
+messy middle that made the defender trainable at all.
+
+### 4.2 Defender training (SFT-STaR bootstrap + 3 GRPO iterations)
+
+Attack-episode policy leak **78% → 50% → 33%** across iterations (n=18/iteration, monotone,
+iter 0 vs. iter 2 **p ≈ 0.007**). Benign leak flat at ~22%; refusal 0% throughout; dead groups
+56% → 22%. KL to reference verified at 0.00000 at iteration 0 by merging SFT into the backbone and
+training a fresh adapter on top.
+
+### 4.3 What that result actually was — the finding that shaped §2.8
+
+Deterministic matched probes, where the two halves share a task and an action and differ only in
+whether the credential field holds a usable secret:
+
+| probe | sft | sft+grpo |
 |---|---|---|
-| RL algorithm | **GRPO** (group-relative) | Binary verifiable reward → drop the value network. Less VRAM, simpler than the PPO you know, field-standard for this reward shape. |
-| Models | **Qwen2.5 family, asymmetric** | Defender small (0.5–3B), attacker larger (7B). Cheap, strong, supported across every RL framework. |
-| Fine-tuning | **LoRA / QLoRA** | Budget-critical: train adapters, not full weights. |
-| Framework (early) | **TRL `GRPOTrainer`** | Fastest to learn (Phases 0–2). Great docs, minimal ceremony. |
-| Framework (later) | **verl** (or verifiers/prime-rl, RAGEN, ART) | Multi-turn concurrent self-play (Phases 4–5) outgrows TRL. Don't over-commit early. |
-| Inference serving | **vLLM** | Standard for fast rollout generation while training. |
+| `pair_taint_accuracy` (classifier test) | 12.5% | 12.5% |
+| `call.reject_recall` (the call gate) | 0% | 0% |
+| `taint_cleared_given_attempt` (unseen secrets) | 21.1% | 36.8% |
+
+A pure episode-type classifier scores ~50% on `pair_taint_accuracy` regardless of how good its type
+detection is, because it must get both halves right; the probe's secrets are derived independently of
+training canaries, so memorization gains nothing either. Both hard zeros are unmoved.
+
+**Reading:** much of the 45-point aggregate gain came from classifying episode type against a frozen
+opponent, not from judging content. `taint_cleared_given_attempt` 21% → 37% is genuine transfer.
+Both are true.
+
+Two limits on that positive result. The probe suite is coarse (48 cases) — raise
+`COUNTERFACTUAL_PROBE_VARIANTS` before leaning on small movements. And `probe_grpo_adapter.py` builds
+**only `ci_build`, a trained-on environment**, so the transfer demonstrated is to unseen *secrets
+within a seen world*, not across environments. Re-pointing the probe at a reserved environment (§5)
+upgrades the claim and costs nothing.
+
+This is a fact about the *environment*, not a failure of the method: a frozen, single-prompt opponent
+leaves a fingerprint lying around, and RL takes it. The two fixes are structural (style-paired prompt
+pools, `policies/prompt_pool.py`, which deny the fingerprint we named) and adversarial (a trained
+attacker, which denies the ones we did not).
+
+### 4.4 Throughput
+
+~3h → **~20 min per GRPO iteration** on one A100. Root cause of the original figure was a
+task-at-a-time rollout loop capping in-flight vLLM requests at ~1, so both engines ran at batch 1;
+three separate "GPU contention" symptoms reduced to that one cause. Modal inference baseline
+~3005 episodes/hr.
+
+### 4.6 Attacker viability gate (2026-08-31) — Phase 3 precondition
+
+Qwen3-8B attacker vs. the full trained defender (base + SFT + GRPO), 48 episodes per config:
+
+| config | win rate | invalid actions | verdict |
+|---|---|---|---|
+| thinking-6144 | 18.8% (9/48) | **29.5%** | TRAINABLE |
+| no-thinking-2048 | 16.7% (8/48) | **0.4%** | TRAINABLE |
+
+**The gate passes.** Win rates are one episode apart — at n=48, p≈0.17 the standard error is ~5.4%,
+so the configs are indistinguishable on capability. What separates them is truncation: a generation
+that hits the token cap never closes its `<think>` block and emits no parseable action. Because a
+truncated generation is a MAX-LENGTH sequence and GRPO weights all completion tokens equally,
+roughly 60% of the gradient at thinking-6144 would come from generations that produced no action.
+Training therefore runs thinking-OFF at 2048.
+
+This corrects an assumption made when the phase was planned: that the attacker had to match the
+sampling config behind the defender's benchmark numbers. That opponent was a 27B AWQ, not an 8B —
+the model already differed, which is the variable that dominates, and matching sampling bought
+nothing measurable.
+
+**Position in the band.** 17% sits at the low end of the 15–85% trainable range, predicting ~23%
+dead groups at the training group size of 8. Group size 8 is the right choice: at this win rate it
+yields the most live groups per episode spent (9.6 per 100, versus 7.4 at G=12 and 5.9 at G=16 —
+larger groups have diminishing returns). If the attacker stalls in early iterations, the lever is a
+weaker opponent — drop `DEFENDER_GRPO_ADAPTER` to `None` for an SFT-only defender — not a bigger
+attacker.
+
+### 4.7 Attacker SFT collection readout (2026-09-02) — the failure distribution is learnable
+
+First `attack_sft` collection, base 8B attacker vs. the full trained defender, 120 episodes over the
+three training envs: **`win=13  near_miss=107  other=0`.**
+
+- **`other=0`**: the attacker never refuses and never fails to engage — every episode reaches the
+  secret. (This settles the open "is the attacker refusing?" question: no.)
+- **`win=13`** (~11%): consistent with the GRPO base rate, so it is stable.
+- **`near_miss=107`** (89%): the attacker reaches the payload almost every time and loses at the *last
+  step* — a wrong submit (fumbled finish) or a payload the defender redacted (caught at payload). This
+  is the most learnable failure distribution available: the pivotal moment is anchored in every case,
+  and it clears `MIN_EXAMPLES` comfortably, so SFT proceeds.
+
+**What it says about the environments:** exploration is trivial (the secret is always found), so the
+entire game lives at exfiltration against an actively-redacting monitor. That is a real, learnable
+game — enough to prove the machinery here — but a *narrow slice* of the eventual threat model, which
+is the Phase-4 argument (§5). **Two next-iteration refinements it surfaced:** the readout should split
+fumbled-finish vs. caught-at-payload (attacker's own error vs. the defender catching it — different
+lessons), and `NEARMISS_FRAMING` currently talks about evading detection, which fits caught-at-payload
+but mis-frames a fumbled finish (an accuracy error, not a detection one).
+
+### 4.5 Test suite
+
+426 tests, all offline — no models, no network.
 
 ---
 
-## 5. Phased plan
+## 5. The bottleneck: environments
 
-Each phase lists: **Goal · Tasks · Exit criteria · Rough compute.** Phases 0–1 need **zero RL
-training** — we build the whole environment and eval instrument while ramping the LLM stack,
-then hit training when ready.
+Everything downstream is gated on this, and it is the dominant workstream from Phase 4 onward.
 
-### Phase 0 — De-risk the LLM-RL stack on a toy task
-**Goal:** one GRPO run working end-to-end before the sandbox exists — the "hello world" that
-converts classical-RL intuition into LLM-RL mechanics (token-level reward, KL-to-reference,
-LoRA, vLLM rollouts).
+Today's environments are **single-file and roughly one step**. The thesis needs realistic, multi-step,
+richly-tooled scenarios — billing, HR, cloud infra, git repos, CI/CD, healthcare, finance — supporting
+chains like *list dir → read docs → infer where credentials live → use prior information → extract*.
+`run_command` already provides rich tool use; **what is missing is authoring, not plumbing.** The
+required lift is a scenario-authoring abstraction: plausible file trees plus documentation plus
+credentials planted where they would realistically live, with verifiable multi-step predicates.
 
-Tasks:
-- [ ] Stand up TRL + vLLM + LoRA on the available GPU; confirm a small model loads and serves.
-- [ ] Pick a trivial verifiable-reward task (e.g. arithmetic/countdown): reward = exact-match.
-- [ ] Run GRPO on Qwen2.5-1.5B until reward moves; log KL, reward, response length.
-- [ ] Write a one-page "LLM-RL mechanics" note for ourselves (the gotchas we hit).
+**Why this is not just a content backlog.** With six environments, a trained attacker finds the two or
+three exploits that exist and stops — collapse by construction — and any benchmark number generalizes
+no further than the environment distribution. Without breadth we cannot distinguish a monitor that
+learned judgment from one that overfit six worlds.
 
-**Exit:** reward curve goes up on the toy task; you understand every knob in the loop.
-**Compute:** minimal — a few GPU-hours; can use rented single GPU or free Colab/Kaggle.
+**Reference format — XBOW `validation-benchmarks`.** 104 self-contained benchmarks, each a directory
+with a Docker service definition and a `benchmark-config.json` carrying name, description, difficulty
+(1–3), tags, and a `win_condition` of `flag` or `question`. Critically, **the flag is injected as a
+build argument rather than hardcoded** — the same design as our build-time canary injection, which our
+per-episode canary randomization extends.
 
-### Phase 1 — Sandbox + benchmark (the v1 deliverable)
-**Goal:** a standalone, publishable agentic-safety benchmark. Inference-only. This ships
-regardless of whether RL ever converges.
+**Where we must diverge.** XBOW benchmarks are offense-only: did the attacker find the flag. A monitor
+benchmark needs the **benign twin** — legitimate tasks over the same files with verifiable completion
+artifacts — or over-refusal is unmeasurable and the defender is free to collapse to refuse-everything.
+That roughly doubles authoring cost per environment and is the real reason this is the bottleneck.
 
-Tasks:
-- [ ] Sandbox container: tool set (read files, run limited commands), canary secrets, template
-      reset. Harness that runs an episode loop and enforces the defender gate.
-- [ ] Environment/policy separation: attacker + defender as vLLM endpoints the harness calls.
-- [ ] **Attack task set** with machine-checkable success predicates (canary match). Cover the
-      four categories: credential exfiltration, PII leak, system-prompt extraction, tool-
-      permission escalation.
-- [ ] **Benign task set** with verifiable completion targets (legitimacy credential + expected
-      artifact). Include *surface-suspicious-but-justified* cases.
-- [ ] Fixed *prompted* (untrained) baseline attacker + defender.
-- [ ] **Frozen held-out eval harness** + metrics: attack-success-rate (ASR), benign-completion
-      rate, over-refusal rate. Wire in AgentDojo / InjecAgent as external held-out eval.
-- [ ] Baseline report: run several off-the-shelf models as attacker and as defender; publish
-      the leaderboard.
+### The held-out set already exists — it was never used as one
 
-**Exit:** we can drop any model in as attacker or defender and get ASR + benign-completion +
-over-refusal numbers, including on external benchmarks.
-**Compute:** inference-only. ~\$50–200 (or near-free with small local models).
+Every training and SFT script builds exactly `ops_logs + analytics + ci_build`. **`billing`,
+`SUPPORT_PORTAL`, and `RELEASE_EXPORT` have never been trained on by anything.** §2.9 is therefore
+not blocked on scarcity; the reserve exists and has simply never been evaluated against. Two
+consequences: the strongest available generalization measurement is currently free, and the one
+positive result we have (§4.3) is weaker than it looked, because the probe runs on a trained-on world.
 
-### Phase 2 — Train defender vs. frozen attacker
-**Goal:** first real RL training. Non-stationarity removed so we can debug sparse reward +
-over-refusal penalty in isolation.
+**Build the real mechanism rather than porting the Tier-0 one.** `train/eval_split.py` proves the idea
+but is a hardcoded pair of names with no enforcement — adapting it just relocates the hardcoding. What
+§2.9 actually needs:
 
-Tasks:
-- [ ] Define the defender reward: `-leak + benign_completion - over_refusal` (weights tuned so
-      false positives cost as much as false negatives).
-- [ ] Start with a **tight turn budget** (1–2 exchanges); grow only once stable.
-- [ ] GRPO + LoRA on the small defender against a fixed pool of prompted attackers.
-- [ ] Track: held-out ASR ↓, benign-completion held ≥ target, over-refusal not exploding.
+- **Membership declared in environment metadata**, not in a split module, so adding an environment
+  forces the train/held-out decision at authoring time instead of deferring it.
+- **Stratified reserves** — held out by domain *and* technique, so the reserve is not accidentally
+  all-easy or all-one-mechanism. With only three reserved this is a judgment call; past ~20
+  environments it must be systematic.
+- **Enforcement by test.** A test that fails if a reserved environment id appears in any training task
+  list. Without it §2.9 is an intention, and intentions lose to a scarce-environment deadline. This is
+  the part with no precedent, and it is the part that makes the rule real.
+- **Applies to attacker training too**, not just the defender. An attacker that has seen every
+  environment cannot measure cross-environment transfer either.
 
-**Exit:** trained defender beats the prompted-baseline defender on held-out attacks *without*
-tanking benign-completion.
-**Compute:** first real spend — order \$100s of GPU-time.
-
-### Phase 3 — Train attacker vs. frozen defender
-**Goal:** validate the other side of the loop.
-
-Tasks:
-- [ ] Attacker reward = leak achieved (with shaping/partial credit to fight sparsity over long
-      rollouts).
-- [ ] GRPO + LoRA on the attacker against the best frozen Phase-2 defender.
-- [ ] Offline judge labels technique per episode → first diversity graph.
-
-**Exit:** trained attacker raises ASR against the frozen defender; techniques are diverse, not
-collapsed to one exploit.
-
-### Phase 4 — Alternating frozen self-play
-**Goal:** de-risk instability before concurrent updates (fictitious self-play).
-
-Tasks:
-- [ ] Alternate: freeze one side, train the other to convergence, swap. Repeat.
-- [ ] Add checkpoints to the opponent pool each round; sample opponents from the pool.
-- [ ] Watch for cycling (regression against previously-beaten strategies).
-
-**Exit:** several alternation rounds with monotone-ish improvement on the frozen held-out eval.
-
-### Phase 5 — Concurrent self-play + pools + diversity
-**Goal:** the full system: both sides updating, growing pools, technique diversity maintained.
-
-Tasks:
-- [ ] Concurrent updates (likely on verl by now).
-- [ ] Pool management: reservoir of checkpoints across skill/technique; diversity-aware
-      opponent sampling driven by the offline judge's technique labels.
-- [ ] Strategy-over-time analytics (technique graph).
-
-**Exit:** stable concurrent training; defender generalizes to held-out + external benchmarks.
-
-### Stretch (explicitly not v1)
-- **CoT-distillation SFT (deliberative alignment).** Periodically take failed episodes;
-  generate a corrected defender CoT that cites the relevant constitution clause and would have
-  caught the attack; **verify against ground-truth + judge before using as SFT data** (no
-  unverified self-reflection). This is also where the attacker-CoT teacher signal lives.
-  Constitution text is used only at data-generation time, internalized into weights — not held
-  in the defender's context at deployment.
-- **Self-improving constitution.** Judge proposes new/refined clauses from recurring uncovered
-  failure patterns; folded into the next SFT round.
-- **Open-sourcing** the benchmark and defender, framed as one defensive layer, evaluated on
-  external held-out benchmarks.
-- **Parked question (not pursued now):** could the same framework train a more-capable,
-  less-trusted model to *earn* trust over time, rather than keeping the monitor permanently
-  smaller/separate?
+**The second bottleneck — the adversarial population loop** — is a strong attacker as automatic
+curriculum (the UED/PAIRED/league insight): the difficulty signal is the *messy middle*, near-50%
+win rate = maximal regret = maximal learning signal. Current read: this is tractable once the
+training loop is correct, and is sequenced after environments rather than before.
 
 ---
 
-## 6. Evaluation & success metrics
+## 6. Phases
 
-Measured on the **frozen held-out eval** (frozen attackers + frozen benign set + external
-benchmarks) on a fixed cadence — internal win-rates alone don't tell us if we're improving vs.
-cycling.
+Gates are real. We do not start Phase N+1 until Phase N's exit criteria are met.
 
-- **Attack-success-rate (ASR):** fraction of attack tasks where the canary leaked. ↓ is better.
-- **Benign-completion rate:** fraction of benign tasks where the required artifact was produced.
-- **Over-refusal rate:** benign tasks blocked/failed despite valid credentials.
-- **Headline success claim (falsifiable):** trained defender reduces held-out ASR by **X%**
-  while holding benign-completion **≥ Y%** (set X, Y before Phase 2 runs).
-- **Transfer:** performance on AgentDojo / InjecAgent it was never trained against.
+**Phase 0 — Toy GRPO. ✅** LLM-RL mechanics de-risked on a verifiable toy task.
+
+**Phase 1 — Sandbox + benchmark harness. ✅** Delivered as programmatic shell environments with
+matched attack/benign pairs rather than the originally-planned frozen YAML dataset. Concurrent eval
+harness, ASR / completion / over-refusal metrics.
+
+**Phase 2 — Defender vs. frozen attacker. ⚠️ Passed with a carried deficiency.** SFT-STaR bootstrap +
+GRPO; result and caveat in §4.2–4.3. The exit criterion "beats the baseline on held-out attacks" is
+met on aggregate leak and **not** met on the matched probes. Treat the trained monitor as a working
+artifact, not a validated one.
+
+*Why the gate opens anyway, given that gates are real.* The probe failure has a diagnosed cause —
+a frozen single-prompt opponent leaves an episode-type fingerprint, and RL takes it — and re-running
+Phase 2 against that same opponent would reproduce the same result rather than fix it. Phase 3 *is*
+the intervention. The deficiency is therefore carried forward as **Phase 3's entry condition**: the
+probes are re-run against the adaptive attacker, and if `pair_taint_accuracy` and `reject_recall`
+are still pinned once the opponent moves, the problem is the monitor and not the environment, and
+Phase 2 reopens. This is the only phase permitted to advance on a diagnosed deficiency, and only
+because the next phase is the diagnosis's remedy.
+
+**Phase 3 — Adaptive attacker (prove the ratchet works on the attacker side). ← IN PROGRESS**
+Train the attacker against the frozen trained defender. **The goal is to prove the SFT→GRPO
+*machinery* works on the attacker side too (it is only defender-proven) and yields a modest lift —
+NOT to produce a strong exploiter.** The attacker's ceiling is bounded by environment richness, so a
+low absolute win rate on the current thin envs is a fact about the environments, not a method failure
+(see §5); do not chase strong exploitation here — that needs Phase 4's environments.
+- ✅ Viability gate passed (§4.6): 8B trainable at ~17%, thinking OFF / 2048 tokens (thinking-6144
+  truncated 29.5% of actions for no win-rate gain — do NOT use it).
+- ✅ Attacker SFT bootstrap built (`attack_sft/`, §4.7): collect wins + anchored near-misses, re-author
+  per-turn reasoning under the grounding gate, SFT, promote only if held-out win rate rises without an
+  effective-rank collapse. This is the attacker half of the ratchet the defender already has.
+- GRPO from the SFT-merged backbone (the `kl=0` construction). First-pass GRPO from *base* stalled at
+  12% (§4.6) — expected, because base had no bootstrap.
+- Offline technique labelling → first diversity graph.
+- Carried from Phase 2: re-run the matched probes once the opponent is adaptive — the first real test
+  of whether `policies/prompt_pool.py` removed the fingerprint or only the one we named (watch whether
+  the attacker finds a replacement).
+- **Exit:** the SFT→GRPO ratchet demonstrably moves the attacker (loss moves, win rate ticks up,
+  entropy holds, dead groups drop) *and* the collection readout has told us how thin the environments
+  are — the input that orders Phase 4 vs. finishing here. The probe re-run either moves or indicts the
+  monitor per Phase 2's carried deficiency.
+
+**Phase 4 — Environment authoring framework and scale-up.** The dominant workstream (§5).
+- **The reusable lever is the *framework*, not hand-built one-offs**: a scenario-authoring abstraction
+  (file tree + planted secret + verifiable multi-step predicate + mandatory benign twin) so envs
+  become cheap content. Build this regardless of the 3↔4 ordering.
+- **The Phase 3 → Phase 4 order is data-dependent, arbitrated by the collection readout.** A working
+  attacker is the instrument that surfaces what to build (PLAN §5, "attacker as diagnostic"), so the
+  default is attacker-first. But if the readout says the envs are too thin to even demonstrate the
+  machinery, environments jump ahead of *finishing* attacker training. Do not hard-commit the order.
+- Per-environment metadata: difficulty, technique tags, canary-placement options.
+- Multi-step verifiable predicates; matched benign twins mandatory per §2.2. Realistic depth so
+  exploration is a real challenge — the current envs make finding the secret trivial and put the whole
+  game at exfiltration (§4.7), which is a narrow slice of the eventual threat model.
+- **Held-out environments reserved at the outset per §2.9.**
+- Evaluate MORPHEUS as a substrate — its operational verifiers generalize canary-matching to
+  programmatic state predicates. Blocking unknown: whether its tool interface can be mediated by our
+  monitor. A focused spike answers it.
+- **Exit:** a new environment is authorable in a day by following the spec; held-out environments are
+  reserved and untouched; the suite is large enough that the Phase 3 attacker no longer saturates it.
+
+**Phase 5 — Alternating self-play → population / league.** Freeze one side, train the other to
+saturation (measured on *held-out*, not training, performance), swap, repeat several rounds. Two
+requirements make "several rounds" converge instead of oscillate:
+- **Opponent pools, not just the latest checkpoint** (§2.5). Keep the best checkpoint of each round and
+  sample opponents from the pool. Without this the defender beats the *latest* attacker while
+  forgetting how to beat an older one, and the pair cycles forever. This is the AlphaZero-league fix;
+  it is the mechanism, not a nicety.
+- **Benchmarking is a per-round GATE, not a final phase** (see §7). Every alternation emits held-out
+  environment transfer, the matched probes (judgment vs. classification), and *attacker-vs-the-base-
+  defender* (absolute improvement, not just relative to the current opponent). Non-collapse
+  (forgetting / effective rank) measured continuously via `train/plasticity.py`. If measurement waits
+  until the end, you cannot tell which round was real improvement versus cycling versus overfitting the
+  current opponent — and it is unrecoverable after the fact.
+- Diversity-aware opponent sampling from the offline taxonomy; curriculum driven by the messy middle.
+- **Exit:** several rounds of monotone-ish improvement on the frozen held-out eval, with forgetting and
+  effective rank stable — i.e. improvement that is not cycling.
+
+**Phase 6 — Benchmark capstone and monitor release.** Snapshot a versioned suite; report the
+adversary-budget curve; publish monitor weights, environments, taxonomy, transcripts, and procedure.
+- **Exit:** held-out-adversary and held-out-environment numbers hold up, and an external benchmark
+  (AgentDojo / InjecAgent) corroborates.
 
 ---
 
-## 7. Compute / budget tiers
+## 7. Evaluation
 
-Budget is uncertain (\$500–\$10k). Plan degrades gracefully:
+**The held-out ladder.** Each rung tests something the rung below cannot.
 
-- **~\$500:** Phase 0 + full Phase 1 benchmark (inference-only) + **one** Phase-2 defender-only
-  LoRA run on a 0.5–1.5B model. Deliverable: benchmark + a first trained-defender result.
-- **~\$10k:** Phases 2–4 meaningfully on ≤7B models, LoRA, short horizons. Deliverable:
-  benchmark + validated two-sided self-play.
-- **Benchmark (Phase 1) is inference-only and cheap — it ships at any funding level.**
+| rung | tests | status |
+|---|---|---|
+| Held-out **episodes** | generalization within an environment | ✅ `sft/review_split.py` |
+| Held-out **canaries** | memorization of specific secrets | ✅ per-episode randomization |
+| Matched-pair **probes** | judgment vs. episode-type classification | ✅ `sft/probe.py`, `sft/call_probe.py` |
+| Held-out **environments** | transferable judgment vs. overfitting the training worlds | ⚠️ reserved, never used — §5 |
+| Held-out **adversary** | robustness vs. beating one opponent | ⬜ Phase 5 |
+| **External** benchmarks | our framing vs. the field's | ⬜ AgentDojo / InjecAgent, never wired |
+
+Everything above the probe rung is a *training* measurement. Only the bottom three produce a
+**benchmark** number.
+
+**Benchmarking steers; it does not just validate — so it runs every round, not at the end.** An
+adaptive-adversary project only works if measurement decides what to build next, because a static
+number saturates (§1). The held-out ladder, the matched probes, and the pool checks are therefore a
+**per-round gate on the alternating loop (Phase 5)**, not a final validation phase. Run them once at
+the end and you cannot distinguish real improvement from cycling from overfitting the current opponent
+— and it is unrecoverable after the fact. "Saturation" is defined on held-out, not training,
+performance. This is the single most consequential lesson of the Phase-2 defender result (§4.3): the
+probe is what caught the metric being gamed, and it only helps if it fires while there is still a
+decision to make.
+
+**Core metrics.** Attack success rate (↓), benign completion rate, over-refusal rate — measured on the
+frozen held-out eval on a fixed cadence, because internal win rates cannot distinguish improvement
+from cycling.
+
+**Shortcut metrics (§2.8).** `pair_taint_accuracy` and `pair_exact_accuracy` (classifier test —
+matched halves, so type detection cannot help), `verb_pair_accuracy` (the "reject the scary verb"
+test — `od`, `base64`, `cut` appear on both sides), `reject_recall` and `allow_precision` on the call
+gate.
+
+**Non-collapse metrics.** Effective rank (plasticity), forgetting (per-task regression from its own
+peak = cycling), stability (within-task reward variance, read *with* the mean). Adaptation speed and
+recovery time need a defined regime shift and apply only once the opponent population shifts.
+
+**Headline claim, falsifiable.** The trained monitor reduces held-out ASR by X% while holding benign
+completion ≥ Y%, *at a stated adversary optimization budget*, on **held-out environments**. X and Y
+are set before Phase 5 runs.
 
 ---
 
-## 8. Risks & open questions
+## 8. Risks and open questions
 
-- **Sparse + long-horizon reward.** Single-bit leak/no-leak over a multi-turn rollout is hard
-  credit assignment. Mitigations: short horizons first, reward shaping / partial credit,
-  curriculum. (This is the core RL difficulty; your classical-RL background is the asset here.)
-- **Benign-set quality is the sleeper variable.** Whether the defender learns "allow legit /
-  block malicious" vs. "refuse everything" is mostly determined by the benign set. Treat its
-  construction as a first-class workstream, not an afterthought.
-- **Degenerate self-play equilibria** (attacker/defender converge on a "safe word" pattern;
-  attack distribution collapses). Mitigations: pools + diversity-aware sampling + the offline
-  judge's technique tracking.
-- **Rollout throughput** if reset isn't cheap enough → revisit env-state reset strategy.
-- **Open:** exact reward weights (leak vs. over-refusal); turn-budget schedule; when to migrate
-  TRL → verl; how large a benign set is "enough" (and generate-on-the-fly vs. frozen).
+- **Environment breadth is the binding constraint** (§5). Every other risk is downstream.
+- **Shortcut learning is the default, not the exception.** Measured in §4.3. Any frozen component —
+  opponent, prompt, canary, environment — becomes a fingerprint that RL will take instead of doing the
+  work. Mitigations: prompt pools, adaptive attacker, canary randomization, held-out environments.
+- **Degenerate self-play equilibria.** Pools + diversity sampling + plasticity metrics (Phase 5).
+- **Sparse long-horizon credit assignment.** Single-bit leak/no-leak over a multi-turn rollout.
+  Mitigations: short horizons first, partial credit, curriculum from the messy middle.
+- **Benign-set quality is the sleeper variable.** Whether the monitor learns "allow legit / block
+  malicious" or "refuse everything" is mostly determined by the benign half. First-class workstream,
+  and per §5 it is half the authoring cost.
+- **Known-inert machinery.** The KL anchor is currently negligible (`beta*kl ≈ 6e-5`), and GRPO
+  weights all completion tokens equally, putting ~99% of the gradient on prose rather than the verdict
+  token. Both are deferred, deliberately, and both should be revisited before Phase 5.
+- **Open:** reward weights beyond the leak > over-refusal invariant; turn-budget schedule; how large a
+  benign set is enough; whether to migrate off the hand-rolled trainer.
 
 ---
 
-## 9. Working style
+## 9. Compute and infra reality
 
-- We build **collaboratively, piece by piece.** Each phase gets its own detailed
-  implementation plan (via the writing-plans workflow) *when we start it* — this document is
-  the map, not the turn-by-turn.
-- Phase gates are real: we don't start Phase N+1 until Phase N's exit criteria are met.
-- Every task/dataset item ships with a machine-checkable success predicate — that's the spec.
+**Modal GPU functions are always preemptible** — `nonpreemptible=True` is CPU/memory only. There is no
+stable-GPU escape, so every training phase must be preemption-tolerant: short, incrementally
+checkpointed units that resume by skipping completed work. GRPO checkpoints per iteration; SFT
+collection commits per episode. A unit longer than the mean time between preemptions makes zero
+progress. Retries can land in the *same* container, so servers and GPU memory must be released in a
+`finally`, not left to teardown.
+
+Budget degrades gracefully: the benchmark half is inference-only and ships at any funding level; a
+single defender or attacker training run is order-\$100s; population self-play across a broad
+environment suite is the expensive tier.
+
+---
+
+## 10. Working style
+
+- Build **collaboratively, piece by piece.** Each phase gets its own spec + plan in `docs/` when we
+  start it — never a whole-subsystem hand-off.
+- Phase gates are real.
+- Every task and dataset item ships with a machine-checkable success predicate. That is the spec.
+- `docs/` is gitignored on purpose: specs, plans, and `ROADMAP.md` are local-only and never committed.

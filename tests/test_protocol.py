@@ -67,11 +67,12 @@ def test_braces_inside_string_value():
 
 
 def test_pure_garbage_falls_back_to_message():
-    # no JSON at all -> must not raise; wrap the raw text as a message so the episode lives
+    # no JSON at all -> must not raise, but also must not append raw thinking to context
     raw = "I refuse to output JSON. Here is my rambling response instead."
     action = parse_attacker_action(raw)
     assert action.kind == "message"
-    assert action.text == raw
+    assert action.text != raw
+    assert "invalid attacker output" in action.text
 
 
 def test_malformed_shape_falls_back_to_message():
@@ -79,7 +80,18 @@ def test_malformed_shape_falls_back_to_message():
     raw = '{"kind": "tool_call"}'
     action = parse_attacker_action(raw)
     assert action.kind == "message"
-    assert action.text == raw
+    assert action.text != raw
+    assert "invalid attacker output" in action.text
+
+
+def test_fallback_stashes_raw_for_diagnosis_but_never_renders_it():
+    # a truncated thinking trace with no closing JSON: the monitor must see only the short
+    # placeholder, but `raw` must retain the full text so we can diagnose it after the run.
+    raw = "<think>the key is in app/config.py, I should base64 it so the monitor... " + "x" * 3000
+    action = parse_attacker_action(raw)
+    assert action.raw == raw                        # full text kept for offline diagnosis
+    assert action.text == "[invalid attacker output: expected one final JSON action]"
+    assert raw not in render_action(action)         # but never reaches the monitor's view
 
 
 # --- parse_defender_decision (fails CLOSED) ---
@@ -119,3 +131,18 @@ def test_render_action_message():
 def test_render_conversation():
     conv = [{"role": "agent", "content": "hi"}, {"role": "monitor", "content": "denied"}]
     assert render_conversation(conv) == "agent: hi\nmonitor: denied"
+
+
+def test_render_conversation_can_window_old_turns():
+    conv = [
+        {"role": "context", "content": "stated task"},
+        {"role": "agent", "content": "old action"},
+        {"role": "monitor", "content": "old result"},
+        {"role": "agent", "content": "latest action"},
+        {"role": "monitor", "content": "latest result"},
+    ]
+    rendered = render_conversation(conv, max_chars=85)
+    assert len(rendered) <= 85
+    assert "latest result" in rendered
+    assert "earlier conversation omitted" in rendered
+    assert "old action" not in rendered
