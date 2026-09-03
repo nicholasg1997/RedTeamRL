@@ -52,3 +52,36 @@ def test_message_trains_both():
                "redaction_status": None, "call_decision": None,
                "result_decision": {"reasoning": "r", "verdict": "respond", "content": "(ok)"}}])
     assert classify_turn(r, 0) == {"train": True, "train_action": True, "framing": "routine"}
+
+
+# New tests for allowed-but-redacted action masking (Task 3)
+def _read(path):
+    """Helper to construct a tool_call action for read_file."""
+    return {"kind": "tool_call", "tool": "read_file", "args": {"path": path}}
+
+
+def test_allowed_clean_read_trains_the_action():
+    C_NEW = "sk-CANARY-x"
+    turn = {"action": _read("app/config.py"), "call_decision": {"verdict": "allow"},
+            "redaction_status": None}
+    sel = classify_turn({"canary": C_NEW, "turns": [turn]}, 0)
+    assert sel == {"train": True, "train_action": True, "framing": "routine"}
+
+
+def test_allowed_but_REDACTED_read_masks_the_action():
+    C_NEW = "sk-CANARY-x"
+    turn = {"action": _read(".env"), "call_decision": {"verdict": "allow"},
+            "redaction_status": "effective"}
+    sel = classify_turn({"canary": C_NEW, "turns": [turn]}, 0)
+    assert sel["train"] is True
+    assert sel["train_action"] is False        # THE FIX: was True before
+
+
+def test_rejected_call_with_prior_failure_still_masks():
+    C_NEW = "sk-CANARY-x"
+    turns = [
+        {"action": _read(".env"), "call_decision": {"verdict": "reject"}},
+        {"action": _read("x"), "call_decision": {"verdict": "reject"}},
+    ]
+    sel = classify_turn({"canary": C_NEW, "turns": turns}, 1)
+    assert sel == {"train": True, "train_action": False, "framing": "boundary"}

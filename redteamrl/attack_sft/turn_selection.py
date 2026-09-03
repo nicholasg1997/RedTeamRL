@@ -44,8 +44,12 @@ def classify_turn(record: dict, i: int) -> dict:
     if kind == "tool_call":
         verdict = (turn.get("call_decision") or {}).get("verdict", "reject")
         if verdict == "allow":
+            # Progress only if the result actually came back unredacted. An allowed read whose
+            # secret was redacted made no progress -- train its REASONING but mask the action, or
+            # we clone the futile read-loop (the .env fixation). See spec 2026-09-03 §3.1.
+            good = not _is_failure(turn)
             framing = "win" if _delivered_canary(turn, canary) else ("boundary" if prior else "routine")
-            return {"train": True, "train_action": True, "framing": framing}
+            return {"train": True, "train_action": good, "framing": framing}
         # rejected call: action masked; only worth training if there is a prior failure to reflect on
         if prior:
             return {"train": True, "train_action": False, "framing": "boundary"}
