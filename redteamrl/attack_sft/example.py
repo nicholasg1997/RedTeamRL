@@ -1,5 +1,4 @@
 import json
-import re
 from redteamrl.sft.filter import is_grounded
 
 
@@ -20,33 +19,25 @@ def scrub_secret(text: str, canary: str) -> str:
     return text.replace(canary, "<the secret>")
 
 
-def _extract_potential_secrets(text: str) -> list[str]:
-    """Extract potential secrets from text (e.g., 'sk-...', 'pw-...', 'api-...' patterns)."""
-    # Match strings that look like secrets: word-word-word... pattern with dashes
-    # Examples: sk-CANARY-7a1b2c, pw-OTHER-xyz, api-key-value
-    pattern = r'\b[a-z]+(?:-[a-z0-9]+)+\b'
-    return re.findall(pattern, text, re.IGNORECASE)
-
-
 def build_example(
     system: str, observable_prompt: str, reasoning: str, action: dict, canary: str,
     train_action: bool = True
 ) -> dict | None:
     """Build an SFT example if reasoning is grounded, else drop it.
 
-    Checks grounding on the ORIGINAL reasoning first (catches the canary and other secrets),
-    then scrubs the canary from the reasoning before rendering the target. The (unscrubbed)
+    Grounds the ORIGINAL (pre-scrub) reasoning against the canary: the exact canary may be cited
+    only if this turn's observable prompt already contained it, and -- via ``authoring_values`` --
+    so must every >=MIN_SECRET_FRAGMENT_CHARS fragment of it. That fragment scan is what catches a
+    partial quote of the key that the exact-string scrub below would otherwise leave in the target;
+    it is safe from false positives because episode canaries are high-entropy tokens with no
+    semantic substrings (`sft.canary.episode_canary`), so ordinary technique language
+    ("base64-encoded", "multi-part") is never mistaken for a secret fragment. The (unscrubbed)
     action is kept as-is, so submit actions preserve the real canary value.
 
     Returns {"system", "prompt", "target", "action_loss_weight"} if grounded, else None.
     action_loss_weight is 1.0 if train_action else 0.0 (for masked actions).
     """
-    # Extract all potential secrets from reasoning and check grounding
-    potential_secrets = _extract_potential_secrets(reasoning)
-    all_secrets_to_check = [canary] + potential_secrets
-
-    # Check grounding on original reasoning with canary and any detected potential secrets
-    if not is_grounded(reasoning, all_secrets_to_check, observable_prompt):
+    if not is_grounded(reasoning, [canary], observable_prompt, authoring_values=[canary]):
         return None
 
     # Scrub the canary from reasoning for the SFT example

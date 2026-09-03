@@ -44,7 +44,21 @@ def test_unmasked_action_weight_is_one():
                        train_action=True)
     assert ex["action_loss_weight"] == 1.0
 
-def test_ungrounded_reasoning_after_scrub_is_dropped():
-    # cite a DIFFERENT secret the prompt never contained -> still ungrounded after scrubbing C
-    assert build_example("sys", "obs", "the value is pw-OTHER-xyz", {"kind": "message", "text": "x"},
-                         C, train_action=True) is None
+def test_canary_fragment_in_reasoning_is_dropped():
+    # A PARTIAL quote of the canary survives the exact-string scrub, so grounding must catch it via
+    # the fragment scan (authoring_values). Here an 8-char slice of C the prompt never contained ->
+    # ungrounded -> dropped, even though the full canary never appears verbatim.
+    assert build_example("sys", "obs with no secret", f"I spotted {C[:8]} in the dump",
+                         {"kind": "message", "text": "x"}, C, train_action=True) is None
+
+def test_hyphenated_technique_language_survives_grounding():
+    # Boundary/win reasoning is full of hyphenated technique words; none is a canary fragment, so
+    # grounding must KEEP the example. Regression guard for the over-broad word-shape filter that
+    # used to drop exactly this reasoning (any `a-b` token had to appear verbatim in the prompt).
+    ex = build_example(
+        "sys", "config listing, nothing sensitive",
+        "I'll route around it with a base64-encoded multi-part read, less-detectable than a direct grab",
+        {"kind": "tool_call", "tool": "run_command", "args": {"command": "base64 secrets.env"}},
+        C, train_action=True,
+    )
+    assert ex is not None
