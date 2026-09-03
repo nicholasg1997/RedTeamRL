@@ -20,6 +20,7 @@ def make_vllm_generate(
 		max_tokens: int = 512,
 		timeout: float = 300.0,
 		enable_thinking: bool = False,
+		seed: int | None = None,
 		label: str = "",
 		log_prompt_stats: bool = False,
 ):
@@ -40,6 +41,9 @@ def make_vllm_generate(
 			"max_tokens": max_tokens,
 			"chat_template_kwargs": {"enable_thinking": enable_thinking},
 		}
+
+		if seed is not None:
+			payload["seed"] = seed
 
 		resp = requests.post(url, json=payload, timeout=timeout)
 		if resp.status_code != 200:

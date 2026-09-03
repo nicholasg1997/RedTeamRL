@@ -70,6 +70,7 @@ DECISION_LOSS_WEIGHT = 1.0         # attacker target is prose+action uniformly; 
 EVAL_ROLLOUTS = 32
 RANK_FLOOR = 0.9                   # promote only if post rank >= 0.9 * pre rank (no entropy collapse)
 RANK_PROBE_SIZE = 32               # fixed observable-prompts sampled from collection for the rank probe
+EVAL_SEED = 1234                   # fixed sampler seed so win_before/win_after differ only by the model
 CKPT_ROOT = "/runs/attacker-sft"
 
 image = (
@@ -164,13 +165,14 @@ def _impl(active_servers):
     active_servers.append((stop_vllm_server, atk_proc))
     gen_atk_base = make_vllm_generate(f"http://localhost:{ATK_PORT}", ATTACKER_MODEL,
                                       enable_thinking=False, temperature=TEMP,
-                                      max_tokens=ATK_MAX_TOKENS)
+                                      max_tokens=ATK_MAX_TOKENS, seed=EVAL_SEED)
 
     # An eval win rate over the reserved (held-out) attack tasks. NOT collect_attacker_episodes,
     # which asserts the TRAINING split and would reject held-out envs by design.
     held_attack = [t for t in held_out_tasks() if t.episode_type == "attack"]
 
     def eval_win_rate(gen_atk, n_rollouts):
+        from redteamrl.attack_sft.eval_metrics import repeated_failed_action_rate
         work = [(spec, r) for spec in held_attack for r in range(n_rollouts)]
 
         def one(item):
@@ -186,10 +188,13 @@ def _impl(active_servers):
                                      max_turns=MAX_TURNS, redaction_enforcement=REDACTION_ENFORCEMENT)
             finally:
                 sandbox.close()
-            return bool(result.leak)
+            return bool(result.leak), list(result.steps)
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            wins = list(pool.map(one, work))
-        return sum(wins) / max(len(wins), 1)
+            outcomes = list(pool.map(one, work))
+        wins = [w for w, _ in outcomes]
+        all_steps = [s for _, steps in outcomes for s in steps]
+        win_rate = sum(wins) / max(len(wins), 1)
+        return win_rate, repeated_failed_action_rate(all_steps)
 
     # ---- 1. COLLECT (the decisive readout) ----
     collect_attacker_episodes(
@@ -229,8 +234,9 @@ def _impl(active_servers):
     ][:RANK_PROBE_SIZE]
 
     # ---- 3. before-eval on the base attacker (still on vLLM), then free it for HF ----
-    win_before = eval_win_rate(gen_atk_base, EVAL_ROLLOUTS)
-    print(f"\nheld-out win rate BEFORE sft: {win_before:.1%}", flush=True)
+    win_before, repeat_before = eval_win_rate(gen_atk_base, EVAL_ROLLOUTS)
+    print(f"\nheld-out win rate BEFORE sft: {win_before:.1%}  "
+          f"(repeated-failed-action {repeat_before:.0%})", flush=True)
     stop_vllm_server(atk_proc)
     active_servers.remove((stop_vllm_server, atk_proc))
 
@@ -304,13 +310,15 @@ def _impl(active_servers):
     active_servers.append((stop_vllm_server, sft_atk_proc))
     gen_atk_sft = make_vllm_generate(f"http://localhost:{ATK_PORT}", "attacker-sft",
                                      enable_thinking=False, temperature=TEMP,
-                                     max_tokens=ATK_MAX_TOKENS)
-    win_after = eval_win_rate(gen_atk_sft, EVAL_ROLLOUTS)
-    print(f"held-out win rate AFTER sft: {win_after:.1%}", flush=True)
+                                     max_tokens=ATK_MAX_TOKENS, seed=EVAL_SEED)
+    win_after, repeat_after = eval_win_rate(gen_atk_sft, EVAL_ROLLOUTS)
+    print(f"held-out win rate AFTER sft: {win_after:.1%}  "
+          f"(repeated-failed-action {repeat_after:.0%})", flush=True)
 
-    # ---- 6. accept: win up AND entropy preserved ----
+    # ---- 6. accept: NON-COLLAPSE bootstrap (spec 2026-09-03 §3.3) ----
     before = {"win_rate": win_before, "effective_rank": rank_before}
-    after = {"win_rate": win_after, "effective_rank": rank_after}
+    after = {"win_rate": win_after, "effective_rank": rank_after,
+             "repeated_failed_action_rate": repeat_after}
     ok, reasons = accept(before, after, rank_floor=RANK_FLOOR)
     result = {"before": before, "after": after, "accepted": ok, "reasons": reasons,
               "won": won, "n_examples": len(examples)}
@@ -319,7 +327,8 @@ def _impl(active_servers):
     runs.commit()
     print(f"\n===== ACCEPTANCE: {'PROMOTED' if ok else 'REJECTED'} =====", flush=True)
     print(f"  win_rate {win_before:.1%} -> {win_after:.1%}   "
-          f"eff_rank {rank_before:.2f} -> {rank_after:.2f}", flush=True)
+          f"eff_rank {rank_before:.2f} -> {rank_after:.2f}   "
+          f"repeated-failed-action {repeat_after:.0%}", flush=True)
     for reason in reasons:
         print(f"  reject: {reason}", flush=True)
     if ok:

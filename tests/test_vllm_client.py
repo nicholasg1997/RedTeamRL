@@ -75,3 +75,15 @@ def test_stop_vllm_server_kills_after_timeout():
     proc.terminate.assert_called_once_with()
     proc.kill.assert_called_once_with()
     assert proc.wait.call_count == 2
+
+
+def test_seed_is_placed_in_the_request_payload(monkeypatch):
+    captured = {}
+    class R:
+        status_code = 200
+        def json(self): return {"choices": [{"message": {"content": "ok"}}]}
+    import redteamrl.policies.vllm_client as vc
+    monkeypatch.setattr(vc.requests, "post", lambda url, json, timeout: captured.update(p=json) or R())
+    gen = make_vllm_generate("http://x", "m", seed=1234)
+    gen("sys", [{"role": "user", "content": "hi"}])
+    assert captured["p"]["seed"] == 1234
