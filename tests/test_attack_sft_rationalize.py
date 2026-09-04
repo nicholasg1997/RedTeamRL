@@ -19,9 +19,13 @@ def test_near_miss_framing_is_retired():
     assert not hasattr(R, "NEARMISS_FRAMING")
 
 
-def test_author_turn_returns_reasoning_text():
-    out = author_turn("obs", {"kind": "message", "text": "x"}, WIN_FRAMING, lambda s, m: "because it fits the cover")
-    assert out == "because it fits the cover"
+def test_author_turn_keeps_the_real_action_and_strips_stray_json_from_reasoning():
+    # The teacher authors REASONING; the turn's REAL action is kept (no synthesized replacement).
+    # If the model emits a trailing JSON out of habit, it is stripped from the reasoning prose.
+    res, act = author_turn("obs", {"kind": "message", "text": "x"}, WIN_FRAMING,
+                           lambda s, m: 'because it fits\n{"kind": "message", "text": "y"}')
+    assert res == "because it fits"
+    assert act == {"kind": "message", "text": "x"}     # ORIGINAL action, not the teacher's JSON
 
 
 def test_three_framings_exist():
@@ -47,10 +51,11 @@ def test_teacher_is_injected_into_the_prompt_but_flagged_not_to_quote():
     assert "do not quote" in p.lower() or "don't quote" in p.lower() or "your own words" in p.lower()
 
 
-def test_author_turn_returns_generate_output():
-    out = author_turn("obs", {"kind": "message", "text": "x"}, ROUTINE_FRAMING,
-                      lambda s, m: "routine read, looks fine")
-    assert out == "routine read, looks fine"
+def test_author_turn_fallback_when_no_json_emitted():
+    res, act = author_turn("obs", {"kind": "tool_call", "tool": "read_file", "args": {"path": "a"}}, ROUTINE_FRAMING,
+                           lambda s, m: "routine read, looks fine")
+    assert res == "routine read, looks fine"
+    assert act == {"kind": "tool_call", "tool": "read_file", "args": {"path": "a"}}
 
 
 def test_boundary_framing_forbids_empty_route_around_and_demands_a_different_action():

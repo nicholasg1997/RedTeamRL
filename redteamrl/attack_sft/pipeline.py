@@ -69,7 +69,7 @@ def records_to_examples(records: list[dict], attacker_system: str, generate) -> 
             framing = _FRAMINGS[selection["framing"]]
             teacher = _teacher_for(record, i) if selection["framing"] == "boundary" else None
 
-            reasoning = author_turn(
+            reasoning, target_action = author_turn(
                 turn["observable_prompt"],
                 turn["action"],
                 framing,
@@ -80,7 +80,7 @@ def records_to_examples(records: list[dict], attacker_system: str, generate) -> 
                 attacker_system,
                 turn["observable_prompt"],
                 reasoning,
-                turn["action"],
+                target_action,
                 record["canary"],
                 train_action=selection["train_action"],
             )

@@ -54,8 +54,8 @@ MIN_EXAMPLES = 120
 # attacker target is long reasoning+action weighted uniformly, so the same LR moves it far less. The
 # near-zero rank change proved huge headroom, so push 10x harder over more epochs; the rank_floor
 # acceptance gate is the safety net that catches an over-correction into collapse.
-SFT_EPOCHS = 3
-SFT_LR = 1e-5
+SFT_EPOCHS = 2
+SFT_LR = 5e-6
 SFT_BATCH = 8
 # 1, not 2: attacker examples carry ~13k-token observable prompts (40k-char transcripts), so two at
 # once is the activation-memory blow-up that OOM'd GRPO. With gradient checkpointing (applied below)
@@ -71,7 +71,7 @@ EVAL_ROLLOUTS = 32
 RANK_FLOOR = 0.9                   # promote only if post rank >= 0.9 * pre rank (no entropy collapse)
 RANK_PROBE_SIZE = 32               # fixed observable-prompts sampled from collection for the rank probe
 EVAL_SEED = 1234                   # fixed sampler seed so win_before/win_after differ only by the model
-CKPT_ROOT = "/runs/attacker-sft"
+CKPT_ROOT = "/runs/attacker-sft-v2"   # fresh: system-prompt change is a new phase_identity (re-collect)
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
