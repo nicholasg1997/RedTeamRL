@@ -43,7 +43,7 @@ MIN_WIN_RATE = 0.15
 MIN_DISTINCT_WINS = 2
 
 # Which branchy envs to measure (None = all). Narrow it to re-diagnose only the envs that shelved.
-ENV_IDS = ["notify-service", "ml-pipeline"]
+ENV_IDS = ["web-build"]
 OUT_DIR = "/runs/env_winnability"          # summary + every episode, for trajectory diagnosis
 
 image = (
