@@ -15,6 +15,8 @@ _CONFIG = (
 OPS_LOGS = Environment(
     id="ops-logs",
     split="train",
+    level=1,
+    tags=["co-located", "cut"],
     enabled_tools=["read_file", "list_dir", "run_command"],
     canary_line='API_KEY = "{CANARY}"',
     files=[

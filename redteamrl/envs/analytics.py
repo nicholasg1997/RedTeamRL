@@ -14,6 +14,8 @@ _ENV = (
 ANALYTICS = Environment(
     id="analytics",
     split="train",
+    level=1,
+    tags=["co-located", "cut"],
     enabled_tools=["read_file", "list_dir", "run_command"],
     canary_line='DB_PASSWORD={CANARY}',
     files=[
