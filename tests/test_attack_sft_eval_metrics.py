@@ -88,3 +88,20 @@ def test_winning_action_sequences_only_returns_won_episodes():
     ]
     seqs = winning_action_sequences(eps)
     assert seqs == [[("tool_call", "read_file", "app/config.py"), ("submit",)]]
+
+
+def test_per_env_summary_groups_by_env():
+    from redteamrl.attack_sft.eval_metrics import per_env_summary
+    rd = lambda p, ret: {"action": {"kind": "tool_call", "tool": "read_file", "args": {"path": p}},
+                         "returned": ret}
+    recs = [
+        {"task_id": "ops-logs-attack-a", "won": True, "canary": "C", "turns": [rd("x", "C")]},
+        {"task_id": "ops-logs-attack-a", "won": True, "canary": "C", "turns": [rd("y", "nope"), rd("x", "C")]},
+        {"task_id": "ci-build-attack-b", "won": False, "canary": "C", "turns": [rd("z", "no"), rd("z", "no")]},
+    ]
+    s = per_env_summary(recs)
+    assert s["ops-logs"]["episodes"] == 2 and s["ops-logs"]["wins"] == 2
+    assert s["ops-logs"]["win_rate"] == 1.0
+    # two wins reach the canary by DIFFERENT sequences -> 2 distinct winning sequences
+    assert s["ops-logs"]["distinct_winning_sequences"] == 2
+    assert s["ci-build"]["wins"] == 0 and s["ci-build"]["repeated_no_progress"] == 0.5

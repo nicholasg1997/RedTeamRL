@@ -76,6 +76,34 @@ def defender_decision_breakdown(steps: list[dict]) -> dict:
     return counts
 
 
+def per_env_summary(records: list[dict]) -> dict[str, dict]:
+    """Group collection records by ENVIRONMENT (not task) and report whether each is productive.
+
+    Each record is ``{"task_id", "won", "canary", "turns"}`` where ``turns`` are harness steps. A
+    blended win rate hides an unproductive environment inside a healthy one; this breaks it out so
+    the winnability gate (spec §3) can keep or shelf each env. ``distinct_winning_sequences`` counts
+    how many DIFFERENT action-key paths produced a win -- one narrow exploit repeated across every
+    win is the degenerate case the §3.4 diversity check guards against."""
+    from redteamrl.envs.registry import env_id_of
+    groups: dict[str, list[dict]] = {}
+    for rec in records:
+        groups.setdefault(env_id_of(rec["task_id"]), []).append(rec)
+    out: dict[str, dict] = {}
+    for env_id, recs in groups.items():
+        wins = [r for r in recs if r.get("won")]
+        rate = mean_repeated_no_progress_rate([(r["turns"], r["canary"]) for r in recs])
+        distinct = {tuple(seq) for seq in winning_action_sequences(
+            [{"won": True, "turns": r["turns"]} for r in wins])}
+        out[env_id] = {
+            "episodes": len(recs),
+            "wins": len(wins),
+            "win_rate": len(wins) / len(recs) if recs else 0.0,
+            "repeated_no_progress": rate,
+            "distinct_winning_sequences": len(distinct),
+        }
+    return out
+
+
 def winning_action_sequences(episodes: list[dict]) -> list[list[tuple]]:
     """For each episode with ``won`` true, the ordered list of its turns' action_keys. Reveals
     whether wins come from a varied strategy space or one narrow exploit (spec §3.4)."""
