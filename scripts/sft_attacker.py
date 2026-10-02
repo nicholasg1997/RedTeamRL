@@ -54,7 +54,7 @@ MIN_EXAMPLES = 120
 # attacker target is long reasoning+action weighted uniformly, so the same LR moves it far less. The
 # near-zero rank change proved huge headroom, so push 10x harder over more epochs; the rank_floor
 # acceptance gate is the safety net that catches an over-correction into collapse.
-SFT_EPOCHS = 2
+SFT_EPOCHS = 1     # was 2: epoch-2 loss drop 1.63->0.53 was memorization; one pass over the examples
 SFT_LR = 5e-6
 SFT_BATCH = 8
 # 1, not 2: attacker examples carry ~13k-token observable prompts (40k-char transcripts), so two at
@@ -322,7 +322,8 @@ def _impl(active_servers):
           f"(repeated-no-progress {repeat_after:.0%})", flush=True)
 
     # ---- 6. accept: NON-COLLAPSE bootstrap (spec 2026-09-03 §3.3) ----
-    before = {"win_rate": win_before, "effective_rank": rank_before}
+    before = {"win_rate": win_before, "effective_rank": rank_before,
+              "repeated_no_progress_rate": repeat_before}   # relative loop gate (accept() §3)
     after = {"win_rate": win_after, "effective_rank": rank_after,
              "repeated_no_progress_rate": repeat_after}
     ok, reasons = accept(before, after, rank_floor=RANK_FLOOR)
