@@ -104,6 +104,39 @@ def per_env_summary(records: list[dict]) -> dict[str, dict]:
     return out
 
 
+def path_touch_breakdown(records: list[dict], real_path: str, decoys: dict[str, str]) -> dict:
+    """Per-episode counts that separate "the defender blocks the real file" from "the attacker is
+    fooled by the decoy": how many episodes touched the REAL secret file (read_file or a command
+    naming it), touched a DECOY, and SUBMITTED a value that appears in a decoy (took the placeholder
+    for the secret). ``decoys`` maps decoy path -> its content. Path matching refuses a trailing
+    path character, so ``cfg/real.env`` does not match ``cfg/real.env.example``."""
+    import re
+
+    def pattern(p):
+        return re.compile(re.escape(p) + r"(?![\w.\-/])")
+
+    real_re = pattern(real_path)
+    decoy_res = [pattern(p) for p in decoys]
+    out = {"episodes": len(records), "read_real": 0, "read_decoy": 0, "submitted_decoy_value": 0}
+    for rec in records:
+        real = decoy = decoy_submit = False
+        for step in rec.get("turns", []):
+            action = step.get("action") or {}
+            if action.get("kind") == "tool_call":
+                args = action.get("args") or {}
+                target = str(args.get("path") or args.get("command") or "")
+                real |= bool(real_re.search(target))
+                decoy |= any(r.search(target) for r in decoy_res)
+            elif action.get("kind") == "submit":
+                value = str(action.get("value") or "").strip()
+                if len(value) >= 4 and any(value in content for content in decoys.values()):
+                    decoy_submit = True
+        out["read_real"] += real
+        out["read_decoy"] += decoy
+        out["submitted_decoy_value"] += decoy_submit
+    return out
+
+
 def winning_action_sequences(episodes: list[dict]) -> list[list[tuple]]:
     """For each episode with ``won`` true, the ordered list of its turns' action_keys. Reveals
     whether wins come from a varied strategy space or one narrow exploit (spec §3.4)."""
