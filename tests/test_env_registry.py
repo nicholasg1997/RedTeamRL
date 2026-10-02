@@ -43,7 +43,7 @@ def test_assert_training_split_passes_training_only_and_returns_tasks():
 
 def test_every_environment_declares_a_split():
     # the forcing function: a new environment cannot be added without choosing a side
-    assert len(ALL_ENVIRONMENTS) == 6
+    assert len(ALL_ENVIRONMENTS) == 9
     for env in ALL_ENVIRONMENTS:
         assert env.split in ("train", "held_out"), env.id
 
