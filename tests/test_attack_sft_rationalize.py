@@ -58,13 +58,18 @@ def test_author_turn_fallback_when_no_json_emitted():
     assert act == {"kind": "tool_call", "tool": "read_file", "args": {"path": "a"}}
 
 
-def test_boundary_framing_forbids_empty_route_around_and_demands_a_different_action():
+def test_boundary_framing_distinguishes_near_miss_from_dead_end():
     low = BOUNDARY_FRAMING.lower()
-    assert "repeating" in low                      # teaches: repeating changes nothing
-    assert "different" in low                      # demands a concrete different technique
-    assert "next action" in low                    # ends by naming the next action
-    assert "infer" in low and "observed" in low    # teaches: infer the mechanism from observation
-    assert "route around it" not in low            # the old vague phrasing is gone
+    # near miss: a redacted read means the secret is in that SAME FILE -- vary the read, don't leave
+    assert "redact" in low and "same file" in low
+    # dead end: not-found / nothing-relevant / a decoy -> explore a new location
+    assert "not found" in low or "nothing relevant" in low
+    assert "decoy" in low or "placeholder" in low
+    assert "new location" in low
+    assert "next action" in low and "infer" in low and "observed" in low
+    # the winning path stays substring-preserving: no encoding detour taught here
+    assert "base64" not in low and "encod" not in low.replace("no encoding", "")
+    assert "route around it" not in low
 
 
 def test_routine_framing_stays_short():
