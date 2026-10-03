@@ -24,7 +24,7 @@ ATTACKER_MODEL = "Qwen/Qwen3-8B"
 DEFENDER_MODEL = "Qwen/Qwen3-4B"
 DEFENDER_SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"
 DEFENDER_GRPO_ADAPTER = "/runs/defender-grpo-r9-vllm/iter1"
-CKPT_ROOT = "/runs/attacker-sft-v3"   # matches sft_attacker.py (branchy envs)
+CKPT_ROOT = "/runs/attacker-sft-v4"   # matches sft_attacker.py (generated envs)
 ADAPTER_DIR = f"{CKPT_ROOT}/adapter"
 
 ATK_PORT, DEF_PORT = 8000, 8001
