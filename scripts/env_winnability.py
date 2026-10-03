@@ -27,7 +27,7 @@ MAX_TURNS = 12
 TRANSCRIPT_CONTEXT_CHARS = 40_000
 REDACTION_ENFORCEMENT = "unshielded"
 TEMP = 0.7
-N_ROLLOUTS = 24                    # per attack task; one attack task per branchy env
+N_ROLLOUTS = 10                    # per attack task; x N_GEN_ENVS=12 -> 120 eps (read the AGGREGATE, per-env n is small)
 WORKERS = 16
 EVAL_SEED = 1234
 CANARY_SEED, CANARY_REVISION = 0, 101
