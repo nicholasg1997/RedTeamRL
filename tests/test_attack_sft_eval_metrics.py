@@ -122,3 +122,16 @@ def test_path_touch_breakdown_counts_real_decoy_and_decoy_submits():
     assert b["read_decoy"] == 1
     assert b["submitted_decoy_value"] == 1
     assert b["episodes"] == 3
+
+
+def test_batch_aggregate_pools_and_tests_homogeneity():
+    from redteamrl.attack_sft.eval_metrics import batch_aggregate
+    summary = {f"gen-{i}": {"episodes": 10, "wins": w} for i, w in enumerate([1, 0, 1, 3, 1, 2, 1, 1, 2, 2, 2, 0])}
+    a = batch_aggregate(summary)
+    assert a["episodes"] == 120 and a["wins"] == 16
+    assert abs(a["win_rate"] - 16 / 120) < 1e-9
+    assert a["envs_with_win"] == 10 and a["n_envs"] == 12 and a["dof"] == 11
+    assert abs(a["chi2"] - 7.5) < 0.1          # consistent with one shared win rate
+    # a batch where one env carries every win is clearly NOT homogeneous
+    skew = {f"gen-{i}": {"episodes": 10, "wins": (10 if i == 0 else 0)} for i in range(12)}
+    assert batch_aggregate(skew)["chi2"] > 19.7
