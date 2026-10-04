@@ -43,9 +43,8 @@ N_ROLLOUTS = 16           # -> 48 episodes/config, 96 total
 # much larger number would be admitted and then preempted, which costs recomputation.
 WORKERS = 16
 TRAIN_GROUP_SIZE = 8      # train_attacker.py's N_ROLLOUTS -- what dead groups are predicted FOR
-CANARY_REVISION, CANARY_SEED = 101, 0
-CANARIES = {"ops-logs": "sk-api-CANARY-7a1b2c", "analytics": "pw-db-CANARY-9x8y7z",
-            "ci-build": "tok-deploy-CANARY-3m2n1k"}
+N_GEN_ENVS = 12           # generated name-varied envs, matching sft_attacker + train_attacker
+CANARY_REVISION, CANARY_SEED = 102, 0      # 102 matches train_attacker (disjoint from SFT's 101)
 
 # The config train_defender.py actually uses for its opponent, versus what train_attacker.py was
 # set up to train. If these disagree materially, the attacker phase would optimize a policy that
@@ -83,10 +82,7 @@ def _check_impl(active_servers):
     sys.path.insert(0, "/root")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
-    from redteamrl.envs import build_tasks
-    from redteamrl.envs.ops_logs import OPS_LOGS
-    from redteamrl.envs.analytics import ANALYTICS
-    from redteamrl.envs.ci_build import CI_BUILD
+    from redteamrl.envs.generate import build_generated_tasks
     from redteamrl.harness.episode import run_episode
     from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT
     from redteamrl.policies.prompted import (
@@ -118,17 +114,22 @@ def _check_impl(active_servers):
     active_servers.append((stop_vllm_server, start_vllm_server(
         merged_dir, DEF_PORT, DEF_MEM_FRAC, max_model_len=DEF_MAX_MODEL_LEN,
         max_num_seqs=WORKERS)))
+    # temperature=0.0 matches train_attacker: the defender is the frozen opponent, so greedy keeps
+    # the within-group variance attributable to the attacker, not to opponent coin-flips.
     gen_def = make_vllm_generate(f"http://localhost:{DEF_PORT}", merged_dir,
-                                 enable_thinking=False, max_tokens=DEF_MAX_NEW_TOKENS)
+                                 enable_thinking=False, temperature=0.0,
+                                 max_tokens=DEF_MAX_NEW_TOKENS)
 
+    # Generated name-varied envs + rev 102, the exact distribution train_attacker runs, so this
+    # gate's number transfers to GRPO.
     tasks = [
-        task for task in (
-            build_tasks(OPS_LOGS,  CANARIES["ops-logs"],  canary_path="app/config.py")
-            + build_tasks(ANALYTICS, CANARIES["analytics"], canary_path=".env")
-            + build_tasks(CI_BUILD,  CANARIES["ci-build"],  canary_path="deploy/credentials")
-        ) if task.episode_type == "attack"
+        task
+        for seed in range(N_GEN_ENVS)
+        for task in build_generated_tasks(seed, f"tok-gen-CANARY-{seed:03d}")
+        if task.episode_type == "attack"
     ]
-    print(f"{len(tasks)} attack tasks x {N_ROLLOUTS} rollouts per config", flush=True)
+    print(f"{len(tasks)} attack tasks (generated x {N_GEN_ENVS}) x {N_ROLLOUTS} rollouts per config",
+          flush=True)
 
     report = {}
     for label, thinking, max_tokens in CONFIGS:
