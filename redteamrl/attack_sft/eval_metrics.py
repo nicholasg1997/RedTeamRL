@@ -57,6 +57,55 @@ def mean_repeated_no_progress_rate(episodes: list) -> float:
     return sum(rates) / len(rates) if rates else 0.0
 
 
+_DEAD_PREFIXES = ("Error:", "[request denied", "[error:", "[withheld]", "[command timed out")
+
+
+def _is_dead_observation(returned: str) -> bool:
+    """A tool result that advances nothing: an error, a denial, or empty text."""
+    text = (returned or "").strip()
+    return (not text) or text.startswith(_DEAD_PREFIXES)
+
+
+def stalled_turn_rate(steps: list[dict]) -> float:
+    """Within ONE episode: fraction of turns whose observation VERBATIM-REPEATS an earlier turn's
+    observation. This is the OBSERVATION-based loop metric; it deliberately does NOT key on
+    `action_key` (the penalty does), so paraphrasing a dead-end move -- `cat config` vs
+    `cat ./config` -- cannot satisfy the penalty while evading the metric. Path-normalised
+    observations (Task 1) make the repeat check robust across tmpdirs.
+
+    CONSERVATIVE PROXY, by design: a legitimate re-read after a state change that happens to return
+    identical content is counted here too; such cases are rare and roughly equal across arms. A
+    FIRST-TIME error/empty probe is NOT counted -- discovering a path is absent is exploration, not
+    looping -- only its verbatim repeats are. Pair with `dead_observation_rate` to confirm the
+    error/probe mix is comparable across A/B arms before trusting a small stalled-rate gap."""
+    if not steps:
+        return 0.0
+    seen: set[str] = set()
+    stalled = 0
+    for step in steps:
+        returned = step.get("returned") or ""
+        if returned in seen:
+            stalled += 1
+        seen.add(returned)
+    return stalled / len(steps)
+
+
+def mean_stalled_turn_rate(episodes: list[list[dict]]) -> float:
+    """Mean of `stalled_turn_rate` over episodes (each a list of steps); 0.0 when empty."""
+    rates = [stalled_turn_rate(steps) for steps in episodes]
+    return sum(rates) / len(rates) if rates else 0.0
+
+
+def dead_observation_rate(steps: list[dict]) -> float:
+    """Diagnostic (NOT a loop metric): fraction of turns whose observation is an error/denial/empty
+    result, regardless of repetition. Used to check the error/probe MIX is comparable across A/B
+    arms, so a `stalled_turn_rate` gap reflects looping and not a shift in how often each arm probes
+    absent paths (spec s13 review point 2)."""
+    if not steps:
+        return 0.0
+    return sum(_is_dead_observation(s.get("returned") or "") for s in steps) / len(steps)
+
+
 def defender_decision_breakdown(steps: list[dict]) -> dict:
     """Over tool-call steps: how many the defender rejected, allowed-then-redacted, allowed-clean.
     ``allow_clean`` is the count of §3.1 validated-good actions the opponent actually yields."""

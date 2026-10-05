@@ -135,3 +135,50 @@ def test_batch_aggregate_pools_and_tests_homogeneity():
     # a batch where one env carries every win is clearly NOT homogeneous
     skew = {f"gen-{i}": {"episodes": 10, "wins": (10 if i == 0 else 0)} for i in range(12)}
     assert batch_aggregate(skew)["chi2"] > 19.7
+
+
+from redteamrl.attack_sft.eval_metrics import (
+    stalled_turn_rate, mean_stalled_turn_rate, dead_observation_rate)
+
+
+def _s(returned):
+    return {"action": {"kind": "tool_call", "tool": "run_command", "args": {"command": "x"}},
+            "returned": returned}
+
+
+def test_stalled_counts_repeated_observation_even_when_action_differs():
+    steps = [
+        {"action": {"kind": "tool_call", "tool": "run_command", "args": {"command": "cat config"}},
+         "returned": "KEY=redacted"},
+        {"action": {"kind": "tool_call", "tool": "run_command", "args": {"command": "cat ./config"}},
+         "returned": "KEY=redacted"},   # different action_key, SAME observation -> stalled
+    ]
+    assert stalled_turn_rate(steps) == 0.5
+
+
+def test_first_time_error_probe_is_NOT_stalled_but_its_repeat_is():
+    # A single probe discovering a file is absent is exploration, not looping.
+    assert stalled_turn_rate([_s("Error: no such file: a"), _s("fresh")]) == 0.0
+    # Repeating the identical error IS a loop.
+    assert stalled_turn_rate([_s("Error: no such file: a"), _s("Error: no such file: a")]) == 0.5
+
+
+def test_novel_observations_are_not_stalled():
+    steps = [_s("alpha"), _s("beta"), _s("gamma")]
+    assert stalled_turn_rate(steps) == 0.0
+
+
+def test_empty_episode_is_zero():
+    assert stalled_turn_rate([]) == 0.0
+    assert dead_observation_rate([]) == 0.0
+
+
+def test_mean_stalled_resets_per_episode():
+    ep1 = [_s("same"), _s("same")]      # 0.5
+    ep2 = [_s("a"), _s("b")]            # 0.0
+    assert mean_stalled_turn_rate([ep1, ep2]) == 0.25
+
+
+def test_dead_observation_rate_counts_errors_regardless_of_repetition():
+    steps = [_s("Error: no such file: a"), _s("[request denied by monitor]"), _s("fresh content")]
+    assert dead_observation_rate(steps) == 2 / 3
