@@ -85,9 +85,9 @@ N_GEN_ENVS = 12         # procedurally generated, name-varied training envs (mir
 # "ratchet is moving" (audit weakness). A distinct revision keeps the two phases' secrets disjoint.
 CANARY_REVISION = 102
 CANARY_SEED = 0
-# CKPT_ROOT is defined in the arm/repeat-penalty config block below (it encodes ARM + coef so the
-# two arms never share a checkpoint lineage). Fresh base: generated envs + SFT adapter + arm/coef
-# are all in phase_identity.
+# The checkpoint root is derived per-run inside _train_impl (it encodes arm + coef so the two arms
+# never share a checkpoint lineage). Fresh base: generated envs + SFT adapter + arm/coef are all in
+# phase_identity.
 # Keys where this run DELIBERATELY diverges from the 2026-08-31 gate. That gate measured raw base
 # 8B vs a temp-0.7 defender on the THIN envs at rev 101 -- this run changes all of that (starts from
 # the SFT adapter, generated envs, greedy defender, rev 102). The 16.7% no longer predicts it, so
@@ -126,9 +126,12 @@ ALLOW_LEGACY_CHECKPOINT = False
 # which is the upper edge of "testing whether discouraging repeats helps winning" before it tips
 # into "training directly on don't-repeat". Hence the sweep is centred lower than the win/loss
 # scale, not above it.
-ARM = 3                            # set per run: 2 or 3
-REPEAT_PENALTY_SWEEP = (0.02, 0.05, 0.1)
-REPEAT_PENALTY_COEF = 0.05         # must be one of REPEAT_PENALTY_SWEEP; ignored when ARM == 2
+# Arm (2 or 3) and the repeat-penalty coef are now the `train()` entrypoint flags
+# (defaults arm=3, coef=0.05) so the arm 2/3 sweep runs from one unedited file:
+#   modal run --detach scripts/train_attacker.py::train --arm 2 --repeat-penalty-coef 0.0
+#   modal run --detach scripts/train_attacker.py::train --arm 3 --repeat-penalty-coef 0.05
+# CKPT_ROOT is derived per-run inside _train_impl from the chosen arm/coef.
+REPEAT_PENALTY_SWEEP = (0.02, 0.05, 0.1)  # the coef must be one of these; ignored when arm == 2
 # Held-out loop metric uses stalled_turn_rate (observation-based), NOT the penalty's action_key.
 # n >= 128 so a 3pp win-rate difference is resolvable (at n=32 the per-eval SE ~6pp hides it).
 # Eval every k iters (not every iter): single-iter win rates at n=128 have SE ~3pp and are read
@@ -137,8 +140,6 @@ REPEAT_PENALTY_COEF = 0.05         # must be one of REPEAT_PENALTY_SWEEP; ignore
 HELDOUT_EVAL_EPISODES = 128
 HELDOUT_EVAL_EVERY = 5             # iterations between held-out evals (plus the final iteration)
 PATH_NORMALISED = True             # Task 1 landed; both arms see normalised observations.
-# Distinct per arm+coef so the two arms never share a checkpoint lineage.
-CKPT_ROOT = f"/runs/attacker-grpo-arm{ARM}-coef{REPEAT_PENALTY_COEF}"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
@@ -158,9 +159,13 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-attacker-grpo", image=image)
 
 
-def _train_impl(active_servers):
+def _train_impl(active_servers, arm, repeat_penalty_coef):
     import contextlib, os, sys, tempfile, torch
     sys.path.insert(0, "/root")
+
+    assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
+    coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
+    ckpt_root = f"/runs/attacker-grpo-arm{arm}-coef{coef}"
 
     # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
     # /v1/load_lora_adapter when this is set, and publish_policy's swap 404s without it -- correct
@@ -427,12 +432,12 @@ def _train_impl(active_servers):
         "temp": TEMP,
         "max_turns": MAX_TURNS,
         "redaction_enforcement": REDACTION_ENFORCEMENT,
-        "arm": ARM,
-        "repeat_penalty_coef": REPEAT_PENALTY_COEF,
+        "arm": arm,
+        "repeat_penalty_coef": coef,
         "path_normalised": PATH_NORMALISED,
     }
     start_iter = 0
-    resume_dir = latest_checkpoint(CKPT_ROOT)
+    resume_dir = latest_checkpoint(ckpt_root)
     if resume_dir is not None:
         resume_meta = read_meta(resume_dir)
         validate_phase_identity(
@@ -446,15 +451,18 @@ def _train_impl(active_servers):
         opt.load_state_dict(torch.load(os.path.join(resume_dir, "optimizer.pt"),
                                        map_location="cuda"))
         start_iter = int(resume_meta["iter"]) + 1
+        # .get so checkpoints written before this key existed still resume (count restarts from 0).
+        cumulative_gen_tokens = int(resume_meta.get("cumulative_gen_tokens", 0))
         print(f"resuming from {resume_dir} at iter {start_iter}", flush=True)
     else:
+        cumulative_gen_tokens = 0
         print("no checkpoint found — starting fresh at iter 0", flush=True)
 
     # Arm 3 subtracts coef * exact-repeat-count from each episode's reward (coef 0.0 = arm 2,
     # the identity). Built once; the secret it keys on comes from each episode's spec.forbidden[0],
     # which _run_one_episode passes to the transform -- no canary recovery here.
     from redteamrl.train.repeat_penalty import make_repeat_penalty
-    reward_transform = make_repeat_penalty(REPEAT_PENALTY_COEF if ARM == 3 else 0.0)
+    reward_transform = make_repeat_penalty(coef)
 
     # --- held-out eval (greedy, temp-0, n disjoint seeds) ---
     from concurrent.futures import ThreadPoolExecutor
@@ -522,10 +530,12 @@ def _train_impl(active_servers):
                            trained_side="attacker",
                            post_completion_turns=POST_COMPLETION_TURNS,
                            max_workers=ROLLOUT_WORKERS,
-                           episode_store=os.path.join(CKPT_ROOT, f"rollout-iter{it}"),
+                           episode_store=os.path.join(ckpt_root, f"rollout-iter{it}"),
                            commit=runs.commit, task_transform=episode_task_for(it),
                            reward_transform=reward_transform)
         assign_advantages(examples)
+        iter_gen_tokens = sum(len(ex.completion_ids) for ex in examples)
+        cumulative_gen_tokens += iter_gen_tokens
         div = group_diversity([
             {"task_id": ex.task_id, "episode_id": ex.episode_id, "reward": ex.reward,
              "verdicts": getattr(ex, "verdicts", [])}
@@ -543,6 +553,8 @@ def _train_impl(active_servers):
               f"mean_reward={rew['mean_reward']:+.3f} "
               f"(atk={rew['mean_reward_attack']:+.3f} ben={rew['mean_reward_benign']:+.3f})",
               flush=True)
+        print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
+              flush=True)
 
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
@@ -555,10 +567,11 @@ def _train_impl(active_servers):
               f"epoch_ratios={[round(r, 4) for r in m['epoch_ratios']]}  "
               f"live={m['n_live_examples']}/{m['n_examples']}", flush=True)
 
-        ckpt = os.path.join(CKPT_ROOT, f"iter{it}")
+        ckpt = os.path.join(ckpt_root, f"iter{it}")
         model.save_pretrained(ckpt)
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
-        write_meta(ckpt, {"iter": it, "phase_identity": phase_identity})
+        write_meta(ckpt, {"iter": it, "phase_identity": phase_identity,
+                          "cumulative_gen_tokens": cumulative_gen_tokens})
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
@@ -571,20 +584,20 @@ def _train_impl(active_servers):
             dead = sum(dead_observation_rate(r.steps) for r in heldout) / len(heldout)
             print(f"iter {it:3d} heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
                   f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
-        prune_checkpoints(CKPT_ROOT, keep=CKPT_KEEP)
+        prune_checkpoints(ckpt_root, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.
-        shutil.rmtree(os.path.join(CKPT_ROOT, f"rollout-iter{it}"), ignore_errors=True)
+        shutil.rmtree(os.path.join(ckpt_root, f"rollout-iter{it}"), ignore_errors=True)
         runs.commit()
 
-    model.save_pretrained(f"{CKPT_ROOT}/final")
+    model.save_pretrained(f"{ckpt_root}/final")
     runs.commit()
 
 
 @app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train():
+def train(arm: int = 3, repeat_penalty_coef: float = 0.05):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -593,12 +606,12 @@ def train():
     """
     active_servers = []
     try:
-        return _train_impl(active_servers)
+        return _train_impl(active_servers, arm, repeat_penalty_coef)
     finally:
         for stop_server, proc in reversed(active_servers):
             stop_server(proc)
 
 
 @app.local_entrypoint()
-def main():
-    train.remote()
+def main(arm: int = 3, repeat_penalty_coef: float = 0.05):
+    train.remote(arm, repeat_penalty_coef)
