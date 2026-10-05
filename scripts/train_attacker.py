@@ -464,6 +464,13 @@ def _train_impl(active_servers):
     # and defined above.
     HELDOUT_SEED_START = 1000
 
+    # The held-out defender below is FIXED (system_template=None). That is only faithful to the
+    # training defender while the prompt pool is off; if the pool were enabled, training would
+    # rotate the defender prompt while this eval stayed fixed -- a silent A/B bias. Fail loudly.
+    assert not USE_PROMPT_POOL, (
+        "held-out eval uses a FIXED defender prompt; if USE_PROMPT_POOL is enabled, mirror "
+        "defender_factory_for here or the arm 2/3 comparison is biased")
+
     # Mirrors `cap` exactly (same base_url/model/tokenizer/max_new_tokens) but greedy, so the
     # held-out proportion is a clean function of the policy, not a sample of a temperature.
     eval_gen = VLLMCapturingGenerate(
