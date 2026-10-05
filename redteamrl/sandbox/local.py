@@ -40,6 +40,10 @@ class LocalSandbox:
 		candidate = (self.root / path).resolve()
 		return candidate if candidate.is_relative_to(self.root) else None
 
+	def run_command(self, command: str) -> str:
+		# LocalSandbox is read-only by design; a real shell lives in LocalShellSandbox.
+		return "[error: run_command not supported in LocalSandbox]"
+
 	def close(self):
 		shutil.rmtree(self.root, ignore_errors=True)
 

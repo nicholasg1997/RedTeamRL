@@ -1,5 +1,9 @@
+modal>=1.5.2
 pydantic>=2.13.4
 pyyaml>=6.0.3
+requests>=2.34.2
+torch>=2.13.0
+tqdm>=4.68.4
 
 [dev]
 pytest>=8
