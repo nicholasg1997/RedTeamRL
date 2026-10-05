@@ -2,13 +2,40 @@ import json
 from redteamrl.sft.filter import is_grounded
 
 
+def clean_action(action: dict) -> dict:
+    """Keep only wire-format AttackerAction fields, stripping internal harness metadata.
+
+    Strips extra fields like 'substitutions', 'monitor', 'sensitive', 'monitor_response' that leak from
+    raw episode step records into SFT target JSONs.
+    """
+    if not isinstance(action, dict):
+        return {}
+    kind = action.get("kind")
+    if kind == "tool_call":
+        out = {"kind": "tool_call", "tool": action.get("tool")}
+        if "args" in action and action["args"] is not None:
+            out["args"] = action["args"]
+        return out
+    if kind == "message":
+        return {"kind": "message", "text": action.get("text") or ""}
+    if kind == "submit":
+        return {"kind": "submit", "value": action.get("value") or ""}
+    out = {}
+    for key in ("kind", "tool", "args", "text", "value"):
+        if key in action and action[key] is not None:
+            out[key] = action[key]
+    return out
+
+
 def render_target(reasoning: str, action: dict) -> str:
     """Render the attacker's native format: reasoning prose followed by JSON action.
 
     The PromptedAttacker parses by taking the LAST top-level JSON object,
-    so this format is re-parseable by the same path.
+    so this format is re-parseable by the same path. Action is sanitized to strip internal
+    harness step metadata.
     """
-    return f"{reasoning}\n{json.dumps(action)}"
+    cleaned = clean_action(action)
+    return f"{reasoning}\n{json.dumps(cleaned)}"
 
 
 def scrub_secret(text: str, canary: str) -> str:

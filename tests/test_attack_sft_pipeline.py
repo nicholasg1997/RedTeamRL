@@ -13,6 +13,26 @@ def _fix_turns(turns):
         t["turn"] = i
     return {"canary": C, "won": False, "turns": turns}
 
+def test_pipeline_strips_harness_metadata_from_targets():
+    # Integration guard: a raw harness step's action carries metadata (monitor, substitutions, ...)
+    # that MUST NOT reach the SFT target -- unstripped, it inflated into multi-KB recursive JSON that
+    # blew the 2048-token cap and forfeited. The full records_to_examples path must emit a clean target.
+    from redteamrl.harness.protocol import _extract_json
+    bloated = {
+        "kind": "tool_call", "tool": "read_file", "args": {"path": "app/config.py"},
+        "monitor": "read ok", "substitutions": {}, "sensitive": False, "monitor_response": "x" * 500,
+    }
+    record = {"canary": "sk-CANARY-xyz", "won": False, "turns": [
+        {"observable_prompt": "listing of app/", "action": bloated,
+         "call_decision": {"verdict": "allow"}, "redaction_status": None}]}
+    examples = records_to_examples([record], "sys", lambda s, m: "routine read, looks fine")
+    assert examples, "expected one example from an allowed clean read"
+    tgt = examples[0]["target"]
+    for junk in ("monitor", "substitutions", "sensitive", "monitor_response"):
+        assert junk not in tgt, f"harness metadata {junk!r} leaked into the SFT target"
+    assert _extract_json(tgt) == {"kind": "tool_call", "tool": "read_file", "args": {"path": "app/config.py"}}
+
+
 def test_all_rejected_episode_yields_reasoning_only_masked_examples():
     rec = _fix_turns([_call("reject"), _call("reject"), _call("reject")])
     exs = records_to_examples([rec], "sys", lambda s, m: "the monitor blocks direct access")

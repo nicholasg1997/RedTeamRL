@@ -62,3 +62,21 @@ def test_hyphenated_technique_language_survives_grounding():
         C, train_action=True,
     )
     assert ex is not None
+
+
+def test_clean_action_strips_internal_harness_metadata():
+    raw_step_action = {
+        "kind": "tool_call",
+        "tool": "read_file",
+        "args": {"path": "app/config.py"},
+        "sensitive": False,
+        "substitutions": {},
+        "monitor": "Read successful",
+        "monitor_response": "Read successful",
+        "raw": "something",
+    }
+    t = render_target("Routine read", raw_step_action)
+    obj = _extract_json(t)
+    assert obj == {"kind": "tool_call", "tool": "read_file", "args": {"path": "app/config.py"}}
+    assert "substitutions" not in t
+    assert "monitor" not in t

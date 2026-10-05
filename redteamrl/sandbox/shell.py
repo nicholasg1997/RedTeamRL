@@ -17,6 +17,14 @@ from redteamrl.types import TaskSpec
 
 _TIMEOUT_S = 10
 _OUTPUT_CAP = 4096
+_PATH_ECHO_CAP = 120
+
+
+def _short(path: str) -> str:
+    """Bound a path echoed into an error message. A degenerate attacker can emit a multi-KB string
+    as its `path`; echoing it verbatim into every error result would bloat the transcript and the
+    next prompt."""
+    return path if len(path) <= _PATH_ECHO_CAP else path[:_PATH_ECHO_CAP] + "…[truncated]"
 
 
 class LocalShellSandbox:
@@ -38,21 +46,30 @@ class LocalShellSandbox:
     def read_file(self, path: str) -> str:
         target = self._safe_path(path)
         if target is None:
-            return f"Error: access denied: {path}"
-        if not target.is_file():
-            return f"Error: no such file: {path}"
-        # errors="replace": a planted secret can sit in an otherwise-binary file, and strict
-        # decoding would crash the read instead of returning it. The canary is ASCII, so it
-        # survives; only genuine non-UTF-8 bytes become the replacement char.
-        return target.read_text(encoding="utf-8", errors="replace")
+            return f"Error: access denied: {_short(path)}"
+        try:
+            if not target.is_file():
+                return f"Error: no such file: {_short(path)}"
+            # errors="replace": a planted secret can sit in an otherwise-binary file, and strict
+            # decoding would crash the read instead of returning it. The canary is ASCII, so it
+            # survives; only genuine non-UTF-8 bytes become the replacement char.
+            return target.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError) as exc:
+            # The attacker emits ARBITRARY paths (a component name too long, an embedded NUL, ...),
+            # so the stat/read syscall itself can raise. This is an untrusted-input boundary: it
+            # must degrade to an error result the attacker sees, never crash the episode/run.
+            return f"Error: cannot read {_short(path)}: {getattr(exc, 'strerror', None) or exc}"
 
     def list_dir(self, path: str) -> str:
         target = self._safe_path(path)
         if target is None:
-            return f"Error: access denied: {path}"
-        if not target.is_dir():
-            return f"Error: no such directory: {path}"
-        entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+            return f"Error: access denied: {_short(path)}"
+        try:
+            if not target.is_dir():
+                return f"Error: no such directory: {_short(path)}"
+            entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+        except (OSError, ValueError) as exc:
+            return f"Error: cannot list {_short(path)}: {getattr(exc, 'strerror', None) or exc}"
         return f"{path}:\n" + ("\n".join(entries) if entries else "(empty)")
 
     def run_command(self, command: str) -> str:
@@ -79,7 +96,12 @@ class LocalShellSandbox:
         return out
 
     def _safe_path(self, path: str) -> Path | None:
-        candidate = (self.root / path).resolve()
+        try:
+            candidate = (self.root / path).resolve()
+        except (OSError, ValueError):
+            # A pathological path can make resolve() itself raise (name too long, embedded NUL).
+            # Treat it as inaccessible rather than letting it crash the caller.
+            return None
         return candidate if candidate.is_relative_to(self.root) else None
 
     def close(self) -> None:

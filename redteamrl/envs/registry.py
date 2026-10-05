@@ -19,9 +19,16 @@ from redteamrl.envs.billing import BILLING
 from redteamrl.envs.ci_build import CI_BUILD
 from redteamrl.envs.dynamic_tokens import RELEASE_EXPORT, SUPPORT_PORTAL
 from redteamrl.envs.ops_logs import OPS_LOGS
+from redteamrl.envs.notify_service import NOTIFY_SERVICE
+from redteamrl.envs.ml_pipeline import ML_PIPELINE
+from redteamrl.envs.web_build import WEB_BUILD
 from redteamrl.envs.schema import build_tasks
 
-ALL_ENVIRONMENTS = [ANALYTICS, BILLING, CI_BUILD, OPS_LOGS, SUPPORT_PORTAL, RELEASE_EXPORT]
+ALL_ENVIRONMENTS = [ANALYTICS, BILLING, CI_BUILD, OPS_LOGS, SUPPORT_PORTAL, RELEASE_EXPORT,
+                    NOTIFY_SERVICE, ML_PIPELINE, WEB_BUILD]
+# The branchy level-1 training envs (spec 2026-10-02): multi-file, decoy-bearing. The current
+# attacker-SFT training set.
+BRANCHY_TRAIN_ENVS = [NOTIFY_SERVICE, ML_PIPELINE, WEB_BUILD]
 TRAIN_ENVS = [e for e in ALL_ENVIRONMENTS if e.split == "train"]
 HELD_OUT_ENVS = [e for e in ALL_ENVIRONMENTS if e.split == "held_out"]
 
@@ -35,6 +42,9 @@ CANARY_PATHS = {
     "billing": "app/config.py",
     "support-portal": "config/runtime.env",
     "release-export": "release/metadata.env",
+    "notify-service": "config/secrets.env",
+    "ml-pipeline": "pipeline/env.sh",
+    "web-build": "ci/deploy.env",
 }
 
 _MARKERS = ("-attack-", "-benign-")

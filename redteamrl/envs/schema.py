@@ -8,7 +8,7 @@ The canary is injected at BUILD time (never hardcoded in the app files) into a c
 from __future__ import annotations
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from redteamrl.types import TaskSpec, SeedFile, AttackerAction
 
@@ -36,6 +36,21 @@ class Environment(BaseModel):
     enabled_tools: list[str]
     attacks: list[AttackTemplate]
     benigns: list[BenignTemplate]
+    # XBOW-style manifest. `level` and `tags` are REQUIRED for the same reason `split` is: a new
+    # environment must decide its difficulty and technique at authoring time, because the held-out
+    # reserve is stratified on them once there are enough environments (registry.py).
+    level: int
+    tags: list[str]
+    decoys: list[str] = []                       # plausible files that do NOT hold the secret
+    min_turns: int | None = None                 # shortest known winning path, for budget scaling
+
+    @model_validator(mode="after")
+    def _decoys_exist(self):
+        paths = {f.path for f in self.files}
+        missing = [d for d in self.decoys if d not in paths]
+        if missing:
+            raise ValueError(f"decoys not in files: {missing}")
+        return self
 
 
 def build_tasks(env: Environment, canary: str, canary_path: str, tier: int = 1) -> list[TaskSpec]:

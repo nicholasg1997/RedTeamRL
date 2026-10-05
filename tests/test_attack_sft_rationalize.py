@@ -19,9 +19,13 @@ def test_near_miss_framing_is_retired():
     assert not hasattr(R, "NEARMISS_FRAMING")
 
 
-def test_author_turn_returns_reasoning_text():
-    out = author_turn("obs", {"kind": "message", "text": "x"}, WIN_FRAMING, lambda s, m: "because it fits the cover")
-    assert out == "because it fits the cover"
+def test_author_turn_keeps_the_real_action_and_strips_stray_json_from_reasoning():
+    # The teacher authors REASONING; the turn's REAL action is kept (no synthesized replacement).
+    # If the model emits a trailing JSON out of habit, it is stripped from the reasoning prose.
+    res, act = author_turn("obs", {"kind": "message", "text": "x"}, WIN_FRAMING,
+                           lambda s, m: 'because it fits\n{"kind": "message", "text": "y"}')
+    assert res == "because it fits"
+    assert act == {"kind": "message", "text": "x"}     # ORIGINAL action, not the teacher's JSON
 
 
 def test_three_framings_exist():
@@ -47,19 +51,25 @@ def test_teacher_is_injected_into_the_prompt_but_flagged_not_to_quote():
     assert "do not quote" in p.lower() or "don't quote" in p.lower() or "your own words" in p.lower()
 
 
-def test_author_turn_returns_generate_output():
-    out = author_turn("obs", {"kind": "message", "text": "x"}, ROUTINE_FRAMING,
-                      lambda s, m: "routine read, looks fine")
-    assert out == "routine read, looks fine"
+def test_author_turn_fallback_when_no_json_emitted():
+    res, act = author_turn("obs", {"kind": "tool_call", "tool": "read_file", "args": {"path": "a"}}, ROUTINE_FRAMING,
+                           lambda s, m: "routine read, looks fine")
+    assert res == "routine read, looks fine"
+    assert act == {"kind": "tool_call", "tool": "read_file", "args": {"path": "a"}}
 
 
-def test_boundary_framing_forbids_empty_route_around_and_demands_a_different_action():
+def test_boundary_framing_distinguishes_near_miss_from_dead_end():
     low = BOUNDARY_FRAMING.lower()
-    assert "repeating" in low                      # teaches: repeating changes nothing
-    assert "different" in low                      # demands a concrete different technique
-    assert "next action" in low                    # ends by naming the next action
-    assert "infer" in low and "observed" in low    # teaches: infer the mechanism from observation
-    assert "route around it" not in low            # the old vague phrasing is gone
+    # near miss: a redacted read means the secret is in that SAME FILE -- vary the read, don't leave
+    assert "redact" in low and "same file" in low
+    # dead end: not-found / nothing-relevant / a decoy -> explore a new location
+    assert "not found" in low or "nothing relevant" in low
+    assert "decoy" in low or "placeholder" in low
+    assert "new location" in low
+    assert "next action" in low and "infer" in low and "observed" in low
+    # the winning path stays substring-preserving: no encoding detour taught here
+    assert "base64" not in low and "encod" not in low.replace("no encoding", "")
+    assert "route around it" not in low
 
 
 def test_routine_framing_stays_short():

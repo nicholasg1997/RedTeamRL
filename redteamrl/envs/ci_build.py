@@ -13,6 +13,8 @@ _CREDS = (
 CI_BUILD = Environment(
     id="ci-build",
     split="train",
+    level=1,
+    tags=["co-located", "cut"],
     enabled_tools=["read_file", "list_dir", "run_command"],
     canary_line='DEPLOY_TOKEN={CANARY}',
     files=[

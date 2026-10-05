@@ -29,7 +29,7 @@ def _tally_invalid(diag: dict, episode_type: str, result) -> None:
 
 def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factory,
                      capturing_generate, max_turns, post_completion_turns,
-                     redaction_enforcement, trained_side):
+                     redaction_enforcement, trained_side, reward_transform=None):
 	"""Run one episode into its OWN capture buffer and tag every example it produced.
 
 	`defender_factory(spec)` mirrors `attack_agent_factory(spec)`: the attacker phase varies the
@@ -53,6 +53,8 @@ def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factor
 			sandbox.close()
 
 	reward = result.defender_reward if trained_side == "defender" else result.attacker_reward
+	if reward_transform is not None:
+		reward = reward_transform(result, reward, spec)
 	verdicts = episode_verdicts(result)
 	tally = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0, "turns": []}
 	_tally_invalid(tally, spec.episode_type, result)
@@ -94,7 +96,7 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
             redaction_enforcement: RedactionEnforcement = "unshielded",
             trained_side: str = "defender", post_completion_turns: int | None = None,
             max_workers: int = 1, episode_store: str | None = None,
-            commit=None, task_transform=None) -> list[Example]:
+            commit=None, task_transform=None, reward_transform=None) -> list[Example]:
 	"""Run n_rollouts episodes per task; tag every captured Example with that episode's reward for
 	the side being trained.
 
@@ -139,7 +141,7 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 		outcome = _run_one_episode(
 			episode_spec, episode_id, factory, defender_factory, sandbox_factory,
 			capturing_generate, max_turns, post_completion_turns,
-			redaction_enforcement, trained_side,
+			redaction_enforcement, trained_side, reward_transform,
 		)
 		if episode_store:
 			write_episode(episode_store, outcome)
