@@ -182,3 +182,38 @@ def test_mean_stalled_resets_per_episode():
 def test_dead_observation_rate_counts_errors_regardless_of_repetition():
     steps = [_s("Error: no such file: a"), _s("[request denied by monitor]"), _s("fresh content")]
     assert dead_observation_rate(steps) == 2 / 3
+
+
+from redteamrl.attack_sft.eval_metrics import exact_repeat_count
+
+
+def _tool(cmd):
+    return {"action": {"kind": "tool_call", "tool": "run_command", "args": {"command": cmd}},
+            "returned": "KEY=redacted", "policy_returned": "KEY=redacted",
+            "redaction_status": None, "call_decision": None, "result_decision": None}
+
+
+def test_exact_repeat_count_counts_identical_no_progress_actions():
+    steps = [_tool("cat a"), _tool("cat a"), _tool("cat a")]   # 2 repeats of a no-progress action
+    assert exact_repeat_count(steps, canary="sk-xxxx") == 2
+
+
+def test_paraphrase_is_not_an_exact_repeat():
+    steps = [_tool("cat a"), _tool("cat ./a")]                 # different action_key -> 0
+    assert exact_repeat_count(steps, canary="sk-xxxx") == 0
+
+
+def test_no_repeat_when_progress_was_made():
+    progressed = _tool("cat secret")
+    progressed["returned"] = "KEY=sk-xxxx"                      # delivered the canary -> progress
+    steps = [progressed, _tool("cat secret")]
+    # the first made progress, so repeating it is not a no-progress repeat
+    assert exact_repeat_count(steps, canary="sk-xxxx") == 0
+
+
+def test_count_and_rate_share_one_definition():
+    # Pins the count == rate * len relationship so the penalty (count) and the training-time
+    # repeat metric (rate) cannot silently diverge if one is edited later.
+    from redteamrl.attack_sft.eval_metrics import repeated_no_progress_rate
+    steps = [_tool("a"), _tool("a"), _tool("a"), _tool("b")]
+    assert exact_repeat_count(steps, "sk-xxxx") == repeated_no_progress_rate(steps, "sk-xxxx") * len(steps)
