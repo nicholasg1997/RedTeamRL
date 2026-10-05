@@ -5,6 +5,7 @@ from redteamrl.policies.base import AttackerPolicy, DefenderPolicy
 from redteamrl.types import TaskSpec, DefenderDecision
 from redteamrl.harness.protocol import _DEFENDER_FAIL_MARKER, render_action
 from redteamrl.harness.egress import egress_check
+from redteamrl.harness.pathnorm import normalize_sandbox_paths
 from redteamrl.harness.reward import attacker_reward, defender_reward
 from redteamrl.harness.taint import sensitive_spans
 
@@ -129,6 +130,7 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
                         raw_result = sandbox.run_command(action.args.get("command", ""))
                     else:
                         raw_result = f"[error: unsupported tool '{action.tool}']"
+                    raw_result = normalize_sandbox_paths(raw_result, sandbox)
                     result = defender.adjudicate_result(conversation, action, raw_result)
                     result_decisions += 1
                     # The evaluator may use the synthetic canary as an offline taint verifier. It
