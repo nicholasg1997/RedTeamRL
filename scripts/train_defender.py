@@ -97,6 +97,15 @@ app = modal.App("redteamrl-defender-grpo", image=image)
 def _train_impl(active_servers):
     import json, os, shutil, sys, tempfile, torch
     sys.path.insert(0, "/root")
+    # Preflight, before the opponent server and model load: every adapter swap must reset vLLM's
+    # prefix cache (LoRA KV blocks are keyed on the adapter NAME in vLLM 0.21), and that route only
+    # exists in dev mode. The r9 run predates this, so its iter>=1 rollouts ran on stale
+    # system-prompt KV -- see PLAN.md §4.2.
+    for var, ok in (("VLLM_ALLOW_RUNTIME_LORA_UPDATING", ("1", "true")),
+                    ("VLLM_SERVER_DEV_MODE", ("1",))):
+        if os.environ.get(var, "").lower() not in ok:
+            raise RuntimeError(f"{var} is not set on the image; the per-iteration adapter swap "
+                               "cannot work correctly. Add it to the image .env({...}) block.")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, PeftModel, get_peft_model
     from redteamrl.policies.prompted import (
