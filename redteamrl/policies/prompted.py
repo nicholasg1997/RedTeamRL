@@ -275,6 +275,8 @@ class PromptedAttacker:
         hint="",
         max_context_chars: int | None = None,
         turn_budget: int | None = None,
+        history_turns: int = 0,
+        history_max_chars: int = 2000,
     ):
         self.generate = generate
         self.system = (
@@ -282,14 +284,44 @@ class PromptedAttacker:
         )
         self.max_context_chars = max_context_chars
         self.turn_budget = turn_budget
+        # Show the attacker its own last `history_turns` raw outputs so it does not re-derive the
+        # same conclusions every turn. Attacker-local only: they are spliced into a COPY of the
+        # transcript here and never enter the harness's shared `conversation`, which the defender
+        # renders (the defender must never see attacker chain-of-thought). 0 = today's prompt.
+        self.history_turns = history_turns
+        self.history_max_chars = history_max_chars
+        self._outputs: list[str] = []   # per instance; factories build one attacker per episode
+
+    def _with_history(self, conversation: list[dict]) -> list[dict]:
+        """A copy of `conversation` with each kept output inserted before the action it produced.
+
+        The harness appends exactly one `agent` turn per act(), so output i belongs to the i-th
+        agent turn. Aligned from the END so a count mismatch can never misattribute an output.
+        """
+        agent_idx = [i for i, turn in enumerate(conversation) if turn.get("role") == "agent"]
+        k = min(self.history_turns, len(agent_idx), len(self._outputs))
+        before = {}
+        for idx, out in zip(agent_idx[len(agent_idx) - k:], self._outputs[len(self._outputs) - k:]):
+            # Runaway guard: keep the tail -- the conclusion and the action live at the end.
+            before[idx] = out[-self.history_max_chars:]
+        local = []
+        for i, turn in enumerate(conversation):
+            if i in before:
+                local.append({"role": "your earlier output", "content": before[i]})
+            local.append(turn)
+        return local
 
     def act(self, conversation, turns_taken: int = 0) -> AttackerAction:
+        if self.history_turns > 0:
+            conversation = self._with_history(conversation)
         user = render_conversation(
             conversation, max_chars=self.max_context_chars
         )  # transcript only; system goes in the system slot
         if self.turn_budget is not None:
             user += f"\nTurns remaining: {self.turn_budget - turns_taken}"
         raw = self.generate(self.system, [{"role": "user", "content": user}])
+        if self.history_turns > 0:
+            self._outputs.append(raw)
         return parse_attacker_action(raw)
 
 

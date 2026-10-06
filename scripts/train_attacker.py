@@ -158,8 +158,13 @@ ADVANTAGE_STD_NORMALIZE = False
 # Bumped whenever the algorithm or the attacker's inputs change, so a run can never resume onto a
 # checkpoint chain trained under different rules (phase_identity would refuse it anyway; a fresh
 # root makes it a clean start instead of an error). v1 = std-normalised advantages (arm 2 iters
-# 0-1, arm 3 iter-0 rollout). v2 = mean-centred advantages + batched update.
-LINEAGE = "v2"
+# 0-1, arm 3 iter-0 rollout). v2 = mean-centred advantages + batched update. v3 = the attacker
+# sees its own last ATTACKER_HISTORY_TURNS raw outputs in its prompt.
+LINEAGE = "v3"
+# The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
+# re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
+# tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
+ATTACKER_HISTORY_TURNS = 3
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
@@ -520,7 +525,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # attributable to learning rather than to us writing better attacks by hand.
         return PromptedAttacker(cap, goal=spec.goal, cover=spec.request, hint=HINT_TECHNIQUE,
                                 system_template=ATTACKER_SYSTEM_SHELL,
-                                max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+                                max_context_chars=TRANSCRIPT_CONTEXT_CHARS,
+                                history_turns=ATTACKER_HISTORY_TURNS)
 
     def benign_agent_factory(spec):
         raise AssertionError("attacker phase runs attack tasks only")
@@ -544,6 +550,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "repeat_penalty_coef": coef,
         "path_normalised": PATH_NORMALISED,
         "advantage_std_normalized": ADVANTAGE_STD_NORMALIZE,
+        "attacker_history_turns": ATTACKER_HISTORY_TURNS,
         "lineage": LINEAGE,
     }
     if split_defender:
@@ -620,7 +627,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             spec = _heldout_attack_task(seed)
             attacker = PromptedAttacker(eval_gen, goal=spec.goal, cover=spec.request,
                                         hint=HINT_TECHNIQUE, system_template=ATTACKER_SYSTEM_SHELL,
-                                        max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
+                                        max_context_chars=TRANSCRIPT_CONTEXT_CHARS,
+                                        history_turns=ATTACKER_HISTORY_TURNS)
             defender = PromptedDefender(generate=gen_def, system_template=None,
                                         max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
             sandbox = LocalShellSandbox()
