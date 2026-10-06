@@ -167,7 +167,7 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-attacker-grpo", image=image)
 
 
-def _train_impl(active_servers, arm, repeat_penalty_coef):
+def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS):
     import contextlib, os, sys, tempfile, torch
     sys.path.insert(0, "/root")
 
@@ -545,7 +545,15 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
             return list(pool.map(one, seeds))
 
     publish_policy(f"iter{start_iter} pre-rollout")
-    for it in range(start_iter, N_ITERS):
+    # `until_iter` bounds THIS launch (exclusive), for budget-capped runs: a later launch resumes
+    # from the checkpoint and carries on. It is an absolute iteration, not a count, because a
+    # Modal retry after preemption re-enters with the same args and a resumed start_iter -- a
+    # count would buy an extra iteration; an absolute bound stops at the same place either way.
+    end_iter = min(N_ITERS, until_iter)
+    if start_iter >= end_iter:
+        print(f"nothing to do: resumed at iter {start_iter}, until_iter={until_iter}", flush=True)
+        return
+    for it in range(start_iter, end_iter):
         cap.buffer.clear()
         model.eval()
         examples = rollout(tasks, attack_agent_factory, benign_agent_factory,
@@ -616,6 +624,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
         shutil.rmtree(os.path.join(ckpt_root, f"rollout-iter{it}"), ignore_errors=True)
         runs.commit()
 
+    if end_iter < N_ITERS:
+        print(f"stopped at --until-iter {until_iter}; relaunch to resume at iter {end_iter}",
+              flush=True)
+        return
     model.save_pretrained(f"{ckpt_root}/final")
     runs.commit()
 
@@ -623,7 +635,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
 @app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train(arm: int = 3, repeat_penalty_coef: float = 0.05):
+def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -632,12 +644,12 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05):
     """
     active_servers = []
     try:
-        return _train_impl(active_servers, arm, repeat_penalty_coef)
+        return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter)
     finally:
         for stop_server, proc in reversed(active_servers):
             stop_server(proc)
 
 
 @app.local_entrypoint()
-def main(arm: int = 3, repeat_penalty_coef: float = 0.05):
-    train.remote(arm, repeat_penalty_coef)
+def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS):
+    train.remote(arm, repeat_penalty_coef, until_iter)
