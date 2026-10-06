@@ -101,3 +101,19 @@ def test_first_swap_tolerates_unload_of_an_unknown_name(monkeypatch):
     calls = _record_posts(monkeypatch, {"/v1/unload_lora_adapter": 404})
     load_lora_adapter("http://localhost:8000", "attacker", "/tmp/x")
     assert calls[-1] == "/reset_prefix_cache"
+
+
+def test_swap_never_requests_an_in_place_load(monkeypatch):
+    # vLLM 0.21 keeps load_inplace on the stored LoRARequest and re-reads the adapter from disk on
+    # EVERY decode step while it is set -- the GPU idled at 10-20% and decode ran ~4-7x slower.
+    import redteamrl.policies.vllm_client as vc
+    payloads = {}
+
+    def fake_post(url, json=None, timeout=None):
+        payloads[url.split(":8000", 1)[1]] = json
+        return _Resp(200)
+    monkeypatch.setattr(vc.requests, "post", fake_post)
+    vc.load_lora_adapter("http://localhost:8000", "attacker", "/tmp/x")
+    load = payloads["/v1/load_lora_adapter"]
+    assert load == {"lora_name": "attacker", "lora_path": "/tmp/x"}
+    assert not load.get("load_inplace")

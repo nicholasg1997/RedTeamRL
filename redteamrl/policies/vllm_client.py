@@ -148,9 +148,15 @@ def load_lora_adapter(base_url: str, name: str, path: str, timeout: float = 300.
 	server, and a failed reset raises rather than training on stale KV. Unload-first and the
 	callers' unique paths are kept as defense in depth (and match newer vLLM's (name, path) key)."""
 	unload_lora_adapter(base_url, name, timeout=min(timeout, 60.0))
+	# NEVER load_inplace=True. vLLM 0.21 keeps the flag on the stored LoRARequest, and
+	# worker_manager.add_adapter reloads when `lora_int_id not in list_adapters() or load_inplace`
+	# -- and add_adapter runs from _prepare_inputs on EVERY decode step. So an in-place load re-read
+	# the adapter from disk every step: py-spy caught the engine thread in from_local_checkpoint in
+	# 3/3 samples, the A100 sat at 10-20% util, and decode ran ~3-6 tok/s/seq vs ~22 with a startup-
+	# loaded adapter (2026-10-05). The unload above already frees the name, so a plain load suffices.
 	resp = requests.post(
 		f"{base_url.rstrip('/')}/v1/load_lora_adapter",
-		json={"lora_name": name, "lora_path": path, "load_inplace": True},
+		json={"lora_name": name, "lora_path": path},
 		timeout=timeout,
 	)
 	if resp.status_code != 200:
