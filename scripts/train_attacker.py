@@ -167,7 +167,8 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-attacker-grpo", image=image)
 
 
-def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS):
+def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
+                skip_final_update=False):
     import contextlib, os, sys, tempfile, torch
     sys.path.insert(0, "/root")
 
@@ -589,6 +590,13 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS):
         print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
               flush=True)
         print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
+        if skip_final_update and it == end_iter - 1:
+            # Measurement / budget launch: the rollout is banked episode-by-episode, so the next
+            # launch replays it from the bank for free and runs this iteration's update then.
+            runs.commit()
+            print(f"stopped after iter {it} rollout (--skip-final-update); its episodes are "
+                  f"banked, relaunch to run the update and continue", flush=True)
+            return
 
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
@@ -640,7 +648,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS):
 @app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS):
+def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
+          skip_final_update: bool = False):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -649,12 +658,14 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
     """
     active_servers = []
     try:
-        return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter)
+        return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
+                           skip_final_update)
     finally:
         for stop_server, proc in reversed(active_servers):
             stop_server(proc)
 
 
 @app.local_entrypoint()
-def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS):
-    train.remote(arm, repeat_penalty_coef, until_iter)
+def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
+         skip_final_update: bool = False):
+    train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update)
