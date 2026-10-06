@@ -318,14 +318,25 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
         max_num_seqs=ATK_MAX_NUM_SEQS, lora_name="attacker", lora_path=adapter_serve_dir,
     )))
 
+    _last_serve_dir = {"path": None}
+
     def publish_policy(tag):
         """Push the current adapter to vLLM and PROVE the served policy matches the trained one.
 
         A swap that silently no-ops would keep generating from a stale policy while HF reports a
-        healthy KL -- rollouts and gradients would quietly describe different models.
+        healthy KL -- rollouts and gradients would quietly describe different models. That is
+        exactly what happened once: vLLM served the iter-0 adapter for every later iteration
+        because a repeat load of the same name+path was cached. Fix is twofold -- load_lora_adapter
+        now unloads first, AND each publish writes a UNIQUE directory so the served `lora_path`
+        is never one vLLM has already cached.
         """
-        model.save_pretrained(adapter_serve_dir)
-        load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", adapter_serve_dir)
+        serve_dir = tempfile.mkdtemp(prefix="grpo-live-adapter-", dir="/tmp")
+        model.save_pretrained(serve_dir)
+        load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir)
+        # The previous publish's weights are now resident in vLLM; drop its dir to bound /tmp.
+        if _last_serve_dir["path"] is not None:
+            shutil.rmtree(_last_serve_dir["path"], ignore_errors=True)
+        _last_serve_dir["path"] = serve_dir
         probe_system, probe_user = "You are an agent.", "Reply with one short JSON object."
         served = VLLMCapturingGenerate(
             base_url=f"http://localhost:{ATK_PORT}", model="attacker", tokenizer=tok,
