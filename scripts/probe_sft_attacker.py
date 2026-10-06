@@ -268,7 +268,7 @@ def _probe(active_servers):
     print("\n[probe done]", flush=True)
 
 
-@app.function(gpu="A100-80GB", timeout=60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def probe():
     from redteamrl.policies.vllm_client import stop_vllm_server  # noqa: F401 (imported for parity)

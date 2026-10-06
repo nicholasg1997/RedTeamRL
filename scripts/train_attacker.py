@@ -632,7 +632,12 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS):
     runs.commit()
 
 
-@app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
+# cpu=8: without it the container gets Modal's minimal default -- `nproc` measured 1 (2026-10-05).
+# Two vLLM engine loops, two API servers, 48 rollout threads + their shell sandboxes and the trainer
+# all shared one core, so the attacker engine decoded at a FIXED ~300ms/step whether 13 or 47 seqs
+# were running (GPU waiting on the CPU: 70-100% "util" at only ~230W). CPU is billed per core and
+# is cheap next to the A100 it was starving.
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS):

@@ -205,7 +205,7 @@ def _check_impl(active_servers):
     runs.commit()
 
 
-@app.function(gpu="A100-80GB", timeout=3 * 60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=3 * 60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def check():
     """Own the vLLM lifecycle outside the body: a retry in the same container must not inherit

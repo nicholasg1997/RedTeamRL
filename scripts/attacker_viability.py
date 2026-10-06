@@ -219,7 +219,7 @@ def _check_impl(active_servers):
 
 # 3h, not 2h: N_ROLLOUTS=16 doubles the episodes the original 2h assumed. Modal bills
 # actual usage, so a longer timeout costs nothing unless it is actually needed.
-@app.function(gpu="A100-80GB", timeout=3 * 60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=3 * 60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def check():
     """Own the vLLM lifecycle outside the body: a retry in the same container must not inherit

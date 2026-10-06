@@ -35,7 +35,7 @@ runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-shell-probe", image=image)
 
 
-@app.function(gpu="A100-80GB", timeout=60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=60 * 60,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def probe():
     import sys

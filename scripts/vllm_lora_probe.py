@@ -40,7 +40,7 @@ hf_cache = modal.Volume.from_name("redteamrl-hf-cache", create_if_missing=True)
 app = modal.App("redteamrl-vllm-lora-probe", image=image)
 
 
-@app.function(gpu="A100-80GB", timeout=45 * 60, volumes={"/cache/huggingface": hf_cache})
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=45 * 60, volumes={"/cache/huggingface": hf_cache})
 def probe():
     import json, os, subprocess, sys, tempfile, time
     import requests

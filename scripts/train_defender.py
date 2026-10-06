@@ -468,7 +468,7 @@ def _train_impl(active_servers):
     runs.commit()
 
 
-@app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train():

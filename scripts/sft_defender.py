@@ -1164,7 +1164,7 @@ def _sft_round_impl(active_servers):
           f"checks={acceptance['checks']}", flush=True)
 
 
-@app.function(gpu="A100-80GB", timeout=24 * 60 * 60,
+@app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),  # restart NOW on preempt; phases resume
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def sft_round():
