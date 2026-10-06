@@ -545,6 +545,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         with ThreadPoolExecutor(max_workers=ROLLOUT_WORKERS) as pool:
             return list(pool.map(one, seeds))
 
+    # Per-process CPU every 60s: a single-threaded process pinned at ~100% (a vLLM scheduler loop,
+    # an API server, or the GIL-bound rollout harness) is the leading suspect for the attacker
+    # engine's ~3 tok/s/seq (vs ~10 co-located in isolation). See redteamrl/train/cpu_monitor.py.
+    from redteamrl.train.cpu_monitor import start_cpu_monitor
+    start_cpu_monitor(interval_s=60.0)
     publish_policy(f"iter{start_iter} pre-rollout")
     # `until_iter` bounds THIS launch (exclusive), for budget-capped runs: a later launch resumes
     # from the checkpoint and carries on. It is an absolute iteration, not a count, because a
