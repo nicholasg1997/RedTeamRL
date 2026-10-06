@@ -83,7 +83,10 @@ image = (
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           # Required for /v1/load_lora_adapter: how the updated GRPO policy reaches vLLM each
           # iteration (a ~50MB adapter file, not the whole backbone).
-          "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"})
+          "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+          # Exposes /reset_prefix_cache, which load_lora_adapter calls after every swap: vLLM 0.21
+          # keys LoRA prefix-cache blocks on the adapter NAME, so stale KV survives a swap.
+          "VLLM_SERVER_DEV_MODE": "1"})
     .add_local_dir("redteamrl", remote_path="/root/redteamrl")
 )
 hf_cache = modal.Volume.from_name("redteamrl-hf-cache", create_if_missing=True)

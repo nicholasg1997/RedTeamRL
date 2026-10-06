@@ -151,7 +151,10 @@ image = (
           "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
           # Required for /v1/load_lora_adapter: without it vLLM does not register the route at all
           # and the swap 404s. Startup --lora-modules works regardless, so the server looks healthy.
-          "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True"})
+          "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "True",
+          # Exposes /reset_prefix_cache. vLLM 0.21 keys LoRA prefix-cache blocks on the adapter
+          # NAME, so every swap must evict them or old-adapter KV is reused (load_lora_adapter).
+          "VLLM_SERVER_DEV_MODE": "1"})
     .add_local_dir("redteamrl", remote_path="/root/redteamrl")
 )
 hf_cache = modal.Volume.from_name("redteamrl-hf-cache", create_if_missing=True)
@@ -175,6 +178,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
             "VLLM_ALLOW_RUNTIME_LORA_UPDATING is not set on the image. vLLM will not expose "
             "/v1/load_lora_adapter, so the per-iteration adapter swap cannot work. Add it to the "
             "image .env({...}) block.")
+    if os.environ.get("VLLM_SERVER_DEV_MODE", "") != "1":
+        raise RuntimeError(
+            "VLLM_SERVER_DEV_MODE=1 is not set on the image. vLLM will not expose "
+            "/reset_prefix_cache, and without it every adapter swap reuses prefix KV computed by "
+            "the previous adapter. Add it to the image .env({...}) block.")
 
     # The gate's number only transfers if training runs what the gate measured. Three knobs once
     # diverged silently and cost an iteration that produced zero gradient.
@@ -325,10 +333,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
 
         A swap that silently no-ops would keep generating from a stale policy while HF reports a
         healthy KL -- rollouts and gradients would quietly describe different models. That is
-        exactly what happened once: vLLM served the iter-0 adapter for every later iteration
-        because a repeat load of the same name+path was cached. Fix is twofold -- load_lora_adapter
-        now unloads first, AND each publish writes a UNIQUE directory so the served `lora_path`
-        is never one vLLM has already cached.
+        what happened once, and the cause was the PREFIX CACHE, not the weights: vLLM 0.21 keys
+        LoRA KV blocks on the adapter name, so this check's fixed prompt (and every rollout's
+        shared system prompt) reused KV computed before the swap. load_lora_adapter now resets
+        the prefix cache after every load (see its docstring, and scripts/vllm_swap_probe.py for
+        the reproduction). The unique dir per publish is kept as defense in depth.
         """
         serve_dir = tempfile.mkdtemp(prefix="grpo-live-adapter-", dir="/tmp")
         model.save_pretrained(serve_dir)

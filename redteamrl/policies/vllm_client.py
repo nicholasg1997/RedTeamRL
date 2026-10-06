@@ -139,9 +139,14 @@ def load_lora_adapter(base_url: str, name: str, path: str, timeout: float = 300.
 	"""Swap the served adapter. This is how the GRPO policy reaches vLLM each iteration: a ~50MB
 	adapter file instead of streaming the whole backbone.
 
-	Unload-then-load, NOT load-in-place: vLLM caches by name and a repeat load of the same name
-	served stale (iter-0) weights while the trainer moved on. Callers also hand a UNIQUE `path` per
-	publish, so neither the name nor the path can resolve to a cached adapter."""
+	The WEIGHTS swap fine; the PREFIX CACHE does not. vLLM 0.21.0 keys LoRA prefix-cache blocks on
+	`lora_name` alone (kv_cache_utils._gen_lora_extra_hash_keys; later versions add the path), and
+	neither unload nor a new path evicts them. So after a swap under the same name, every prompt
+	prefix seen before -- the shared system prompt, the publish check's fixed prompt -- reused KV
+	computed by the PREVIOUS adapter. That is why the served greedy output kept matching base.
+	Resetting the prefix cache after the load is the fix; it needs VLLM_SERVER_DEV_MODE=1 on the
+	server, and a failed reset raises rather than training on stale KV. Unload-first and the
+	callers' unique paths are kept as defense in depth (and match newer vLLM's (name, path) key)."""
 	unload_lora_adapter(base_url, name, timeout=min(timeout, 60.0))
 	resp = requests.post(
 		f"{base_url.rstrip('/')}/v1/load_lora_adapter",
@@ -153,6 +158,20 @@ def load_lora_adapter(base_url: str, name: str, path: str, timeout: float = 300.
 			f"vLLM refused the adapter swap ({resp.status_code}): {resp.text[:500]}. "
 			"Serving a stale adapter would train against a policy that is not the one being "
 			"updated, so this must not be ignored."
+		)
+	reset_prefix_cache(base_url, timeout=min(timeout, 60.0))
+
+
+def reset_prefix_cache(base_url: str, timeout: float = 60.0) -> None:
+	"""Evict all cached prefix KV. Raises on failure: a swap without it serves stale KV (see
+	load_lora_adapter). Only callable between generation phases -- vLLM refuses to reset while
+	requests hold cached blocks."""
+	resp = requests.post(f"{base_url.rstrip('/')}/reset_prefix_cache", timeout=timeout)
+	if resp.status_code != 200:
+		raise RuntimeError(
+			f"vLLM prefix-cache reset failed ({resp.status_code}): {resp.text[:300]}. The route "
+			"needs VLLM_SERVER_DEV_MODE=1 on the server; without the reset, prompts seen before the "
+			"adapter swap reuse KV computed by the previous adapter."
 		)
 
 

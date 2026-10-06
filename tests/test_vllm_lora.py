@@ -60,3 +60,44 @@ def test_missing_ids_raise_instead_of_guessing():
 def test_empty_completion_is_rejected():
     with pytest.raises(ValueError, match="empty"):
         parse_token_ids(_payload({"text": "", "prompt_token_ids": [1], "token_ids": []}))
+
+
+class _Resp:
+    def __init__(self, status_code, text=""):
+        self.status_code, self.text = status_code, text
+
+
+def _record_posts(monkeypatch, statuses):
+    """Patch requests.post in vllm_client; return the list of endpoint paths hit, in order."""
+    import redteamrl.policies.vllm_client as vc
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        endpoint = url.split(":8000", 1)[1]
+        calls.append(endpoint)
+        return _Resp(statuses.get(endpoint, 200))
+    monkeypatch.setattr(vc.requests, "post", fake_post)
+    return calls
+
+
+def test_swap_resets_the_prefix_cache_after_loading(monkeypatch):
+    # vLLM 0.21 keys LoRA prefix-cache blocks on the adapter NAME, so without a reset every prompt
+    # seen before the swap reuses KV computed by the previous adapter (scripts/vllm_swap_probe.py).
+    from redteamrl.policies.vllm_client import load_lora_adapter
+    calls = _record_posts(monkeypatch, {})
+    load_lora_adapter("http://localhost:8000", "attacker", "/tmp/x")
+    assert calls == ["/v1/unload_lora_adapter", "/v1/load_lora_adapter", "/reset_prefix_cache"]
+
+
+def test_failed_prefix_cache_reset_is_fatal(monkeypatch):
+    from redteamrl.policies.vllm_client import load_lora_adapter
+    _record_posts(monkeypatch, {"/reset_prefix_cache": 404})
+    with pytest.raises(RuntimeError, match="VLLM_SERVER_DEV_MODE"):
+        load_lora_adapter("http://localhost:8000", "attacker", "/tmp/x")
+
+
+def test_first_swap_tolerates_unload_of_an_unknown_name(monkeypatch):
+    from redteamrl.policies.vllm_client import load_lora_adapter
+    calls = _record_posts(monkeypatch, {"/v1/unload_lora_adapter": 404})
+    load_lora_adapter("http://localhost:8000", "attacker", "/tmp/x")
+    assert calls[-1] == "/reset_prefix_cache"
