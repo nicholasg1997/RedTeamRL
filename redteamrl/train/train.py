@@ -224,7 +224,7 @@ def tactic_summary(examples: list[Example]) -> str:
 	        f"encoded_pass_rate={encoded / n:.1%}")
 
 
-def assign_advantages(examples: list[Example]) -> None:
+def assign_advantages(examples: list[Example], normalize_std: bool = True) -> None:
 	ep_reward = {}
 	ep_task = {}
 
@@ -233,13 +233,39 @@ def assign_advantages(examples: list[Example]) -> None:
 		ep_task[example.episode_id] = example.task_id
 
 	ep_ids = list(ep_reward)
-	adv = group_advantages([ep_reward[i] for i in ep_ids], [ep_task[i] for i in ep_ids])
+	adv = group_advantages([ep_reward[i] for i in ep_ids], [ep_task[i] for i in ep_ids],
+	                       normalize_std=normalize_std)
 	by_ep = dict(zip(ep_ids, adv))
 	for example in examples:
 		example.advantage = by_ep[example.episode_id]
 
+def micro_batches(examples: list[Example], max_tokens: int, max_logit_rows: int) -> list[list[int]]:
+	"""Group example indices into forward-pass batches, sorted by length to minimise padding.
+
+	Two caps, because two tensors grow with a batch: activations ~ rows x padded width
+	(`max_tokens`), and logits ~ rows x (longest completion + 1) x ~152k vocab (`max_logit_rows`).
+	An example that alone exceeds a cap still gets its own batch -- exactly what ran before."""
+	order = sorted(range(len(examples)),
+	               key=lambda i: len(examples[i].prompt_ids) + len(examples[i].completion_ids))
+	batches, current, width, keep = [], [], 0, 0
+	for i in order:
+		n = len(examples[i].prompt_ids) + len(examples[i].completion_ids)
+		k = len(examples[i].completion_ids) + 1
+		new_width, new_keep = max(width, n), max(keep, k)
+		if current and ((len(current) + 1) * new_width > max_tokens
+		                or (len(current) + 1) * new_keep > max_logit_rows):
+			batches.append(current)
+			current, new_width, new_keep = [], n, k
+		current.append(i)
+		width, keep = new_width, new_keep
+	if current:
+		batches.append(current)
+	return batches
+
+
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2,
-                inner_epochs: int = 1) -> dict:
+                inner_epochs: int = 1, max_batch_tokens: int = 16384,
+                max_batch_logit_rows: int = 4096) -> dict:
 	"""GRPO update: `inner_epochs` gradient steps over ONE batch of rollouts.
 
 	Generation dominates cost — a rollout is hours, an optimizer step is seconds. Taking a single
@@ -251,8 +277,12 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	reference) are computed ONCE. Recomputing `old_lp` after a step would re-pin the ratio at 1
 	and silently remove the trust region — the epochs would become unconstrained repeats.
 
-	Episodes are weighted equally regardless of trajectory length, and each decision is
-	backpropagated immediately so only one autograd graph is alive at a time.
+	Episodes are weighted equally regardless of trajectory length. A learner with
+	`logprobs_batch` is scored in micro-batches (one autograd graph per micro-batch, bounded by
+	`max_batch_tokens` / `max_batch_logit_rows`); one without it is scored one example at a time.
+	The per-example losses and weights are identical either way -- batching changes speed, not math.
+	Micro-batches are fixed once and reused for the frozen pass and every epoch, so epoch 0's ratio
+	stays exactly 1.
 	"""
 	if inner_epochs < 1:
 		raise ValueError("inner_epochs must be at least 1")
@@ -269,15 +299,24 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	# detach: a learner whose no-grad path returns a view of its parameters would otherwise leave
 	# these aliasing live storage, so the optimizer step would silently mutate "old_lp", re-pin
 	# the ratio at 1.0, and remove the trust region without any visible error.
-	frozen = [
-		(
-			learner.logprobs(example.prompt_ids, example.completion_ids,
-			                 use_adapter=True, with_grad=False).detach().clone(),
-			learner.logprobs(example.prompt_ids, example.completion_ids,
-			                 use_adapter=False, with_grad=False).detach().clone(),
-		)
-		for example in live
-	]
+	batched = hasattr(learner, "logprobs_batch")
+	batches = (micro_batches(live, max_batch_tokens, max_batch_logit_rows) if batched
+	           else [[i] for i in range(len(live))])
+
+	def score(indices, use_adapter, with_grad):
+		if not batched:
+			example = live[indices[0]]
+			return [learner.logprobs(example.prompt_ids, example.completion_ids,
+			                         use_adapter=use_adapter, with_grad=with_grad)]
+		return learner.logprobs_batch(
+			[(live[i].prompt_ids, live[i].completion_ids) for i in indices],
+			use_adapter=use_adapter, with_grad=with_grad)
+
+	frozen: list = [None] * len(live)
+	for indices in batches:
+		for i, old_lp, ref_lp in zip(indices, score(indices, True, False),
+		                             score(indices, False, False)):
+			frozen[i] = (old_lp.detach().clone(), ref_lp.detach().clone())
 
 	epoch_ratios = []
 	total_loss = grad_norm = 0.0
@@ -287,18 +326,22 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 		ratios = []
 		kls = []
 		total_loss = 0.0
-		for example, (old_lp, ref_lp) in zip(live, frozen):
-			new_lp = learner.logprobs(example.prompt_ids, example.completion_ids,
-			                          use_adapter=True, with_grad=True)
-			mask = torch.ones_like(new_lp)
-			loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta, clip_eps)
-			weight = 1.0 / (n_episodes * decisions_per_episode[example.episode_id])
-			(loss * weight).backward()
-			total_loss += loss.item() * weight
-			ratios.append(torch.exp(new_lp - old_lp).mean().item())
-			# Report the same non-negative k3 estimator used by the optimization objective.
-			delta = ref_lp - new_lp
-			kls.append((torch.exp(delta) - delta - 1.0).mean().item())
+		for indices in batches:
+			batch_loss = 0.0
+			for i, new_lp in zip(indices, score(indices, True, True)):
+				example = live[i]
+				old_lp, ref_lp = frozen[i]
+				mask = torch.ones_like(new_lp)
+				loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta,
+				                    clip_eps)
+				weight = 1.0 / (n_episodes * decisions_per_episode[example.episode_id])
+				batch_loss = batch_loss + loss * weight
+				total_loss += loss.item() * weight
+				ratios.append(torch.exp(new_lp - old_lp).mean().item())
+				# Report the same non-negative k3 estimator used by the optimization objective.
+				delta = ref_lp - new_lp
+				kls.append((torch.exp(delta) - delta - 1.0).mean().item())
+			batch_loss.backward()       # one graph per micro-batch
 		trainable = [p for p in learner.model.parameters() if p.requires_grad]
 		grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=float("inf")))
 		learner.optimizer.step()

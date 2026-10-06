@@ -39,7 +39,12 @@ DEFENDER_SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"
 DEFENDER_GRPO_ADAPTER = "/runs/defender-grpo-r9-vllm/iter1"
 N_ROLLOUTS = 8          # GRPO group size; larger groups buy within-group variance
 N_ITERS = 20
-LR = 1e-5
+# 2e-5 (was 1e-5) to go with mean-centred advantages: dropping the std division shrinks a
+# 1-win-in-8 group's winner advantage 2.65 -> 1.18 (~2.2x), which at 1e-5 would quietly halve
+# the step on the win signal. Doubling restores it there, while repeat-only groups (std ~0.02-0.1)
+# now step ~20-50x smaller -- the intended effect. The ratio sat at ~0.998 after 4 epochs, far
+# from the 0.2 clip, so there is headroom.
+LR = 2e-5
 # 0.7 is what attacker_viability measured 16.7% at (make_vllm_generate's default). 1.0 was
 # chosen to buy within-group variance, but it bought the opposite: iteration 0 came back
 # 100% dead groups at a 0% win rate. Exploration you cannot convert into a win is not
@@ -145,6 +150,16 @@ REPEAT_PENALTY_SWEEP = (0.02, 0.05, 0.1)  # the coef must be one of these; ignor
 HELDOUT_EVAL_EPISODES = 128
 HELDOUT_EVAL_EVERY = 5             # iterations between held-out evals (plus the final iteration)
 PATH_NORMALISED = True             # Task 1 landed; both arms see normalised observations.
+# Mean-centred advantages (r - mean), NOT std-normalised (2026-10-06). Arm 3 iter 0 showed why:
+# all-loss groups differing by ONE repeat (-0.30 vs -0.35, std 0.02) got +-1..2 advantages -- as
+# strong as a win -- and the push grows as a learning policy's groups tighten. In reward units a
+# one-repeat difference stays a 0.05 signal and the penalty coefficient means what it says.
+ADVANTAGE_STD_NORMALIZE = False
+# Bumped whenever the algorithm or the attacker's inputs change, so a run can never resume onto a
+# checkpoint chain trained under different rules (phase_identity would refuse it anyway; a fresh
+# root makes it a clean start instead of an error). v1 = std-normalised advantages (arm 2 iters
+# 0-1, arm 3 iter-0 rollout). v2 = mean-centred advantages + batched update.
+LINEAGE = "v2"
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.0-devel-ubuntu22.04", add_python="3.12")
@@ -238,7 +253,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 
     assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
-    ckpt_root = f"/runs/attacker-grpo-arm{arm}-coef{coef}"
+    ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     if split_defender:
         # Separate lineage: the defender on L4 kernels can flip near-tied greedy tokens vs the
         # A100, i.e. a (slightly) different opponent -- never mix the two in one checkpoint chain.
@@ -528,6 +543,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "arm": arm,
         "repeat_penalty_coef": coef,
         "path_normalised": PATH_NORMALISED,
+        "advantage_std_normalized": ADVANTAGE_STD_NORMALIZE,
+        "lineage": LINEAGE,
     }
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
@@ -646,7 +663,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                            episode_store=os.path.join(ckpt_root, f"rollout-iter{it}"),
                            commit=runs.commit, task_transform=episode_task_for(it),
                            reward_transform=reward_transform)
-        assign_advantages(examples)
+        assign_advantages(examples, normalize_std=ADVANTAGE_STD_NORMALIZE)
         iter_gen_tokens = sum(len(ex.completion_ids) for ex in examples)
         cumulative_gen_tokens += iter_gen_tokens
         div = group_diversity([
