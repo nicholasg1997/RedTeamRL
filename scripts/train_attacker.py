@@ -166,15 +166,83 @@ hf_cache = modal.Volume.from_name("redteamrl-hf-cache", create_if_missing=True)
 runs = modal.Volume.from_name("redteamrl-eval-runs", create_if_missing=True)
 app = modal.App("redteamrl-attacker-grpo", image=image)
 
+# --split-defender: memory fraction for the defender when it has an L4 (24GB) to itself. 4B bf16 is
+# ~7.5GB of weights, so 0.85 leaves ~12GB of KV -- ~3.5x the 3.4GB it got co-located on the A100.
+REMOTE_DEF_GPU = "L4"
+REMOTE_DEF_MEM_FRAC = 0.85
+
+
+def _merge_frozen_defender() -> str:
+    """Merge the frozen defender's adapters into its backbone; return a servable dir (or the base id).
+
+    The adapters must be MERGED before serving -- declaring them and serving the raw base would
+    silently train the attacker against the wrong (unpromoted) defender. Shared by the co-located
+    path and RemoteDefender so both serve byte-identical weights."""
+    import tempfile
+    import torch
+    adapters = [a for a in (DEFENDER_SFT_ADAPTER, DEFENDER_GRPO_ADAPTER) if a]
+    if not adapters:
+        return DEFENDER_MODEL
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    merged_dir = tempfile.mkdtemp(prefix="frozen-defender-", dir="/tmp")
+    model = AutoModelForCausalLM.from_pretrained(DEFENDER_MODEL, torch_dtype=torch.bfloat16,
+                                                 device_map="cpu")
+    for adapter in adapters:                        # order matters: SFT then GRPO
+        model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+    model.save_pretrained(merged_dir)
+    AutoTokenizer.from_pretrained(DEFENDER_MODEL).save_pretrained(merged_dir)
+    print(f"serving frozen defender = base + {' + '.join(adapters)}", flush=True)
+    return merged_dir
+
+
+# The frozen defender on its own GPU, reached by Modal RPC (not a public URL: the server runs with
+# dev endpoints enabled). Stateless per call -- transcript in, verdict out -- so it serves plain
+# rollouts and forked tree branches alike, and scales separately from the attacker (max_containers).
+# max_containers=1 so autoscaling can never multiply the bill. scaledown_window outlasts an update
+# phase (~22 min) so it does not cold-start every iteration. A future DEFENDER-training variant would
+# add a method that calls load_lora_adapter (which resets the prefix cache) on this server.
+@app.cls(gpu=REMOTE_DEF_GPU, cpu=4.0, timeout=24 * 60 * 60, max_containers=1,
+         scaledown_window=30 * 60, volumes={"/cache/huggingface": hf_cache, "/runs": runs})
+@modal.concurrent(max_inputs=64)
+class RemoteDefender:
+    @modal.enter()
+    def start(self):
+        import sys
+        sys.path.insert(0, "/root")
+        from redteamrl.policies.vllm_client import make_vllm_generate, start_vllm_server
+        served = _merge_frozen_defender()
+        self.proc = start_vllm_server(served, DEF_PORT, REMOTE_DEF_MEM_FRAC,
+                                      max_model_len=DEF_MAX_MODEL_LEN,
+                                      max_num_seqs=DEF_MAX_NUM_SEQS)
+        # Same sampling as the co-located path: greedy, thinking off (see the comment there).
+        self.gen = make_vllm_generate(f"http://localhost:{DEF_PORT}", served,
+                                      enable_thinking=False, temperature=0.0,
+                                      max_tokens=DEF_MAX_NEW_TOKENS)
+        print(f"RemoteDefender ready on {REMOTE_DEF_GPU}", flush=True)
+
+    @modal.method()
+    def generate(self, system: str, messages: list[dict]) -> str:
+        return self.gen(system, messages)
+
+    @modal.exit()
+    def stop(self):
+        from redteamrl.policies.vllm_client import stop_vllm_server
+        stop_vllm_server(getattr(self, "proc", None))
+
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
-                skip_final_update=False):
+                skip_final_update=False, split_defender=False):
     import contextlib, os, sys, tempfile, torch
     sys.path.insert(0, "/root")
 
     assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
     ckpt_root = f"/runs/attacker-grpo-arm{arm}-coef{coef}"
+    if split_defender:
+        # Separate lineage: the defender on L4 kernels can flip near-tied greedy tokens vs the
+        # A100, i.e. a (slightly) different opponent -- never mix the two in one checkpoint chain.
+        ckpt_root += "-splitdef"
 
     # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
     # /v1/load_lora_adapter when this is set, and publish_policy's swap 404s without it -- correct
@@ -238,36 +306,35 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         write_meta,
     )
 
-    # Frozen DEFENDER on vLLM first so it reserves its GPU fraction; HF attacker takes the rest.
-    # The adapters must be MERGED before serving -- declaring them and serving the raw base
-    # would silently train the attacker against the wrong (unpromoted) defender.
-    served_defender = DEFENDER_MODEL
-    _adapters = [a for a in (DEFENDER_SFT_ADAPTER, DEFENDER_GRPO_ADAPTER) if a]
-    if _adapters:
-        import shutil
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM as _AutoLM, AutoTokenizer as _AutoTok
-        merged_dir = tempfile.mkdtemp(prefix="frozen-defender-", dir="/tmp")
-        _model = _AutoLM.from_pretrained(DEFENDER_MODEL, torch_dtype=torch.bfloat16,
-                                         device_map="cpu")
-        for _adapter in _adapters:                      # order matters: SFT then GRPO
-            _model = PeftModel.from_pretrained(_model, _adapter).merge_and_unload()
-        _model.save_pretrained(merged_dir)
-        _AutoTok.from_pretrained(DEFENDER_MODEL).save_pretrained(merged_dir)
-        del _model
-        served_defender = merged_dir
-        print(f"serving frozen defender = base + {' + '.join(_adapters)}", flush=True)
-    active_servers.append((stop_vllm_server, start_vllm_server(
-        served_defender, DEF_PORT, DEF_MEM_FRAC, max_model_len=DEF_MAX_MODEL_LEN,
-        max_num_seqs=DEF_MAX_NUM_SEQS)))
-    hf_cache.commit()
-    # temperature=0.0: the defender is the frozen OPPONENT, not the trainee. At 0.7 sibling rollouts
-    # with identical attacker actions can draw different verdicts, so part of the within-group reward
-    # variance -- which IS the GRPO advantage signal -- would be opponent coin-flips mis-attributed to
-    # the attacker. Pinning it to greedy makes the defender a deterministic function of the transcript.
-    gen_def = make_vllm_generate(f"http://localhost:{DEF_PORT}", served_defender,
-                                 enable_thinking=False, temperature=0.0,
-                                 max_tokens=DEF_MAX_NEW_TOKENS)
+    import shutil
+    if split_defender:
+        # The frozen defender runs on its OWN L4 (RemoteDefender, below). Co-located, its
+        # compute-heavy prefills time-sliced the attacker's short decode steps: ~22 tok/s/seq alone
+        # vs ~3 in training. Kick off its cold start NOW so it overlaps this container's ~10 min of
+        # model loading; the first rollout call blocks on it only if it is still starting.
+        remote_defender = RemoteDefender()
+        defender_warmup = remote_defender.generate.spawn(
+            "You are a monitor.", [{"role": "user", "content": "Reply with one short JSON object."}])
+        served_defender = "remote-L4"
+
+        def gen_def(system, messages):
+            return remote_defender.generate.remote(system, messages)
+        print("frozen defender: REMOTE (L4, RemoteDefender) -- warming up in parallel", flush=True)
+    else:
+        # Frozen DEFENDER on vLLM first so it reserves its GPU fraction; HF attacker takes the rest.
+        served_defender = _merge_frozen_defender()
+        active_servers.append((stop_vllm_server, start_vllm_server(
+            served_defender, DEF_PORT, DEF_MEM_FRAC, max_model_len=DEF_MAX_MODEL_LEN,
+            max_num_seqs=DEF_MAX_NUM_SEQS)))
+        hf_cache.commit()
+        # temperature=0.0: the defender is the frozen OPPONENT, not the trainee. At 0.7 sibling
+        # rollouts with identical attacker actions can draw different verdicts, so part of the
+        # within-group reward variance -- which IS the GRPO advantage signal -- would be opponent
+        # coin-flips mis-attributed to the attacker. Greedy makes it a deterministic function of
+        # the transcript.
+        gen_def = make_vllm_generate(f"http://localhost:{DEF_PORT}", served_defender,
+                                     enable_thinking=False, temperature=0.0,
+                                     max_tokens=DEF_MAX_NEW_TOKENS)
 
     # Train on the SAME procedurally generated, name-varied envs as the SFT phase so names/formats
     # cannot predict attack-vs-benign (the generator is the name-invariance substrate). Per-episode
@@ -462,6 +529,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "repeat_penalty_coef": coef,
         "path_normalised": PATH_NORMALISED,
     }
+    if split_defender:
+        # Only added when split, so the co-located path's identity (and its existing checkpoints)
+        # is unchanged. The opponent's hardware is part of the episode distribution.
+        phase_identity["defender_placement"] = f"remote-{REMOTE_DEF_GPU}"
     start_iter = 0
     resume_dir = latest_checkpoint(ckpt_root)
     if resume_dir is not None:
@@ -550,6 +621,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     # engine's ~3 tok/s/seq (vs ~10 co-located in isolation). See redteamrl/train/cpu_monitor.py.
     from redteamrl.train.cpu_monitor import start_cpu_monitor
     start_cpu_monitor(interval_s=60.0)
+    if split_defender:
+        defender_warmup.get()        # blocks only if the L4 is still cold-starting
+        print("remote defender answered the warm-up call", flush=True)
     publish_policy(f"iter{start_iter} pre-rollout")
     # `until_iter` bounds THIS launch (exclusive), for budget-capped runs: a later launch resumes
     # from the checkpoint and carries on. It is an absolute iteration, not a count, because a
@@ -654,7 +728,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
-          skip_final_update: bool = False):
+          skip_final_update: bool = False, split_defender: bool = False):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -664,7 +738,7 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
     active_servers = []
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
-                           skip_final_update)
+                           skip_final_update, split_defender)
     finally:
         for stop_server, proc in reversed(active_servers):
             stop_server(proc)
@@ -672,5 +746,5 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
 
 @app.local_entrypoint()
 def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
-         skip_final_update: bool = False):
-    train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update)
+         skip_final_update: bool = False, split_defender: bool = False):
+    train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender)
