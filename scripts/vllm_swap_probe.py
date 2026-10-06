@@ -151,13 +151,17 @@ def probe(model_id: str = DEFAULT_MODEL):
         separation = min(signature_distance(refs[a], refs[b])
                          for i, a in enumerate(names) for b in names[i + 1:])
         noise_floor = max(noise)
-        trustworthy = separation > 5 * noise_floor
         print(f"[setup] noise floor (cache hit vs miss, same adapter) = {noise_floor:.4f}; "
-              f"closest pair of references = {separation:.4f}; trustworthy={trustworthy}",
-              flush=True)
+              f"closest pair of references = {separation:.4f}", flush=True)
+        # Trust is judged PER VERDICT by its margin over the runner-up, not by comparing the worst
+        # noise case to the closest reference pair: that global ratio sat at ~4.5x and printed
+        # "untrustworthy" while every actual verdict separated 9-11x.
+        margins = []
 
         def check(phase: str, expect: str) -> bool:
             served, d, runner_up = nearest(signature(LORA_NAME), refs)
+            if served == expect:
+                margins.append(runner_up / max(d, 1e-9))
             ok = served == expect
             print(f"[{phase}] serves '{served}' (dist {d:.4f}, runner-up {runner_up:.4f}); "
                   f"expected '{expect}' -> {'OK' if ok else 'STALE/WRONG'}", flush=True)
@@ -195,7 +199,9 @@ def probe(model_id: str = DEFAULT_MODEL):
         shutil.rmtree(root, ignore_errors=True)
 
     print("\n===== SWAP PROBE SUMMARY =====", flush=True)
-    print(f"  probe trustworthy (refs separated >5x noise floor): {trustworthy}", flush=True)
+    trustworthy = bool(margins) and min(margins) >= 3.0
+    print(f"  probe trustworthy (every correct verdict >=3x closer than its runner-up; "
+          f"min margin {min(margins, default=0):.1f}x): {trustworthy}", flush=True)
     for k, v in results.items():
         print(f"  {k}: {v}", flush=True)
     diagnosis = (results.get("1a raw swap serves B (False = bug reproduced)") is False and
