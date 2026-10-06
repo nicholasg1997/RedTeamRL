@@ -66,7 +66,7 @@ DEF_MEM_FRAC = 0.15
 # collapsed exactly as transcripts grew. 0.42 gives ~8.2 and still leaves the trainer +11GB.
 ATK_MEM_FRAC = 0.42
 ATK_MAX_MODEL_LEN = 16384
-ATK_MAX_NUM_SEQS = 16      # >= ROLLOUT_WORKERS so concurrent episodes batch
+ATK_MAX_NUM_SEQS = 48      # >= ROLLOUT_WORKERS so concurrent episodes batch
 # MEASURED 2026-08-31 (attacker_viability): thinking-6144 and no-thinking-2048 gave
 # statistically identical win rates (18.8% vs 16.7%, n=48, one episode apart) -- but
 # thinking-6144 truncated 29.5% of its actions mid-<think> vs 0.4% here. A truncated
@@ -77,7 +77,7 @@ BEN_MAX_TOKENS = 1024
 DEF_MAX_NEW_TOKENS = 512
 DEF_MAX_MODEL_LEN = 8192   # defender prompts are ~2.5k + 512 generated; frees room
                            # for the attacker's larger context (was 32768)
-DEF_MAX_NUM_SEQS = 16
+DEF_MAX_NUM_SEQS = 48      # matches ROLLOUT_WORKERS; its 24.7k-token KV pool queues the excess
 TRANSCRIPT_CONTEXT_CHARS = 40_000
 N_GEN_ENVS = 12         # procedurally generated, name-varied training envs (mirrors sft_attacker)
 # 102, not 101: the SFT phase collected at rev 101. Sharing it makes SFT targets and GRPO rollouts
@@ -102,7 +102,12 @@ ACKNOWLEDGED_CONFIG_DELTAS = frozenset(
 # Episodes run concurrently ACROSS ALL TASKS. vLLM batches by in-flight request count, so the old
 # task-at-a-time loop pinned both engines at a queue of ~1 (measured: 27B at 61 tok/s, the 4B
 # starved to 1.7). Keep this <= the engines' max_num_seqs so requests batch rather than queue.
-ROLLOUT_WORKERS = 16
+# 48, not 16 (2026-10-05): at 16 the attacker engine decoded ~13 seqs at ~49 tok/s TOTAL (~4/seq)
+# with its KV pool peaking at 7.6% -- decode-bound small batches (230W vs 330W in the update).
+# A decode step costs ~the same at batch 13 or 40 (dominated by reading the weights), so 3x the
+# in-flight episodes ~triples rollout throughput. Wall-clock only: not in phase_identity, so a
+# run resumes across this change. If late-episode KV ever saturates, vLLM preempts (slower, safe).
+ROLLOUT_WORKERS = 48
 # Benign episodes complete in ~2 turns and then idled to MAX_TURNS under the default fixed
 # horizon. A bounded post-completion window gives equal safety exposure at a fraction of the cost.
 POST_COMPLETION_TURNS = 4
