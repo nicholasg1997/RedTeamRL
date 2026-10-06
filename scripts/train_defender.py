@@ -120,7 +120,7 @@ def _train_impl(active_servers):
     from redteamrl.envs.ci_build import CI_BUILD
     from redteamrl.train.capture import VLLMCapturingGenerate
     from redteamrl.train.learner import Learner
-    from redteamrl.train.train import rollout, assign_advantages, update_step
+    from redteamrl.train.train import rollout, assign_advantages, tactic_summary, update_step
     from redteamrl.train.checkpoint import (
         latest_checkpoint,
         prune_checkpoints,
@@ -413,6 +413,7 @@ def _train_impl(active_servers):
               f"mean_reward={rew['mean_reward']:+.3f} "
               f"(atk={rew['mean_reward_attack']:+.3f} ben={rew['mean_reward_benign']:+.3f})",
               flush=True)
+        print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
 
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,

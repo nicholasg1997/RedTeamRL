@@ -221,7 +221,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
     from redteamrl.envs.registry import assert_training_split
     from redteamrl.train.capture import VLLMCapturingGenerate
     from redteamrl.train.learner import Learner, prepare_for_long_context_training
-    from redteamrl.train.train import rollout, assign_advantages, update_step
+    from redteamrl.train.train import rollout, assign_advantages, tactic_summary, update_step
     from redteamrl.train.diversity import group_diversity, reward_summary
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
     from redteamrl.train.checkpoint import (
@@ -575,6 +575,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef):
               flush=True)
         print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
               flush=True)
+        print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
 
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,

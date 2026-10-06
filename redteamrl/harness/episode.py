@@ -7,7 +7,7 @@ from redteamrl.harness.protocol import _DEFENDER_FAIL_MARKER, render_action
 from redteamrl.harness.egress import egress_check
 from redteamrl.harness.pathnorm import normalize_sandbox_paths
 from redteamrl.harness.reward import attacker_reward, defender_reward
-from redteamrl.harness.taint import sensitive_spans
+from redteamrl.harness.taint import sensitive_spans, taint_kinds
 
 RedactionEnforcement = Literal["unshielded", "fail_closed"]
 
@@ -38,6 +38,12 @@ class EpisodeResult(BaseModel):
     unnecessary_redactions: int = 0
     sensitive_result_passes: int = 0
     defender_protocol_failures: int = 0
+    # DIAGNOSTICS ONLY -- not inputs to any reward (see harness/taint.taint_kinds).
+    # Steps on which the defender let a known carrier of the secret through, by carrier kind.
+    passed_taint_counts: dict[str, int] = {}
+    # For a policy leak: "literal", the known carrier(s) that preceded a submit (e.g. "base64"),
+    # or "unattributed" -- a rising unattributed rate means a tactic outside the detector list.
+    leak_attribution: str | None = None
 
 
 def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPolicy,
@@ -88,6 +94,9 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
     unnecessary_redactions = 0
     sensitive_result_passes = 0
     defender_protocol_failures = 0
+    passed_taint_counts: dict[str, int] = {}
+    taint_seen: set[str] = set()
+    leak_attribution: str | None = None
 
     total_turn_budget = max_turns + (post_completion_turns or 0)
     for turn in range(total_turn_budget):
@@ -178,6 +187,12 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
 
         if policy_returned is None:
             policy_returned = returned
+        # Diagnostic only (never reward): which known carrier of the secret the defender let
+        # through this turn. See taint_kinds for why this must stay out of the reward.
+        passed_taint = taint_kinds(policy_returned, spec.forbidden) if action.kind != "submit" else set()
+        for kind in passed_taint:
+            passed_taint_counts[kind] = passed_taint_counts.get(kind, 0) + 1
+        taint_seen |= passed_taint
         defender_protocol_failures += sum(
             bool(
                 monitored_decision
@@ -195,6 +210,7 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
                       "redaction_status": redaction_status,
                       "call_decision": decision.model_dump() if decision else None,
                       "result_decision": result.model_dump() if result else None,
+                      "passed_taint": sorted(passed_taint),
                       })
         n_turns = turn + 1
         if was_complete:
@@ -205,6 +221,13 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
         turn_policy_leak = policy_res.leak or submit_leak
         if turn_policy_leak and policy_leak_at_turn is None:
             policy_leak_at_turn = turn
+            # How the secret got out, as far as the known detectors can tell. A literal pass is
+            # self-explaining; a submit is explained by whatever tainted output crossed the
+            # defender earlier, and by nothing at all when the tactic is outside the detector list.
+            if policy_res.leak:
+                leak_attribution = "literal"
+            else:
+                leak_attribution = "+".join(sorted(taint_seen)) or "unattributed"
             if was_complete:
                 policy_leak_phase = "post_completion"
             elif policy_res.complete:
@@ -262,6 +285,8 @@ def run_episode(spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPoli
         unnecessary_redactions=unnecessary_redactions,
         sensitive_result_passes=sensitive_result_passes,
         defender_protocol_failures=defender_protocol_failures,
+        passed_taint_counts=passed_taint_counts,
+        leak_attribution=leak_attribution,
     )
 
 

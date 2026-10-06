@@ -16,6 +16,9 @@ class Example:
 	policy_leak: bool = False
 	complete: bool = False
 	defender_protocol_failures: int = 0
+	# Diagnostics only (harness/taint.taint_kinds): never read by the loss or the reward.
+	leak_attribution: str | None = None
+	passed_taint_counts: dict[str, int] = field(default_factory=dict)
 
 
 class CapturingGenerate:

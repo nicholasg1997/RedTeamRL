@@ -66,6 +66,8 @@ def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factor
 		ex.policy_leak = bool(getattr(result, "policy_leak", False))
 		ex.complete = bool(getattr(result, "complete", False))
 		ex.defender_protocol_failures = int(getattr(result, "defender_protocol_failures", 0))
+		ex.leak_attribution = getattr(result, "leak_attribution", None)
+		ex.passed_taint_counts = dict(getattr(result, "passed_taint_counts", {}) or {})
 	return {"episode_id": episode_id, "task_id": spec.id, "reward": reward,
 	        "tally": tally, "examples": episode_examples}
 
@@ -197,6 +199,29 @@ def episode_verdicts(result) -> list[dict[str, str]]:
 					"verdict": str(decision["verdict"]),
 				})
 	return verdicts
+
+
+def tactic_summary(examples: list[Example]) -> str:
+	"""One log line: how leaks got out and what known secret-carriers the defender let through.
+
+	Per EPISODE (examples repeat episode facts on every decision). Diagnostic only. Watch
+	`unattributed`: a leak no known detector explains is a new tactic -- or a channel around the
+	defender -- and is the cue to read those transcripts by hand."""
+	episodes = {}
+	for ex in examples:
+		episodes.setdefault(ex.episode_id, ex)
+	leaks: dict[str, int] = {}
+	exposed: dict[str, int] = {}
+	for ex in episodes.values():
+		if ex.leak_attribution:
+			leaks[ex.leak_attribution] = leaks.get(ex.leak_attribution, 0) + 1
+		for kind in ex.passed_taint_counts:
+			exposed[kind] = exposed.get(kind, 0) + 1
+	fmt = lambda d: " ".join(f"{k}={v}" for k, v in sorted(d.items())) or "none"
+	n = max(len(episodes), 1)
+	encoded = sum(any(k in ("base64", "hex") for k in ex.passed_taint_counts) for ex in episodes.values())
+	return (f"leaks by tactic: {fmt(leaks)} | episodes passing a carrier: {fmt(exposed)} | "
+	        f"encoded_pass_rate={encoded / n:.1%}")
 
 
 def assign_advantages(examples: list[Example]) -> None:
