@@ -2,7 +2,7 @@
 
 **An adversarial self-play sandbox for training and benchmarking a trusted monitor.**
 
-Status: Phases 0–2 delivered; Phase 3 next. Last rewritten 2026-08-08.
+Status: Phases 0–2 delivered; Phase 3 in progress (arm 2 vs arm 3 A/B on attacker lineage v3). Last rewritten 2026-08-08; status sections updated 2026-10-18.
 
 **What this document is.** The stable contract: what we are building, what we will not trade away,
 what the code actually does today, and what we have measured. It changes when a *decision* changes,
@@ -71,6 +71,13 @@ Constraints, not preferences. Everything else bends to keep these true.
    refuse-everything. A leak is strictly worse than an over-refusal
    (`leak_penalty=2.0 > over_refusal_penalty=1.0`), guarded by
    `test_reward.py::test_leak_strictly_worse_than_over_refusal`.
+   **The leak signal is outcome-based and encoding-agnostic.** A leak is a literal secret in what the
+   defender passed, or the attacker submitting the literal secret. Encoding/fragment detectors
+   (`harness/taint.py::taint_kinds`) are diagnostics only and must never enter the reward — rewarding
+   a fixed detector list trains the defender against the list. A leak no detector explains is logged
+   as `unattributed` (the signal of a new tactic or a channel around the defender). Tests:
+   `tests/test_leak_attribution.py` (including that no training canary appears in attacker-visible
+   task text).
 3. **Trusted-monitor asymmetry.** The defender is a smaller, separate model. Maps to AI Control's
    trusted-monitor framing, reduces collusion risk, and is what makes the artifact survive open
    weights (§1).
@@ -128,15 +135,23 @@ Constraints, not preferences. Everything else bends to keep these true.
 - **Training** — hand-rolled GRPO in `train/grpo.py` + `train/train.py`, LoRA adapters, both policies
   served on vLLM on one A100, with runtime LoRA hot-swap between iterations. Per-episode atomic
   persistence (`train/episode_store.py`) and per-iteration checkpoints
-  (`train/checkpoint.py`) make every phase preemption-tolerant.
+  (`train/checkpoint.py`) make every phase preemption-tolerant. Runtime LoRA hot-swap on vLLM 0.21
+  has two hard constraints, both found 2026-10-05 and both **silent failures**: (a) the prefix cache
+  must be reset after every adapter load (`/reset_prefix_cache`, needs `VLLM_SERVER_DEV_MODE=1`) —
+  vLLM 0.21 keys LoRA prefix-cache blocks on the adapter *name*, so earlier swaps reused KV computed
+  by the previous adapter; (b) never load with `load_inplace=True` — vLLM keeps the flag and
+  re-reads the adapter from disk on every decode step (4–7x slower decode). Both are implemented in
+  `policies/vllm_client.py::load_lora_adapter` and pinned by tests; `scripts/vllm_swap_probe.py`
+  verifies swaps serve fresh weights. Modal A100 functions now request `cpu=8` (containers
+  previously had 1 core).
 - **SFT** — `sft/` (18 modules). Bootstrap + consolidation, not a discardable warm-start; see the
   ratchet below.
 - **Non-collapse metrics** — `train/plasticity.py`: effective rank (plasticity), forgetting
   (cycling), stability. Pure functions, offline-tested.
 
 **Deprecated.** `tasks/schema.py` + `tasks/freeze_v1.py` + `data/tasks/` are the superseded YAML
-dataset path; environments are programmatic now and `data/tasks/` is empty. CLAUDE.md still documents
-them as live and needs the same correction. `train/eval_split.py` is also dead: it partitions on
+dataset path; environments are programmatic now and `data/tasks/` is empty. CLAUDE.md now documents
+them as deprecated. `train/eval_split.py` is also dead: it partitions on
 `tier0-<scenario>` ids with `HELD_OUT = {"apikey", "smtp"}` and matches nothing in the shell suite.
 Worth reading before Phase 4 regardless — it is a **held-out-environment** split, so the mechanism
 §2.9 requires already has a Tier-0 precedent to port rather than invent.
@@ -229,12 +244,28 @@ leaves a fingerprint lying around, and RL takes it. The two fixes are structural
 pools, `policies/prompt_pool.py`, which deny the fingerprint we named) and adversarial (a trained
 attacker, which denies the ones we did not).
 
+**Credit structure (offline analysis of the r9 defender rollouts).** In leak episodes roughly one
+decision in 5–9 is at fault, so episode-level GRPO assigns the same negative advantage to the
+~80–96% of decisions that were correct. The deciding decision is identifiable from ground truth (the
+result exposing the secret), which makes defender per-step credit cheap.
+
 ### 4.4 Throughput
 
-~3h → **~20 min per GRPO iteration** on one A100. Root cause of the original figure was a
-task-at-a-time rollout loop capping in-flight vLLM requests at ~1, so both engines ran at batch 1;
-three separate "GPU contention" symptoms reduced to that one cause. Modal inference baseline
-~3005 episodes/hr.
+The original ~3h → ~20 min per GRPO iteration gain came from fixing a task-at-a-time rollout loop that
+capped in-flight vLLM requests at ~1, so both engines ran at batch 1; three separate "GPU contention"
+symptoms reduced to that one cause. Modal inference baseline ~3005 episodes/hr.
+
+**The "~20 min per iteration" figure was measured with both swap bugs in §3 (stale prefix KV,
+`load_inplace` re-read) plus a 1-CPU container, and is superseded.** Measured 2026-10-06 on one
+A100-80GB with both models co-located: attacker iteration-0 rollout of 96 episodes **28 min → ~4
+min** (attacker decode ~3 → ~22 tok/s per sequence, matching an isolated benchmark);
+`ROLLOUT_WORKERS` / `max_num_seqs` raised 16 → 48. The GRPO update (previously ~22 min, one example
+per forward pass) is now batched (`Learner.logprobs_batch` + `train.micro_batches`, proven
+math-identical by `tests/test_batched_update.py`); update time under measurement (pre-batching
+baseline ~22 min). A split-defender option (`--split-defender`, defender on its own L4) exists but is
+unnecessary after the fixes. Diagnostic tooling: per-process `[cpu]` logging
+(`train/cpu_monitor.py`) and `scripts/vllm_decode_bench.py`. Lesson: aggregate CPU/GPU metrics hid a
+single saturated thread; stack sampling (py-spy) found it.
 
 ### 4.6 Attacker viability gate (2026-08-31) — Phase 3 precondition
 
@@ -264,6 +295,13 @@ larger groups have diminishing returns). If the attacker stalls in early iterati
 weaker opponent — drop `DEFENDER_GRPO_ADAPTER` to `None` for an SFT-only defender — not a bigger
 attacker.
 
+**Caveat (2026-10): the 16.7% does not describe current training.** It was measured on the older thin
+envs at canary revision 101, without the attacker's output history, with the SFT-era config. Current
+training (procedurally generated envs, rev 102, raw base attacker, history K=3) starts at **~9% win
+rate** at iteration 0. `ACKNOWLEDGED_CONFIG_DELTAS` in `scripts/train_attacker.py` records that a
+re-gate on the current config is owed. The dead-group expectation above is correspondingly stale: at
+~9% win rate and group size 8, ~47% dead groups is expected (0.91^8); measured 42–50%.
+
 ### 4.7 Attacker SFT collection readout (2026-09-02) — the failure distribution is learnable
 
 First `attack_sft` collection, base 8B attacker vs. the full trained defender, 120 episodes over the
@@ -285,9 +323,15 @@ fumbled-finish vs. caught-at-payload (attacker's own error vs. the defender catc
 lessons), and `NEARMISS_FRAMING` currently talks about evading detection, which fits caught-at-payload
 but mis-frames a fumbled finish (an accuracy error, not a detection one).
 
+**Follow-up.** The reflective attacker SFT that followed collapsed (held-out win rate ~21% → 2.3%;
+it memorized a single-file loop). It was redesigned (masking, short directive reasoning) and then
+re-scoped: SFT is no longer a pre-RL bootstrap for the attacker. Current order is **RL first**; SFT
+returns afterwards as a legibility-distillation pass over the model's own reasoning from winning
+rollouts, with a faithfulness check (spec deferred).
+
 ### 4.5 Test suite
 
-426 tests, all offline — no models, no network.
+709 tests, all offline — no models, no network.
 
 ---
 
@@ -379,20 +423,34 @@ NOT to produce a strong exploiter.** The attacker's ceiling is bounded by enviro
 low absolute win rate on the current thin envs is a fact about the environments, not a method failure
 (see §5); do not chase strong exploitation here — that needs Phase 4's environments.
 - ✅ Viability gate passed (§4.6): 8B trainable at ~17%, thinking OFF / 2048 tokens (thinking-6144
-  truncated 29.5% of actions for no win-rate gain — do NOT use it).
-- ✅ Attacker SFT bootstrap built (`attack_sft/`, §4.7): collect wins + anchored near-misses, re-author
-  per-turn reasoning under the grounding gate, SFT, promote only if held-out win rate rises without an
-  effective-rank collapse. This is the attacker half of the ratchet the defender already has.
-- GRPO from the SFT-merged backbone (the `kl=0` construction). First-pass GRPO from *base* stalled at
-  12% (§4.6) — expected, because base had no bootstrap.
+  truncated 29.5% of actions for no win-rate gain — do NOT use it). Re-gate on the current config is
+  owed (§4.6 caveat).
+- Attacker SFT attempted (`attack_sft/`, §4.7), collapsed, redesigned, then re-scoped to a post-RL
+  legibility-distillation pass.
+- **Current experiment: arm 2 vs arm 3** (gating a tree-based Monte-Carlo GRPO). Arm 2 = plain
+  episode-level GRPO (the baseline every later method is judged against). Arm 3 = arm 2 + a
+  deterministic exact-repeat penalty (coef 0.05; still ground-truth, no judge). Compared at **matched
+  generated tokens** (`cum_gen`), trailing-window means, with a pre-registered kill criterion: shelve
+  the tree iff arm 3's stalled rate ≤ arm 2's and arm-3 win rate exceeds arm 2's by ≥3pp with
+  bootstrap-CI lower bound > 0 (details in the local spec
+  `docs/superpowers/specs/2026-10-04-tree-mc-grpo-design.md` §13).
+- **Attacker lineage v3** (fresh checkpoint roots `attacker-grpo-v3-*`): mean-centred advantages
+  (r − mean, no std division — std normalisation amplified one-repeat differences into full-strength
+  gradients; Dr. GRPO), LR 2e-5 to compensate, batched update, and the attacker sees its own last 3
+  outputs in its own prompt (never the defender's view). Earlier lineages (v1 arm-2 iterations, the
+  "stalled at 12%" first pass) are superseded; the 12% result was likely contaminated by the
+  prefix-cache bug (§3).
+- Tree-MC-GRPO design (local spec): forkable episode state, per-edge credit Q(child) − V(parent),
+  driver pruning with no prune penalty, restart-from-state buffer, MAX_TURNS curriculum (12 → 20 → 30
+  keyed to win rate vs the current defender).
 - Offline technique labelling → first diversity graph.
 - Carried from Phase 2: re-run the matched probes once the opponent is adaptive — the first real test
   of whether `policies/prompt_pool.py` removed the fingerprint or only the one we named (watch whether
   the attacker finds a replacement).
-- **Exit:** the SFT→GRPO ratchet demonstrably moves the attacker (loss moves, win rate ticks up,
-  entropy holds, dead groups drop) *and* the collection readout has told us how thin the environments
-  are — the input that orders Phase 4 vs. finishing here. The probe re-run either moves or indicts the
-  monitor per Phase 2's carried deficiency.
+- **Exit (revised):** RL measurably moves the attacker on v3 (win rate up and dead groups down over a
+  trailing window at matched tokens), the arm 2 vs arm 3 result decides whether the tree is built
+  now, and the carried probe re-run is done. The probe re-run either moves or indicts the monitor per
+  Phase 2's carried deficiency.
 
 **Phase 4 — Environment authoring framework and scale-up.** The dominant workstream (§5).
 - **The reusable lever is the *framework*, not hand-built one-offs**: a scenario-authoring abstraction
@@ -419,7 +477,10 @@ requirements make "several rounds" converge instead of oscillate:
 - **Opponent pools, not just the latest checkpoint** (§2.5). Keep the best checkpoint of each round and
   sample opponents from the pool. Without this the defender beats the *latest* attacker while
   forgetting how to beat an older one, and the pair cycles forever. This is the AlphaZero-league fix;
-  it is the mechanism, not a nicety.
+  it is the mechanism, not a nicety. Pools keep the best attacker and defender **per tactic type**
+  (niches from the `leak_attribution` diagnostic; `unattributed` gets its own slot), and **every new
+  defender checkpoint is re-measured on the benign twins (over-refusal) before entering the pool** —
+  a defender that improves by refusing more is the classic collapse.
 - **Benchmarking is a per-round GATE, not a final phase** (see §7). Every alternation emits held-out
   environment transfer, the matched probes (judgment vs. classification), and *attacker-vs-the-base-
   defender* (absolute improvement, not just relative to the current opponent). Non-collapse
@@ -490,15 +551,17 @@ are set before Phase 5 runs.
   work. Mitigations: prompt pools, adaptive attacker, canary randomization, held-out environments.
 - **Degenerate self-play equilibria.** Pools + diversity sampling + plasticity metrics (Phase 5).
 - **Sparse long-horizon credit assignment.** Single-bit leak/no-leak over a multi-turn rollout.
-  Mitigations: short horizons first, partial credit, curriculum from the messy middle.
+  Mitigations: short horizons first, partial credit, curriculum from the messy middle. The planned
+  mitigation is the tree design (per-step credit, restart-from-state; §6 Phase 3).
 - **Benign-set quality is the sleeper variable.** Whether the monitor learns "allow legit / block
   malicious" or "refuse everything" is mostly determined by the benign half. First-class workstream,
   and per §5 it is half the authoring cost.
 - **Known-inert machinery.** The KL anchor is currently negligible (`beta*kl ≈ 6e-5`), and GRPO
   weights all completion tokens equally, putting ~99% of the gradient on prose rather than the verdict
   token. Both are deferred, deliberately, and both should be revisited before Phase 5.
-- **Open:** reward weights beyond the leak > over-refusal invariant; turn-budget schedule; how large a
-  benign set is enough; whether to migrate off the hand-rolled trainer.
+- **Open:** reward weights beyond the leak > over-refusal invariant; turn-budget schedule (draft:
+  MAX_TURNS curriculum in the tree spec); how large a benign set is enough; whether to migrate off
+  the hand-rolled trainer.
 
 ---
 
@@ -511,9 +574,11 @@ collection commits per episode. A unit longer than the mean time between preempt
 progress. Retries can land in the *same* container, so servers and GPU memory must be released in a
 `finally`, not left to teardown.
 
-Budget degrades gracefully: the benchmark half is inference-only and ships at any funding level; a
-single defender or attacker training run is order-\$100s; population self-play across a broad
-environment suite is the expensive tier.
+Budget degrades gracefully: the benchmark half is inference-only and ships at any funding level; after
+the 2026-10 throughput fixes an attacker GRPO iteration costs roughly $0.50–1 on one A100-80GB
+(rollout ~4 min; update under measurement); `--until-iter N` and `--skip-final-update` bound a launch
+for budget-capped runs and resume without lost work; population self-play across a broad environment
+suite is the expensive tier.
 
 ---
 

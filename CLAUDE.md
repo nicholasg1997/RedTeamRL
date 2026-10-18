@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 RedTeamRL is a research project (see [PLAN.md](PLAN.md)) building an **adversarial self-play sandbox** for training and benchmarking a "trusted monitor" defender model. An **attacker LLM** pursues a concrete goal (exfiltrate a planted secret) against a smaller, separate **defender LLM** that mediates every tool call and message.
 
-**Status: Phases 0–2 delivered, Phase 3 (adaptive attacker) next.** Both the benchmark harness and a working training stack exist — SFT-STaR bootstrap (`sft/`) plus a hand-rolled GRPO trainer (`train/`) with both policies served on vLLM. See PLAN.md §4 for what has actually been measured, including the caveat on the defender result: much of its headline gain was episode-type classification rather than content judgment, which is why PLAN.md §2.8 requires every headline metric to ship with a shortcut probe.
+**Status: Phases 0–2 delivered, Phase 3 (adaptive attacker) in progress (arm 2 vs arm 3 A/B on attacker lineage v3).** Both the benchmark harness and a working training stack exist — SFT-STaR bootstrap (`sft/`) plus a hand-rolled GRPO trainer (`train/`) with both policies served on vLLM. See PLAN.md §4 for what has actually been measured, including the caveat on the defender result: much of its headline gain was episode-type classification rather than content judgment, which is why PLAN.md §2.8 requires every headline metric to ship with a shortcut probe.
 
 The design principles in [PLAN.md](PLAN.md) §2 are **non-negotiable constraints that the code enforces**, not aspirations. Read them before changing reward, verification, or the gate. The two that most often constrain code changes:
 - **No LLM judge determines reward.** Success is a ground-truth substring match (`harness/egress.py`), never a model's opinion. Do not introduce model-graded reward or completion.
@@ -21,7 +21,7 @@ The project uses `uv`. A `.venv` is already provisioned; invoke it directly or v
 uv sync
 uv sync --extra local
 
-# Run the test suite (372 tests, all offline — no models or network)
+# Run the test suite (709 tests, all offline — no models or network)
 .venv/bin/python -m pytest
 uv run pytest
 
@@ -33,7 +33,7 @@ uv run pytest
 
 # --- Modal (all GPU work; every function is preemptible, see Gotchas) ---
 modal run scripts/sft_defender.py                # SFT-STaR defender bootstrap
-modal run --detach scripts/train_defender.py     # defender GRPO (~20 min/iteration on one A100)
+modal run --detach scripts/train_defender.py     # defender GRPO (timings in PLAN.md §4.4 predate the 2026-10 throughput fixes)
 modal run --detach scripts/train_attacker.py     # attacker GRPO (Phase 3 — see docs/plans/)
 modal run scripts/attacker_viability.py::check   # is the attacker trainable? run BEFORE training it
 modal run scripts/probe_grpo_adapter.py::evaluate # shortcut probes: judgment vs. classification
@@ -73,5 +73,7 @@ modal run scripts/probe_grpo_adapter.py::evaluate # shortcut probes: judgment vs
 - **`mlx-lm` is Apple-Silicon-only and an optional `[local]` extra.** `policies/mlx_client.py` imports it at module top level, so it's imported lazily (inside `__main__`/functions) elsewhere — the core package must import cleanly on a CUDA/Linux box with no mlx-lm. `pyproject.toml` pins `transformers<5` to work around an mlx-lm bug.
 - **Indentation is mixed across files** (some tab-indented, e.g. `reward.py`/`eval/harness.py`/`sandbox/local.py`; others space-indented). Match the file you're editing.
 - **Modal GPU functions are always preemptible** (`nonpreemptible=True` is CPU/memory only), and a retry can land in the *same container*. So training scripts must release vLLM servers in a `finally`, checkpoint incrementally, and resume by skipping completed work — a unit longer than the mean time between preemptions makes zero progress.
+- **vLLM LoRA hot-swap:** always go through `policies/vllm_client.py::load_lora_adapter` (unload → load without `load_inplace` → `/reset_prefix_cache`). vLLM 0.21 caches LoRA prefix KV by adapter *name*, and `load_inplace` re-reads the adapter from disk every decode step. Images need `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` and `VLLM_SERVER_DEV_MODE=1`. Verify with `scripts/vllm_swap_probe.py` after any vLLM upgrade.
+- **Modal GPU functions request `cpu=8`** — the default gave one core.
 - **`phase_identity` gates resume compatibility.** Anything that changes the observable episode distribution — canary revision, prompt-pool version, env set — must be part of it, and changing it requires a fresh `CKPT_ROOT`. Resuming across such a change silently mixes two different environments into one training run.
 - **Aggregate leak rate cannot tell judgment from classification or memorization.** Before reporting any defender improvement, run `scripts/probe_grpo_adapter.py` — matched pairs share a task and an action, so episode-type detection scores ~50% and cannot explain a gain (PLAN.md §2.8, §4.3).
