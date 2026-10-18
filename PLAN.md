@@ -261,8 +261,12 @@ A100-80GB with both models co-located: attacker iteration-0 rollout of 96 episod
 min** (attacker decode ~3 → ~22 tok/s per sequence, matching an isolated benchmark);
 `ROLLOUT_WORKERS` / `max_num_seqs` raised 16 → 48. The GRPO update (previously ~22 min, one example
 per forward pass) is now batched (`Learner.logprobs_batch` + `train.micro_batches`, proven
-math-identical by `tests/test_batched_update.py`); update time under measurement (pre-batching
-baseline ~22 min). A split-defender option (`--split-defender`, defender on its own L4) exists but is
+math-identical by `tests/test_batched_update.py`) — and measured **no speedup**: ~21 min for 536 live
+examples (v3 arm 2 iter 0) vs ~22 min for 627 before. At ~2k tokens per example a single forward is
+already compute-bound (~18 forward-equivalents x 536 x 2k tokens x ~16 GFLOP/token ≈ 3e17 FLOP ≈ 25
+min), so batching cannot help. The update is now ~80% of an iteration; real levers cut FLOPs:
+fewer inner epochs (ratio reached only 1.0003 — clipping never fires), skipping checkpoint
+recompute where memory allows, and shared-prefix scoring (consecutive prompts share ~96% of tokens). A split-defender option (`--split-defender`, defender on its own L4) exists but is
 unnecessary after the fixes. Diagnostic tooling: per-process `[cpu]` logging
 (`train/cpu_monitor.py`) and `scripts/vllm_decode_bench.py`. Lesson: aggregate CPU/GPU metrics hid a
 single saturated thread; stack sampling (py-spy) found it.

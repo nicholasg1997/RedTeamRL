@@ -253,7 +253,7 @@ class RemoteDefender:
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False):
-    import contextlib, os, sys, tempfile, torch
+    import os, sys, tempfile, torch
     sys.path.insert(0, "/root")
 
     assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
@@ -308,6 +308,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         BENIGN_AGENT_SYSTEM)
     from redteamrl.policies.vllm_client import (
         load_lora_adapter, make_vllm_generate, start_vllm_server, stop_vllm_server)
+    from redteamrl.policies.swap_check import verify_served_adapter
     from redteamrl.sandbox.shell import LocalShellSandbox
     from redteamrl.policies.prompt_pool import (
         DEFENDER_STYLES, PROMPT_POOL_VERSION, select_style)
@@ -439,60 +440,21 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         if _last_serve_dir["path"] is not None:
             shutil.rmtree(_last_serve_dir["path"], ignore_errors=True)
         _last_serve_dir["path"] = serve_dir
-        probe_system, probe_user = "You are an agent.", "Reply with one short JSON object."
-        served = VLLMCapturingGenerate(
-            base_url=f"http://localhost:{ATK_PORT}", model="attacker", tokenizer=tok,
-            temperature=0.0, max_new_tokens=32,
-        )(probe_system, [{"role": "user", "content": probe_user}])
-        probe_prompt = tok.apply_chat_template(
-            [{"role": "system", "content": probe_system},
-             {"role": "user", "content": probe_user}],
-            add_generation_prompt=True, enable_thinking=False, tokenize=False)
-        ids = tok(probe_prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
-        model.eval()
-        # prepare_for_long_context_training set use_cache=False for checkpointing. Generating
-        # WITHOUT the KV cache recomputes the whole forward each step: same arithmetic in theory,
-        # different kernels in practice, and greedy argmax flips on near-tied logits -- after which
-        # every later token diverges. This is a no_grad diagnostic, so checkpointing is a no-op
-        # here and the cache is safe to restore for it.
-        cached = getattr(model.config, "use_cache", None)
-
-        def _greedy(with_adapter):
-            ctx = contextlib.nullcontext() if with_adapter else model.disable_adapter()
-            with torch.no_grad(), ctx:
-                out = model.generate(**ids, do_sample=False, max_new_tokens=32)
-            return tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-
-        try:
-            # prepare_for_long_context_training set use_cache=False for checkpointing. Generating
-            # without the KV cache recomputes the whole forward each step -- same arithmetic in
-            # theory, different kernels in practice. This is a no_grad diagnostic, so checkpointing
-            # is a no-op here and the cache is safe to restore for it.
-            model.config.use_cache = True
-            local = _greedy(with_adapter=True)
-            # Only computed when the check fails: is vLLM serving the BASE policy? That is the
-            # difference between "the swap silently no-opped" (fatal -- rollouts would come from a
-            # policy that is not being trained) and "two inference stacks diverged on a near-tied
-            # logit" (benign -- vLLM generates, HF re-scores, and GRPO measured ratio=1.000).
-            base = _greedy(with_adapter=False) if served.strip() != local else None
-        finally:
-            if cached is not None:
-                model.config.use_cache = cached
-
-        if served.strip() != local:
-            shared = len(os.path.commonprefix([served.strip(), local]))
-            if served.strip() == base:
-                raise RuntimeError(
-                    f"[{tag}] vLLM is serving the BASE policy -- the adapter swap did not take, so "
-                    f"rollouts would come from a model that is not the one being trained.\n"
-                    f"  vLLM greedy: {served.strip()[:160]!r}\n"
-                    f"  HF+adapter : {local[:160]!r}\n"
-                    f"  HF base    : {base[:160]!r}")
-            print(f"[{tag}] WARNING: vLLM and HF greedy diverge after {shared} chars, but vLLM is "
-                  f"NOT serving the base policy -- the adapter DID load. Treating as numeric "
-                  f"divergence between the two stacks.\n"
-                  f"  vLLM: {served.strip()[:120]!r}\n  HF  : {local[:120]!r}", flush=True)
-        print(f"[{tag}] served policy verified against the trainer", flush=True)
+        # Verify vLLM against ITSELF (policies/swap_check.py): the served name must match a fresh,
+        # never-cached load of the same file. The old vLLM-vs-HF greedy comparison raised "serving
+        # the BASE policy" on a working swap (v3 arm 2 iter 0: "I'm" vs "I am", ratio=1.000) --
+        # after a small update the adapter is ~base and two stacks break near-ties differently.
+        check_prompts = [
+            tok.apply_chat_template([{"role": "system", "content": "You are an agent."},
+                                     {"role": "user", "content": u}],
+                                    add_generation_prompt=True, enable_thinking=False,
+                                    tokenize=False)
+            for u in ("Reply with one short JSON object.", "List the files you would inspect first.",
+                      "State your next action in one sentence.")]
+        d = verify_served_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir,
+                                  ATTACKER_MODEL, check_prompts)
+        print(f"[{tag}] served policy verified (served vs fresh load {d['served_vs_fresh']:.4f}; "
+              f"adapter moved {d['fresh_vs_base']:.4f} from base)", flush=True)
 
     # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
     # 6144, but this is an 8B: it does not close its think block inside that budget, and the
