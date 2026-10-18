@@ -37,6 +37,24 @@ class Learner:
 		targets = torch.tensor(completion_ids, device=self.model.device)
 		return logp.gather(1, targets.unsqueeze(1)).squeeze(1)
 
+	@contextlib.contextmanager
+	def no_checkpointing(self):
+		"""Temporarily store activations instead of recomputing them in backward.
+
+		`prepare_for_long_context_training` enables checkpointing for 15k-token sequences; at ~2k
+		tokens a small micro-batch's activations fit, and skipping the recompute saves ~25% of an
+		epoch. The graph and the math are unchanged. Restores the previous state even on error."""
+		model = self.model
+		was_on = bool(getattr(model, "is_gradient_checkpointing", False))
+		if was_on:
+			model.gradient_checkpointing_disable()
+		try:
+			yield
+		finally:
+			if was_on:
+				model.gradient_checkpointing_enable(
+					gradient_checkpointing_kwargs={"use_reentrant": False})
+
 	def logprobs_batch(self, pairs: list[tuple[list[int], list[int]]],
 	                   use_adapter: bool, with_grad: bool) -> list[torch.Tensor]:
 		"""`logprobs` for several (prompt, completion) pairs in ONE forward pass.

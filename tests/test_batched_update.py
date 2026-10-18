@@ -105,3 +105,60 @@ def test_mean_centred_advantages_keep_reward_units():
     assert max(abs(x) for x in normed) > 1.5
     assert max(abs(x) for x in centred) < 0.05
     assert group_advantages([0.2] * 4, ["t"] * 4, normalize_std=False) == [0.0] * 4   # still dead
+
+
+def test_skipping_checkpoint_recompute_changes_nothing_but_speed():
+    from redteamrl.train.learner import prepare_for_long_context_training
+    a, b = _tiny_model(), _tiny_model()
+    for m in (a, b):
+        prepare_for_long_context_training(m)
+    la = Learner(a, None, torch.optim.SGD(a.parameters(), lr=0.1))
+    lb = Learner(b, None, torch.optim.SGD(b.parameters(), lr=0.1))
+    ma = update_step(la, _examples(), beta=0.04, inner_epochs=2)                  # recompute
+    mb = update_step(lb, _examples(), beta=0.04, inner_epochs=2,
+                     no_checkpoint_max_tokens=4096)                               # store
+    assert mb["epoch_ratios"] == pytest.approx(ma["epoch_ratios"], abs=1e-5)
+    for pa, pb in zip(a.parameters(), b.parameters()):
+        torch.testing.assert_close(pb, pa, atol=1e-5, rtol=1e-4)
+    assert b.is_gradient_checkpointing      # restored for the long sequences that need it
+
+
+def test_no_checkpointing_restores_state_on_error():
+    from redteamrl.train.learner import prepare_for_long_context_training
+    model = prepare_for_long_context_training(_tiny_model())
+    learner = Learner(model, None, None)
+    with pytest.raises(ValueError):
+        with learner.no_checkpointing():
+            assert not model.is_gradient_checkpointing
+            raise ValueError("boom")
+    assert model.is_gradient_checkpointing
+
+
+def test_behaviour_logprobs_come_from_epoch_zero_without_drift():
+    # old_lp is captured from epoch 0's forward instead of a separate pass: epoch 0's ratio must
+    # be exactly 1 and later epochs must still move it (the trust region is live).
+    model = _tiny_model()
+    learner = Learner(model, None, torch.optim.SGD(model.parameters(), lr=0.5))
+    m = update_step(learner, _examples(), beta=0.0, inner_epochs=3)
+    assert m["epoch_ratios"][0] == pytest.approx(1.0, abs=1e-7)
+    assert abs(m["epoch_ratios"][-1] - 1.0) > 1e-4
+
+
+def test_checkpoint_skipping_actually_engages():
+    # Regression: micro_batches packs to max_batch_tokens, so without capping batches at the
+    # skip threshold almost no batch qualifies and the ~25% saving is silently zero.
+    model = _tiny_model()
+
+    class _Counting(Learner):
+        entered = 0
+
+        @contextlib.contextmanager
+        def no_checkpointing(self):
+            _Counting.entered += 1
+            yield
+
+    learner = _Counting(model, None, torch.optim.SGD(model.parameters(), lr=0.1))
+    update_step(learner, _examples(), beta=0.0, inner_epochs=2, max_batch_tokens=16384,
+                no_checkpoint_max_tokens=16)        # every example is <= 16 tokens alone
+    assert _Counting.entered == 2 * len(micro_batches(_examples(), 16, 4096))
+    assert _Counting.entered > 0

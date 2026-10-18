@@ -43,8 +43,8 @@ N_ITERS = 20
 # 1-win-in-8 group's winner advantage 2.65 -> 1.18 (~2.2x), which at 1e-5 would quietly halve
 # the step on the win signal. Doubling restores it there, while repeat-only groups (std ~0.02-0.1)
 # now step ~20-50x smaller -- the intended effect. The ratio sat at ~0.998 after 4 epochs, far
-# from the 0.2 clip, so there is headroom.
-LR = 2e-5
+# from the 0.2 clip, so there is headroom. 3e-5 (2026-10-18) with INNER_EPOCHS 4 -> 2.
+LR = 3e-5
 # 0.7 is what attacker_viability measured 16.7% at (make_vllm_generate's default). 1.0 was
 # chosen to buy within-group variance, but it bought the opposite: iteration 0 came back
 # 100% dead groups at a 0% win rate. Exploration you cannot convert into a win is not
@@ -53,7 +53,16 @@ TEMP = 0.7
 BETA = 0.04             # KL weight against the frozen reference
 CLIP_EPS = 0.2          # PPO trust region; only bites once inner epochs move the ratio
 # Gradient steps per rollout batch; see train_defender.py. Watch `epoch_ratios` for clip saturation.
-INNER_EPOCHS = 4
+# 2, not 4 (2026-10-18): the update is compute-bound (~21 min, ~80% of an iteration) and at 4 epochs
+# the ratio reached only 1.0003 -- nowhere near the 0.2 clip -- so epochs 3-4 were small repeat
+# steps. Two epochs at a higher LR cover similar ground for ~half the update compute.
+INNER_EPOCHS = 2
+# Micro-batches up to this many padded tokens skip activation checkpointing (store activations
+# instead of recomputing them in backward, ~25% of an epoch). ~2.7 MB/token of activations for the
+# 8B across 36 layers -> ~11 GB at 4096 tokens, inside the trainer's ~15 GB of headroom beside both
+# vLLM engines. Larger batches (and single long sequences) keep checkpointing. Set 0 if an update
+# OOMs: the rollout is banked and replays for free.
+NO_CHECKPOINT_MAX_TOKENS = 4096
 MAX_TURNS = 12
 REDACTION_ENFORCEMENT = "unshielded"  # the attacker must receive exploitable policy mistakes
 DEF_PORT = 8000
@@ -159,8 +168,10 @@ ADVANTAGE_STD_NORMALIZE = False
 # checkpoint chain trained under different rules (phase_identity would refuse it anyway; a fresh
 # root makes it a clean start instead of an error). v1 = std-normalised advantages (arm 2 iters
 # 0-1, arm 3 iter-0 rollout). v2 = mean-centred advantages + batched update. v3 = the attacker
-# sees its own last ATTACKER_HISTORY_TURNS raw outputs in its prompt.
-LINEAGE = "v3"
+# sees its own last ATTACKER_HISTORY_TURNS raw outputs in its prompt. v4 = 2 inner epochs, LR 3e-5,
+# old_lp taken from epoch 0, checkpoint recompute skipped for small micro-batches, and the update
+# hyperparameters (inner_epochs, beta, clip_eps) are now in phase_identity.
+LINEAGE = "v4"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -513,6 +524,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "path_normalised": PATH_NORMALISED,
         "advantage_std_normalized": ADVANTAGE_STD_NORMALIZE,
         "attacker_history_turns": ATTACKER_HISTORY_TURNS,
+        # Update hyperparameters: changing any of them changes the algorithm, so a resume across
+        # one would silently continue a chain trained under different rules.
+        "inner_epochs": INNER_EPOCHS, "beta": BETA, "clip_eps": CLIP_EPS,
         "lineage": LINEAGE,
     }
     if split_defender:
@@ -666,7 +680,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 
         model.train()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
-                        inner_epochs=INNER_EPOCHS)
+                        inner_epochs=INNER_EPOCHS,
+                        no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS)
         # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish
         # "the gradient is tiny, raise LR" from "the gradient is fine, we need more steps" --
         # ratio alone cannot, and this script was silently dropping both.

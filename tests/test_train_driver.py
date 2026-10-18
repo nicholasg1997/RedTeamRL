@@ -192,8 +192,10 @@ def test_behaviour_policy_and_reference_are_computed_once_not_per_epoch():
 
     update_step(learner, live, beta=0.0, inner_epochs=3)
 
-    assert learner.calls["old"] == len(live)      # once, not len(live) * 3
-    assert learner.calls["ref"] == len(live)
+    # old_lp is captured from epoch 0's forward (no step has happened yet, so those weights ARE the
+    # behaviour policy) -- no separate pass, and never re-captured in later epochs.
+    assert learner.calls["old"] == 0
+    assert learner.calls["ref"] == len(live)      # once, not len(live) * 3
     assert learner.calls["new"] == len(live) * 3  # the only per-epoch forward pass
 
 

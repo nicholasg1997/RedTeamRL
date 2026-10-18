@@ -265,7 +265,7 @@ def micro_batches(examples: list[Example], max_tokens: int, max_logit_rows: int)
 
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2,
                 inner_epochs: int = 1, max_batch_tokens: int = 16384,
-                max_batch_logit_rows: int = 4096) -> dict:
+                max_batch_logit_rows: int = 4096, no_checkpoint_max_tokens: int = 0) -> dict:
 	"""GRPO update: `inner_epochs` gradient steps over ONE batch of rollouts.
 
 	Generation dominates cost — a rollout is hours, an optimizer step is seconds. Taking a single
@@ -295,12 +295,16 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	decisions_per_episode = Counter(example.episode_id for example in live)
 	n_episodes = len(decisions_per_episode)
 
-	# Freeze the behaviour policy and the reference before any weights move. CLONE, not just
-	# detach: a learner whose no-grad path returns a view of its parameters would otherwise leave
-	# these aliasing live storage, so the optimizer step would silently mutate "old_lp", re-pin
-	# the ratio at 1.0, and remove the trust region without any visible error.
+	# The reference is frozen before any weights move; the behaviour policy is captured in epoch 0
+	# (below). Both are CLONED: a no-grad path returning a view of the parameters would otherwise
+	# alias live storage and let the optimizer step mutate them silently.
 	batched = hasattr(learner, "logprobs_batch")
-	batches = (micro_batches(live, max_batch_tokens, max_batch_logit_rows) if batched
+	# When checkpoint-skipping is on, cap batches at its threshold: otherwise micro_batches packs to
+	# max_batch_tokens and almost no batch is small enough to skip -- the saving would silently be
+	# zero. Smaller batches cost nothing here; the update is compute-bound at ~2k tokens/example.
+	token_cap = (min(max_batch_tokens, no_checkpoint_max_tokens) if no_checkpoint_max_tokens > 0
+	             else max_batch_tokens)
+	batches = (micro_batches(live, token_cap, max_batch_logit_rows) if batched
 	           else [[i] for i in range(len(live))])
 
 	def score(indices, use_adapter, with_grad):
@@ -312,25 +316,48 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 			[(live[i].prompt_ids, live[i].completion_ids) for i in indices],
 			use_adapter=use_adapter, with_grad=with_grad)
 
-	frozen: list = [None] * len(live)
+	# Only the REFERENCE needs its own pass. The behaviour policy's log-probs (`old_lp`) are taken
+	# from epoch 0's forward instead: no optimizer step happens until epoch 0 has scored every
+	# micro-batch, so its weights ARE the behaviour policy and the values are identical by
+	# construction (ratio exactly 1 at epoch 0, as before). Saves one forward per example.
+	ref: list = [None] * len(live)
+	old: list = [None] * len(live)
 	for indices in batches:
-		for i, old_lp, ref_lp in zip(indices, score(indices, True, False),
-		                             score(indices, False, False)):
-			frozen[i] = (old_lp.detach().clone(), ref_lp.detach().clone())
+		for i, ref_lp in zip(indices, score(indices, False, False)):
+			ref[i] = ref_lp.detach().clone()
+
+	def padded_tokens(indices):
+		return len(indices) * max(len(live[i].prompt_ids) + len(live[i].completion_ids)
+		                          for i in indices)
+
+	def score_with_grad(indices):
+		"""Skip activation checkpointing for micro-batches small enough to hold their activations:
+		checkpointing re-runs the forward during backward (~25% of an epoch) and exists for 15k-token
+		sequences. Same graph, same math -- only what is stored vs recomputed changes."""
+		skip = (no_checkpoint_max_tokens > 0 and hasattr(learner, "no_checkpointing")
+		        and padded_tokens(indices) <= no_checkpoint_max_tokens)
+		if not skip:
+			return score(indices, True, True)
+		with learner.no_checkpointing():
+			return score(indices, True, True)
 
 	epoch_ratios = []
 	total_loss = grad_norm = 0.0
 	kls = []
-	for _ in range(inner_epochs):
+	for epoch in range(inner_epochs):
 		learner.optimizer.zero_grad()
 		ratios = []
 		kls = []
 		total_loss = 0.0
 		for indices in batches:
 			batch_loss = 0.0
-			for i, new_lp in zip(indices, score(indices, True, True)):
+			for i, new_lp in zip(indices, score_with_grad(indices)):
 				example = live[i]
-				old_lp, ref_lp = frozen[i]
+				if epoch == 0:
+					# CLONE, not just detach: a view would alias live storage, so the optimizer step
+					# would silently mutate old_lp, re-pin the ratio at 1, and remove the trust region.
+					old[i] = new_lp.detach().clone()
+				old_lp, ref_lp = old[i], ref[i]
 				mask = torch.ones_like(new_lp)
 				loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta,
 				                    clip_eps)
