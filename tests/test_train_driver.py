@@ -224,3 +224,23 @@ def test_single_inner_epoch_is_unchanged():
 def test_inner_epochs_must_be_positive():
     with pytest.raises(ValueError, match="inner_epochs"):
         update_step(_TrackingLearner(), _live(), inner_epochs=0)
+
+
+def test_distinct_group_keys_are_not_pooled():
+    # A restart group and a fresh group of the SAME task must never share a baseline: their
+    # episodes began in different states, so pooling would reward the lucky start.
+    exs = [
+        Example([1], [2], task_id="T", episode_id=0, reward=1.0, group_key="T#fresh"),
+        Example([1], [3], task_id="T", episode_id=1, reward=-1.0, group_key="T@restart"),
+    ]
+    assign_advantages(exs, normalize_std=False)
+    assert all(e.advantage == 0.0 for e in exs)        # each is a one-episode (dead) group
+
+
+def test_default_group_key_still_pools_by_task():
+    exs = [
+        Example([1], [2], task_id="T", episode_id=0, reward=1.0),
+        Example([1], [3], task_id="T", episode_id=1, reward=-1.0),
+    ]
+    assign_advantages(exs, normalize_std=False)
+    assert exs[0].advantage > 0 > exs[1].advantage

@@ -13,6 +13,9 @@ class Example:
 	advantage: float = 0.0
 	verdicts: list[dict[str, str]] = field(default_factory=list)
 	episode_type: str = ""
+	# GRPO baseline group. "" means "the task" (every pre-v5 caller); restart groups set their own so
+	# episodes that began in different states never share a baseline. task_id stays the reporting key.
+	group_key: str = ""
 	policy_leak: bool = False
 	complete: bool = False
 	defender_protocol_failures: int = 0

@@ -230,7 +230,7 @@ def assign_advantages(examples: list[Example], normalize_std: bool = True) -> No
 
 	for example in examples:
 		ep_reward[example.episode_id] = example.reward
-		ep_task[example.episode_id] = example.task_id
+		ep_task[example.episode_id] = example.group_key or example.task_id
 
 	ep_ids = list(ep_reward)
 	adv = group_advantages([ep_reward[i] for i in ep_ids], [ep_task[i] for i in ep_ids],
