@@ -72,7 +72,8 @@ def test_eviction_drops_entries_older_than_the_cap():
     bank = StartStateBank(None)
     bank.add(_entry("old", iteration=1))
     bank.add(_entry("fresh", iteration=6))
-    bank.evict_older_than(current_iter=7, max_age=5)
+    evicted = bank.evict_older_than(current_iter=7, max_age=5)
+    assert [e.entry_id for e in evicted] == ["old"]
     assert {e.entry_id for e in bank.entries()} == {"fresh"}
 
 

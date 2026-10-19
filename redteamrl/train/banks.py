@@ -83,7 +83,9 @@ class StartStateBank:
             os.replace(final + ".tmp", final)
         return True
 
-    def evict_older_than(self, current_iter: int, max_age: int) -> int:
+    def evict_older_than(self, current_iter: int, max_age: int) -> list[BankEntry]:
+        """Drop entries older than `max_age` iterations; returns them so the caller can delete the
+        persisted records they point at."""
         stale = [e for e in self._entries.values() if current_iter - e.iteration > max_age]
         for entry in stale:
             del self._entries[entry.entry_id]
@@ -92,7 +94,7 @@ class StartStateBank:
                     os.remove(os.path.join(self.directory, f"{entry.entry_id}.json"))
                 except OSError:
                     pass
-        return len(stale)
+        return stale
 
     def distinct_routes(self, levels: set[int] | None = None) -> int:
         return len({e.route_signature for e in self._eligible(levels)})
