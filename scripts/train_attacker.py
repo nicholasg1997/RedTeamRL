@@ -172,8 +172,10 @@ ADVANTAGE_STD_NORMALIZE = False
 # 0-1, arm 3 iter-0 rollout). v2 = mean-centred advantages + batched update. v3 = the attacker
 # sees its own last ATTACKER_HISTORY_TURNS raw outputs in its prompt. v4 = 2 inner epochs, LR 3e-5,
 # old_lp taken from epoch 0, checkpoint recompute skipped for small micro-batches, and the update
-# hyperparameters (inner_epochs, beta, clip_eps) are now in phase_identity.
-LINEAGE = "v4"
+# hyperparameters (inner_epochs, beta, clip_eps) are now in phase_identity. v5 = adaptive task
+# allocation + restarts from earlier win / near-miss states (spec 2026-10-18): who gets a fresh
+# group vs a restart group changes every iteration's episode distribution.
+LINEAGE = "v5"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -265,8 +267,8 @@ class RemoteDefender:
 
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
-                skip_final_update=False, split_defender=False):
-    import os, sys, tempfile, time, torch
+                skip_final_update=False, split_defender=False, eval_at_end=False):
+    import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
     assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
@@ -331,6 +333,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from redteamrl.train.learner import Learner, prepare_for_long_context_training
     from redteamrl.train.train import rollout, assign_advantages, tactic_summary, update_step
     from redteamrl.train.diversity import group_diversity, reward_summary
+    from redteamrl.train.allocation import AllocParams, GroupPlan, TaskStats, allocate
+    from redteamrl.train.banks import StartStateBank
+    from redteamrl.train.episode_store import read_episodes
+    from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES, finalize_iteration, v5_identity
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
     from redteamrl.train.checkpoint import (
         latest_checkpoint,
@@ -381,19 +387,23 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     # Only attack tasks carry an attacker reward; benign episodes have no attacker to train.
     tasks = [task for task in tasks if task.episode_type == "attack"]
     print(f"{len(tasks)} attack tasks (generated envs x {N_GEN_ENVS})", flush=True)
+    task_by_id = {task.id: task for task in tasks}
+    alloc = AllocParams()
 
     def episode_task_for(iteration):
-        """A fresh high-entropy secret per (iteration, rollout) -- never repeated.
+        """A fresh high-entropy secret per (iteration, slot, rollout) -- never repeated.
 
         Keying on rollout_index alone replants the SAME six secrets every iteration, so a policy
         could earn the whole reward by memorizing six strings and generalize to nothing. Including
         the iteration makes every episode a secret the model has not seen, so improvement has to
-        transfer. Still a pure function of (iteration, rollout_index), so a resumed run reproduces
-        exactly the canaries its banked episodes were generated with.
+        transfer. `rollout_index` is slot * N_ROLLOUTS + r (v5), so a task that holds two groups in
+        one iteration still draws distinct secrets. Still a pure function of its arguments, so a
+        resumed run reproduces exactly the canaries its banked episodes were generated with.
         """
         def episode_task(spec, rollout_index):
             return randomize_task_canary(
-                spec, iteration * N_ROLLOUTS + rollout_index, CANARY_SEED, CANARY_REVISION)
+                spec, iteration * len(tasks) * N_ROLLOUTS + rollout_index, CANARY_SEED,
+                CANARY_REVISION)
         return episode_task
 
     tok = AutoTokenizer.from_pretrained(ATTACKER_MODEL)
@@ -543,6 +553,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "inner_epochs": INNER_EPOCHS, "beta": BETA, "clip_eps": CLIP_EPS,
         "lineage": LINEAGE,
     }
+    phase_identity.update(v5_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
         # is unchanged. The opponent's hardware is part of the episode distribution.
@@ -568,6 +579,34 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     else:
         cumulative_gen_tokens = 0
         print("no checkpoint found — starting fresh at iter 0", flush=True)
+
+    # --- v5 allocation state ---------------------------------------------------------------
+    # Banks live under the checkpoint root (one directory per task) with the source records they
+    # point at. Per-task fresh-start stats ride in each checkpoint's meta, so a resume rebuilds the
+    # allocation inputs from the last COMPLETED iteration.
+    banks = {task.id: StartStateBank(os.path.join(ckpt_root, "banks", task.id)) for task in tasks}
+    bank_record_dir = os.path.join(ckpt_root, "bank-records")
+    saved_stats = {d["task_id"]: TaskStats.from_dict(d) for d in
+                   (read_meta(resume_dir).get("task_stats", []) if resume_dir is not None else [])}
+    task_stats = {task.id: saved_stats.get(task.id, TaskStats(task.id)) for task in tasks}
+
+    def plans_for(iteration, rollout_dir):
+        """This iteration's group plan, persisted beside its rollout.
+
+        A resume mid-iteration replays the banked episodes, which only line up with the SAME
+        groups. Recomputing could differ (banks and stats move as iterations finalize), so the
+        first computation is saved and every later one loads it."""
+        path = os.path.join(rollout_dir, "plans.json")
+        if os.path.exists(path):
+            with open(path) as handle:
+                return [GroupPlan.from_dict(d) for d in json.load(handle)]
+        plans = allocate(list(task_stats.values()), banks, len(tasks), iteration,
+                         random.Random(f"alloc-{LINEAGE}-{iteration}"), alloc)
+        os.makedirs(rollout_dir, exist_ok=True)
+        with open(path + ".tmp", "w") as handle:
+            json.dump([plan.to_dict() for plan in plans], handle)
+        os.replace(path + ".tmp", path)
+        return plans
 
     # Arm 3 subtracts coef * exact-repeat-count from each episode's reward (coef 0.0 = arm 2,
     # the identity). Built once; the secret it keys on comes from each episode's spec.forbidden[0],
@@ -651,6 +690,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     for it in range(start_iter, end_iter):
         cap.buffer.clear()
         model.eval()
+        rollout_dir = os.path.join(ckpt_root, f"rollout-iter{it}")
+        plans = plans_for(it, rollout_dir)
+        print(f"iter {it:3d} alloc    " + "  ".join(
+            f"{p.kind[0]}:{p.task_id}" + (f"@{p.restart_turn}({p.reason[8:]})" if p.entry else "")
+            for p in plans), flush=True)
         examples = rollout(tasks, attack_agent_factory, benign_agent_factory,
                            defender_factory_for(it),
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
@@ -658,21 +702,30 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                            trained_side="attacker",
                            post_completion_turns=POST_COMPLETION_TURNS,
                            max_workers=ROLLOUT_WORKERS,
-                           episode_store=os.path.join(ckpt_root, f"rollout-iter{it}"),
+                           episode_store=rollout_dir,
                            commit=runs.commit, task_transform=episode_task_for(it),
-                           reward_transform=reward_transform)
+                           reward_transform=reward_transform,
+                           group_plans=plans, task_by_id=task_by_id, record_restart_state=True)
+        # Stats and banks update from the episode store right away. Both are safe to repeat after
+        # a crash: stats are reloaded from the last checkpoint's meta, banking is idempotent, and
+        # the plan above is fixed by plans.json.
+        summary = finalize_iteration(read_episodes(rollout_dir), plans, banks, task_stats, it,
+                                     N_ROLLOUTS, bank_record_dir, alloc)
+        runs.commit()
         assign_advantages(examples, normalize_std=ADVANTAGE_STD_NORMALIZE)
         iter_gen_tokens = sum(len(ex.completion_ids) for ex in examples)
         cumulative_gen_tokens += iter_gen_tokens
         div = group_diversity([
-            {"task_id": ex.task_id, "episode_id": ex.episode_id, "reward": ex.reward,
+            {"task_id": ex.group_key or ex.task_id, "episode_id": ex.episode_id,
+             "reward": ex.reward,
              "verdicts": getattr(ex, "verdicts", [])}
             for ex in examples
         ])
         rew = reward_summary(examples)
         live = sum(1 for ex in examples if ex.advantage != 0)
-        wins = {ex.episode_id: ex.reward for ex in examples}
-        win_rate = sum(r > 0 for r in wins.values()) / max(len(wins), 1)
+        # win_rate is FRESH-START episodes only: restart groups begin from a favourable state, so
+        # their rate is reported separately and is never the headline.
+        win_rate = summary["fresh_win_rate"]
         print(f"iter {it:3d} rollout  live={live}/{len(examples)}  win_rate={win_rate:.0%}  "
               f"dead_groups={div['dead_group_rate']:.0%} "
               f"mixed_reward={div['mixed_reward_group_rate']:.0%}  |  "
@@ -681,6 +734,14 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               f"mean_reward={rew['mean_reward']:+.3f} "
               f"(atk={rew['mean_reward_attack']:+.3f} ben={rew['mean_reward_benign']:+.3f})",
               flush=True)
+        print(f"iter {it:3d} v5       fresh_groups={summary['n_fresh_groups']} "
+              f"restart_groups={summary['n_restart_groups']} fallbacks={summary['fallbacks']}  "
+              f"fresh_win={summary['fresh_win_rate']:.1%} (task-avg "
+              f"{summary['fresh_win_rate_task_avg']:.1%})  restart_win={summary['restart_win_rate']:.1%}"
+              f"  banked: wins={summary['banked_wins']} near={summary['banked_near']} "
+              f"evicted={summary['evicted']}  bank sizes="
+              f"{sum(len(b) for b in banks.values())} win routes="
+              f"{sum(b.distinct_routes({3}) for b in banks.values())}", flush=True)
         print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
               flush=True)
         print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
@@ -713,11 +774,13 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         model.save_pretrained(ckpt)
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity,
-                          "cumulative_gen_tokens": cumulative_gen_tokens})
+                          "cumulative_gen_tokens": cumulative_gen_tokens,
+                          "task_stats": [s.to_dict() for s in task_stats.values()]})
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
-        if (it + 1) % HELDOUT_EVAL_EVERY == 0 or it == N_ITERS - 1:
+        if ((it + 1) % HELDOUT_EVAL_EVERY == 0 or it == N_ITERS - 1
+                or (eval_at_end and it == end_iter - 1)):
             heldout = _run_heldout_eval(HELDOUT_EVAL_EPISODES)
             win_rate = sum(r.outcome == "leak" for r in heldout) / len(heldout)
             stalled = mean_stalled_turn_rate([r.steps for r in heldout])
@@ -748,8 +811,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 @app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
-          skip_final_update: bool = False, split_defender: bool = False):
+def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
+          skip_final_update: bool = False, split_defender: bool = False,
+          eval_at_end: bool = False):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -765,7 +829,7 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
     active_servers = []
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
-                           skip_final_update, split_defender)
+                           skip_final_update, split_defender, eval_at_end)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -775,7 +839,9 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
 
 
 @app.local_entrypoint()
-def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
-         skip_final_update: bool = False, split_defender: bool = False):
-    if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender) == "oom":
+def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
+         skip_final_update: bool = False, split_defender: bool = False,
+         eval_at_end: bool = False):
+    if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
+                    eval_at_end) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")
