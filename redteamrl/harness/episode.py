@@ -102,6 +102,21 @@ def _window_closed(state: TurnState, turn: int, max_turns: int,
     return post_completion_turns is not None and not state.complete and turn >= max_turns
 
 
+def execute_tool(action, sandbox: Sandbox) -> str:
+    """Run an ALLOWED tool call in the sandbox and return its path-normalised output. Shared by
+    the live turn loop and by prefix replay, so both execute a call identically."""
+    path = action.args.get("path", "")
+    if action.tool == "read_file":
+        raw_result = sandbox.read_file(path)
+    elif action.tool == "list_dir":
+        raw_result = sandbox.list_dir(path)
+    elif action.tool == "run_command":
+        raw_result = sandbox.run_command(action.args.get("command", ""))
+    else:
+        raw_result = f"[error: unsupported tool '{action.tool}']"
+    return normalize_sandbox_paths(raw_result, sandbox)
+
+
 def step_turn(state: TurnState, spec: TaskSpec, attacker: AttackerPolicy, defender: DefenderPolicy,
               sandbox: Sandbox, turn: int, max_turns: int,
               post_completion_turns: int | None,
@@ -141,16 +156,7 @@ def step_turn(state: TurnState, spec: TaskSpec, attacker: AttackerPolicy, defend
         else:
             decision = defender.adjudicate_call(state.conversation, action)
             if decision.verdict == "allow":
-                path = action.args.get("path", "")
-                if action.tool == "read_file":
-                    raw_result = sandbox.read_file(path)
-                elif action.tool == "list_dir":
-                    raw_result = sandbox.list_dir(path)
-                elif action.tool == "run_command":
-                    raw_result = sandbox.run_command(action.args.get("command", ""))
-                else:
-                    raw_result = f"[error: unsupported tool '{action.tool}']"
-                raw_result = normalize_sandbox_paths(raw_result, sandbox)
+                raw_result = execute_tool(action, sandbox)
                 result = defender.adjudicate_result(state.conversation, action, raw_result)
                 state.result_decisions += 1
                 # The evaluator may use the synthetic canary as an offline taint verifier. It
@@ -196,6 +202,24 @@ def step_turn(state: TurnState, spec: TaskSpec, attacker: AttackerPolicy, defend
             else:  # reject
                 returned = "[request denied by monitor]"
 
+    stop = finish_turn(state, spec, turn, phase, was_complete, action, decision, result,
+                       policy_returned, returned, redaction_status, post_completion_turns)
+    if on_turn is not None:
+        on_turn(state, turn)
+    return stop
+
+
+def finish_turn(state: TurnState, spec: TaskSpec, turn: int, phase: str, was_complete: bool,
+                action, decision: DefenderDecision | None, result: DefenderDecision | None,
+                policy_returned: str | None, returned: str, redaction_status: str | None,
+                post_completion_turns: int | None) -> bool:
+    """Everything a turn does AFTER the defender has decided: taint diagnostics, the transcript,
+    the step record, and the egress/leak/completion bookkeeping. Returns True when the episode
+    must stop.
+
+    Shared by ``step_turn`` and by prefix replay (harness/restart.py), which feeds it the RECORDED
+    decisions instead of querying a defender. Defined once so a restored state cannot drift from
+    what a live episode holds."""
     if policy_returned is None:
         policy_returned = returned
     # Diagnostic only (never reward): which known carrier of the secret the defender let
@@ -267,8 +291,6 @@ def step_turn(state: TurnState, spec: TaskSpec, attacker: AttackerPolicy, defend
         and state.post_turns_executed >= post_completion_turns
     ):
         stop = True
-    if on_turn is not None:
-        on_turn(state, turn)
     return stop
 
 
