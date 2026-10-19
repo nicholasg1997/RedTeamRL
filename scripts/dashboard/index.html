@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.31.1/plotly.min.js"></script>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --border: #e2e2e0;
+    --grid: #ececea; --accent: #2f6fde;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141416; --panel: #1c1c1f; --text: #ececee; --muted: #9a9aa2; --border: #2c2c31;
+      --grid: #2a2a2f; --accent: #6ea1ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141416; --panel: #1c1c1f; --text: #ececee; --muted: #9a9aa2; --border: #2c2c31;
+    --grid: #2a2a2f; --accent: #6ea1ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 12px;
+           align-items: center; padding: 12px 16px; background: var(--bg);
+           border-bottom: 1px solid var(--border); }
+  h1 { font-size: 16px; margin: 0 8px 0 0; }
+  .toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .toggle button { border: 0; background: var(--panel); color: var(--muted); padding: 5px 10px;
+                   font: inherit; cursor: pointer; }
+  .toggle button.on { background: var(--accent); color: #fff; }
+  #status { color: var(--muted); font-size: 12px; margin-left: auto; }
+  main { padding: 8px 16px 32px; }
+  details { margin: 12px 0; background: var(--panel); border: 1px solid var(--border);
+            border-radius: 10px; }
+  summary { cursor: pointer; padding: 10px 14px; font-weight: 600; text-transform: capitalize; }
+  summary .count { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+          gap: 8px; padding: 0 10px 10px; }
+  .chart { height: 300px; min-width: 0; }
+  #empty { color: var(--muted); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Training Dashboard</h1>
+  <span class="toggle" role="group" aria-label="x-axis">
+    <button id="x-iter" class="on" type="button">x = iteration</button>
+    <button id="x-cum" type="button">x = generated tokens</button>
+  </span>
+  <span id="status">loading…</span>
+</header>
+<main>
+  <div id="empty" hidden>no runs yet</div>
+  <div id="sections"></div>
+</main>
+<script>
+"use strict";
+
+// Sections are the key prefix before the first "." (see redteamrl/train/iter_metrics.py).
+const KNOWN = ["learning", "heldout", "diversity", "restart", "throughput", "update", "defender"];
+const ORDER = [...KNOWN, "Uncategorized"];
+const META = new Set(["iter", "cum_gen", "wall_time", "phase"]);
+const POLL = Number(new URLSearchParams(location.search).get("poll")) || 20000;
+const PALETTE = ["#2f6fde", "#e8590c", "#2b8a3e", "#ae3ec9", "#c92a2a", "#0b7285", "#a07d00"];
+
+// Optional per-metric labels and d3 formats. A logged key missing here still renders (raw name);
+// a key here that is never logged is simply not drawn.
+const CONFIG = {
+  "learning.live_frac": {label: "live examples (fraction)", format: ".0%"},
+  "learning.dead_groups": {label: "dead groups", format: ".0%"},
+  "learning.mixed_reward": {label: "mixed-reward groups", format: ".0%"},
+  "learning.fresh_win": {label: "fresh-start win rate", format: ".1%"},
+  "learning.fresh_win_task_avg": {label: "fresh win rate (task average)", format: ".1%"},
+  "learning.mean_reward": {label: "mean reward", format: "+.3f"},
+  "heldout.win_rate": {label: "held-out win rate", format: ".1%"},
+  "heldout.stalled_rate": {label: "held-out stalled rate", format: ".1%"},
+  "heldout.dead_rate": {label: "held-out dead-observation rate", format: ".1%"},
+  "diversity.win_routes": {label: "distinct winning routes", format: "d"},
+  "diversity.bank_size": {label: "start-state bank size", format: "d"},
+  "diversity.banked_wins": {label: "wins banked this iteration", format: "d"},
+  "diversity.banked_near": {label: "near misses banked this iteration", format: "d"},
+  "diversity.encoded_pass_rate": {label: "encoded carrier pass rate", format: ".1%"},
+  "restart.win_rate": {label: "restart win rate", format: ".1%"},
+  "restart.fallbacks": {label: "restart fallbacks", format: "d"},
+  "restart.groups": {label: "restart groups", format: "d"},
+  "throughput.rollout_min": {label: "rollout (min)", format: ".1f"},
+  "throughput.update_min": {label: "update (min)", format: ".1f"},
+  "throughput.gen_tokens": {label: "generated tokens", format: ",d"},
+  "throughput.tokens_per_s": {label: "rollout tokens / s", format: ".0f"},
+  "throughput.peak_gib": {label: "trainer peak memory (GiB)", format: ".1f"},
+  "update.loss": {label: "loss", format: ".4f"},
+  "update.kl": {label: "KL", format: ".5f"},
+  "update.grad_norm": {label: "grad norm", format: ".4f"},
+  "update.ratio": {label: "policy ratio", format: ".4f"},
+  "defender.attack_leak": {label: "attack episodes leaked", format: ".1%"},
+  "defender.benign_leak": {label: "benign episodes leaked", format: ".1%"},
+  "defender.protocol_fail": {label: "protocol failures", format: ".1%"},
+  "defender.over_refusal": {label: "over-refusal (false denials)", format: ".1%"},
+  "defender.clean": {label: "clean episodes", format: ".1%"},
+};
+
+let xMode = "iter";
+let lastSignature = "";
+const chartDivs = new Map();      // metric key -> chart div
+
+function parseJsonl(text) {
+  const rows = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row && typeof row === "object" && !Array.isArray(row)) rows.push(row);
+    } catch (e) { /* a torn last line from a sync mid-write: skip it */ }
+  }
+  return rows;
+}
+
+function dedupeByIter(rows) {
+  const byIter = new Map();
+  for (const row of rows) if (typeof row.iter === "number") byIter.set(row.iter, row);  // last wins
+  return [...byIter.values()].sort((a, b) => a.iter - b.iter);
+}
+
+function metricKeys(runs) {
+  const keys = new Set();
+  for (const rows of Object.values(runs))
+    for (const row of rows)
+      for (const [key, value] of Object.entries(row))
+        if (!META.has(key) && typeof value === "number" && Number.isFinite(value)) keys.add(key);
+  return keys;
+}
+
+function category(key) {
+  if (CONFIG[key] && CONFIG[key].category) return CONFIG[key].category;
+  const dot = key.indexOf(".");
+  if (dot < 0) return "Uncategorized";
+  const prefix = key.slice(0, dot);
+  return KNOWN.includes(prefix) ? prefix : "Uncategorized";
+}
+
+function store(op, key, value) {
+  try {
+    if (op === "get") return localStorage.getItem(key);
+    localStorage.setItem(key, value);
+  } catch (e) { return null; }
+  return null;
+}
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+async function fetchText(url) {
+  const resp = await fetch(url, {cache: "no-store"});
+  if (!resp.ok) throw new Error(`${resp.status}`);
+  return resp.text();
+}
+
+async function load() {
+  let names;
+  try {
+    names = JSON.parse(await fetchText("runs.json")).runs || [];
+  } catch (e) {
+    return {runs: {}, missing: [], noManifest: true};
+  }
+  const runs = {}, missing = [];
+  await Promise.all(names.map(async (name) => {
+    try {
+      runs[name] = dedupeByIter(parseJsonl(await fetchText(`${name}/metrics.jsonl`)));
+    } catch (e) {
+      missing.push(name);          // no file yet, or a run that predates the writer
+    }
+  }));
+  return {runs, missing, noManifest: false};
+}
+
+function buildSections(keys) {
+  const root = document.getElementById("sections");
+  root.replaceChildren();
+  chartDivs.clear();
+  const grouped = new Map(ORDER.map((c) => [c, []]));
+  for (const key of [...keys].sort()) grouped.get(category(key)).push(key);
+  for (const [cat, catKeys] of grouped) {
+    if (!catKeys.length) continue;
+    const details = document.createElement("details");
+    details.open = store("get", `dash.open.${cat}`) !== "0";
+    details.addEventListener("toggle", () => {
+      store("set", `dash.open.${cat}`, details.open ? "1" : "0");
+      if (details.open) for (const div of details.querySelectorAll(".chart")) Plotly.Plots.resize(div);
+    });
+    const summary = document.createElement("summary");
+    summary.textContent = cat;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = `${catKeys.length}`;
+    summary.append(count);
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    for (const key of catKeys) {
+      const div = document.createElement("div");
+      div.className = "chart";
+      grid.append(div);
+      chartDivs.set(key, div);
+    }
+    details.append(summary, grid);
+    root.append(details);
+  }
+}
+
+function traces(key, runs) {
+  return Object.keys(runs).sort().map((name, index) => {
+    const rows = runs[name];
+    const hasCum = rows.some((r) => r.cum_gen != null);
+    const useCum = xMode === "cum_gen" && hasCum;
+    const points = rows.filter((r) => key in r && (!useCum || r.cum_gen != null));
+    return {
+      name: name + (xMode === "cum_gen" && !hasCum ? " (x=iter)" : ""),
+      x: points.map((r) => (useCum ? r.cum_gen : r.iter)),
+      y: points.map((r) => (typeof r[key] === "number" && Number.isFinite(r[key]) ? r[key] : null)),
+      mode: "lines+markers", connectgaps: false, type: "scatter",
+      line: {color: PALETTE[index % PALETTE.length], width: 2},
+      marker: {size: 5},
+    };
+  }).filter((t) => t.x.length);
+}
+
+function draw(runs) {
+  const text = css("--text"), grid = css("--grid"), muted = css("--muted");
+  for (const [key, div] of chartDivs) {
+    const conf = CONFIG[key] || {};
+    Plotly.react(div, traces(key, runs), {
+      title: {text: conf.label || key, font: {size: 13, color: text}, x: 0.02},
+      uirevision: `${key}:${xMode}`,         // keeps the user's zoom across polls
+      hovermode: "x unified",
+      margin: {l: 52, r: 12, t: 34, b: 74},
+      paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+      font: {color: muted, size: 11},
+      showlegend: Object.keys(runs).length > 1,
+      legend: {orientation: "h", y: -0.42, font: {size: 10}},
+      xaxis: {title: {text: xMode === "cum_gen" ? "generated tokens" : "iteration"},
+              gridcolor: grid, zeroline: false},
+      yaxis: {tickformat: conf.format || "", hoverformat: conf.format || "",
+              gridcolor: grid, zeroline: false},
+    }, {displaylogo: false, responsive: true});
+  }
+}
+
+async function tick() {
+  const {runs, missing, noManifest} = await load();
+  const names = Object.keys(runs);
+  document.getElementById("empty").hidden = names.length > 0;
+  const keys = metricKeys(runs);
+  const signature = [...keys].sort().join("|");
+  if (signature !== lastSignature) {
+    buildSections(keys);
+    lastSignature = signature;
+  }
+  draw(runs);
+  const rows = names.reduce((n, name) => n + runs[name].length, 0);
+  document.getElementById("status").textContent = noManifest
+    ? "waiting for runs.json…"
+    : `${names.length} run(s), ${rows} rows` + (missing.length ? ` · no data yet: ${missing.join(", ")}` : "")
+      + ` · updated ${new Date().toLocaleTimeString()}`;
+}
+
+function setX(mode) {
+  xMode = mode;
+  document.getElementById("x-iter").classList.toggle("on", mode === "iter");
+  document.getElementById("x-cum").classList.toggle("on", mode === "cum_gen");
+  tick();
+}
+document.getElementById("x-iter").addEventListener("click", () => setX("iter"));
+document.getElementById("x-cum").addEventListener("click", () => setX("cum_gen"));
+
+tick();
+setInterval(tick, POLL);
+</script>
+</body>
+</html>

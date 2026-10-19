@@ -1,0 +1,6 @@
+{"iter": 0, "cum_gen": null, "wall_time": 1760100000.0, "phase": "attacker", "learning.fresh_win": 0.06, "learning.dead_groups": 0.6, "learning.mean_reward": -0.03, "update.kl": 0.0006, "throughput.update_min": 9.1}
+{"iter": 1, "cum_gen": null, "wall_time": 1760100900.0, "phase": "attacker", "learning.fresh_win": 0.08, "learning.dead_groups": 0.48, "learning.mean_reward": 0.02, "update.kl": 0.0015, "throughput.update_min": 9.3}
+{"iter": 2, "cum_gen": null, "wall_time": 1760101800.0, "phase": "attacker", "learning.fresh_win": 0.11, "learning.dead_groups": 0.4, "learning.mean_reward": 0.07, "update.kl": 0.0022, "throughput.update_min": 9.0, "diversity.win_routes": 12}
+{"iter": 3, "cum_gen": null, "wall_time": 1760102700.0, "phase": "attacker", "learning.fresh_win": 0.13, "learning.dead_groups": 0.36, "learning.mean_reward": 0.1, "update.kl": 0.0024, "throughput.update_min": 9.2, "diversity.win_routes": 18}
+{"iter": 4, "cum_gen": null, "wall_time": 1760103600.0, "phase": "attacker", "learning.fresh_win": 0.15, "learning.dead_groups": 0.33, "learning.mean_reward": 0.12, "update.kl": 0.0027, "throughput.update_min": 9.4, "diversity.win_routes": 22}
+{"iter": 5, "learning.fresh_w
