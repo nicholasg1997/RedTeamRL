@@ -369,12 +369,10 @@ def episode_verdicts(result) -> list[dict[str, str]]:
 	return verdicts
 
 
-def tactic_summary(examples: list[Example]) -> str:
-	"""One log line: how leaks got out and what known secret-carriers the defender let through.
-
-	Per EPISODE (examples repeat episode facts on every decision). Diagnostic only. Watch
-	`unattributed`: a leak no known detector explains is a new tactic -- or a channel around the
-	defender -- and is the cue to read those transcripts by hand."""
+def tactic_counts(examples: list[Example]) -> dict:
+	"""Per EPISODE (examples repeat episode facts on every decision): how leaks got out, which known
+	secret-carriers the defender let through, and the share of episodes passing an encoded carrier.
+	Diagnostic only -- never an input to reward. Shared by `tactic_summary` and the metrics log."""
 	episodes = {}
 	for ex in examples:
 		episodes.setdefault(ex.episode_id, ex)
@@ -385,11 +383,22 @@ def tactic_summary(examples: list[Example]) -> str:
 			leaks[ex.leak_attribution] = leaks.get(ex.leak_attribution, 0) + 1
 		for kind in ex.passed_taint_counts:
 			exposed[kind] = exposed.get(kind, 0) + 1
-	fmt = lambda d: " ".join(f"{k}={v}" for k, v in sorted(d.items())) or "none"
 	n = max(len(episodes), 1)
 	encoded = sum(any(k in ("base64", "hex") for k in ex.passed_taint_counts) for ex in episodes.values())
-	return (f"leaks by tactic: {fmt(leaks)} | episodes passing a carrier: {fmt(exposed)} | "
-	        f"encoded_pass_rate={encoded / n:.1%}")
+	return {"leaks": leaks, "exposed": exposed, "encoded_pass_rate": encoded / n,
+	        "n_episodes": len(episodes)}
+
+
+def tactic_summary(examples: list[Example]) -> str:
+	"""One log line: how leaks got out and what known secret-carriers the defender let through.
+
+	Per EPISODE (examples repeat episode facts on every decision). Diagnostic only. Watch
+	`unattributed`: a leak no known detector explains is a new tactic -- or a channel around the
+	defender -- and is the cue to read those transcripts by hand."""
+	counts = tactic_counts(examples)
+	fmt = lambda d: " ".join(f"{k}={v}" for k, v in sorted(d.items())) or "none"
+	return (f"leaks by tactic: {fmt(counts['leaks'])} | episodes passing a carrier: "
+	        f"{fmt(counts['exposed'])} | encoded_pass_rate={counts['encoded_pass_rate']:.1%}")
 
 
 def assign_advantages(examples: list[Example], normalize_std: bool = True) -> None:
