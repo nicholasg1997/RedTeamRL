@@ -16,19 +16,27 @@ OLD = {"a": -0.9, "b": -0.6, "c": -3.0}        # a previous, clearly different a
 
 class _FakeVLLM:
     def __init__(self, served_dist):
-        self.served_dist, self.loaded, self.unloaded = served_dist, [], []
+        # `served_dist` may be a list: successive served requests cycle through it (a noisy engine).
+        self.served = served_dist if isinstance(served_dist, list) else [served_dist]
+        self.loaded, self.unloaded, self.paths, self.n_served = [], [], {}, 0
 
     def post(self, url, json=None, timeout=None):
         path = url.split("8001", 1)[1]
         if path == "/v1/load_lora_adapter":
             self.loaded.append(json["lora_name"])
+            self.paths[json["lora_name"]] = json["lora_path"]
             return _Resp({})
         if path == "/v1/unload_lora_adapter":
             self.unloaded.append(json["lora_name"])
             return _Resp({})
         model = json["model"]
-        dist = (BASE if model == "base" else NEW if model.startswith("swapcheck-")
-                else self.served_dist)
+        if model == "base":
+            dist = BASE
+        elif model.startswith("swapcheck-"):
+            dist = OLD if self.paths[model] == "/tmp/old" else NEW
+        else:
+            dist = self.served[self.n_served % len(self.served)]
+            self.n_served += 1
         return _Resp({"choices": [{"logprobs": {"top_logprobs": [dist]}}]})
 
 
@@ -70,3 +78,29 @@ def test_fresh_names_are_never_reused(monkeypatch):
     check()
     check()
     assert len(set(fake.loaded)) == 2
+
+
+def test_stale_swap_is_identified_as_serving_the_previous_adapter(monkeypatch):
+    # The real failure: vLLM still serves last iteration's weights. A fresh load of the previous
+    # adapter must match the served name exactly, which is what separates it from a noisy check.
+    fake = _FakeVLLM(OLD)
+    monkeypatch.setattr(sc.requests, "post", fake.post)
+    with pytest.raises(sc.SwapMismatch) as err:
+        sc.verify_served_adapter("http://localhost:8001", "attacker", "/tmp/new", "base",
+                                 ["p1", "p2"], previous_path="/tmp/old")
+    m = err.value.measurement
+    assert m["served_vs_previous"] == pytest.approx(0.0)
+    assert m["served_repeat"] == pytest.approx(0.0)
+    assert sorted(fake.unloaded) == sorted(fake.loaded) and len(fake.loaded) == 2
+
+
+def test_nondeterministic_engine_shows_up_as_a_nonzero_repeat(monkeypatch):
+    # The false-alarm signature: the SAME served name disagrees with itself between two passes.
+    fake = _FakeVLLM([NEW, NEW, OLD, OLD])          # pass 1 -> NEW, pass 2 -> OLD
+    monkeypatch.setattr(sc.requests, "post", fake.post)
+    m = sc.measure_served_adapter("http://localhost:8001", "attacker", "/tmp/new", "base",
+                                  ["p1", "p2"])
+    assert m["served_vs_fresh"] == pytest.approx(0.0)
+    assert m["served_repeat"] > 0.05
+    assert "served_vs_previous" not in m
+    assert m["top1_agree"] == 1.0

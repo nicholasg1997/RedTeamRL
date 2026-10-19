@@ -321,7 +321,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         BENIGN_AGENT_SYSTEM)
     from redteamrl.policies.vllm_client import (
         load_lora_adapter, make_vllm_generate, start_vllm_server, stop_vllm_server)
-    from redteamrl.policies.swap_check import verify_served_adapter
+    from redteamrl.policies.swap_check import SwapMismatch, describe, verify_served_adapter
     from redteamrl.sandbox.shell import LocalShellSandbox
     from redteamrl.policies.prompt_pool import (
         DEFENDER_STYLES, PROMPT_POOL_VERSION, select_style)
@@ -433,7 +433,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         max_num_seqs=ATK_MAX_NUM_SEQS, lora_name="attacker", lora_path=adapter_serve_dir,
     )))
 
-    _last_serve_dir = {"path": None}
+    _last_serve_dir = {"path": adapter_serve_dir}   # the startup adapter is the first 'previous'
 
     def publish_policy(tag):
         """Push the current adapter to vLLM and PROVE the served policy matches the trained one.
@@ -449,10 +449,6 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         serve_dir = tempfile.mkdtemp(prefix="grpo-live-adapter-", dir="/tmp")
         model.save_pretrained(serve_dir)
         load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir)
-        # The previous publish's weights are now resident in vLLM; drop its dir to bound /tmp.
-        if _last_serve_dir["path"] is not None:
-            shutil.rmtree(_last_serve_dir["path"], ignore_errors=True)
-        _last_serve_dir["path"] = serve_dir
         # Verify vLLM against ITSELF (policies/swap_check.py): the served name must match a fresh,
         # never-cached load of the same file. The old vLLM-vs-HF greedy comparison raised "serving
         # the BASE policy" on a working swap (v3 arm 2 iter 0: "I'm" vs "I am", ratio=1.000) --
@@ -464,10 +460,26 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                     tokenize=False)
             for u in ("Reply with one short JSON object.", "List the files you would inspect first.",
                       "State your next action in one sentence.")]
-        d = verify_served_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir,
-                                  ATTACKER_MODEL, check_prompts)
-        print(f"[{tag}] served policy verified (served vs fresh load {d['served_vs_fresh']:.4f}; "
-              f"adapter moved {d['fresh_vs_base']:.4f} from base)", flush=True)
+        # The previous adapter's dir is kept until verification: a fresh load of it is what tells
+        # a stale swap (served == previous) from a noisy check (served_repeat > 0).
+        previous = _last_serve_dir["path"]
+        verify = lambda: verify_served_adapter(f"http://localhost:{ATK_PORT}", "attacker",
+                                               serve_dir, ATTACKER_MODEL, check_prompts,
+                                               previous_path=previous)
+        try:
+            d = verify()
+        except SwapMismatch as e:
+            # v4 arm 2 iter 1 (2026-10-18) raised at 0.0853 after a successful prefix reset, with
+            # no evidence of which failure it was. Log it, swap once more, and re-verify: a
+            # rollout still never starts on an adapter that did not pass.
+            print(f"[{tag}] SWAP CHECK FAILED, reloading once: {describe(e.measurement)}",
+                  flush=True)
+            load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir)
+            d = verify()
+        print(f"[{tag}] served policy verified ({describe(d)})", flush=True)
+        if previous is not None:
+            shutil.rmtree(previous, ignore_errors=True)
+        _last_serve_dir["path"] = serve_dir
 
     # Thinking OFF. The 27B that produced the defender's benchmark numbers ran thinking-ON at
     # 6144, but this is an 8B: it does not close its think block inside that budget, and the
