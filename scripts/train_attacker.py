@@ -322,8 +322,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         PromptedDefender, PromptedAttacker, ATTACKER_SYSTEM_SHELL, HINT_TECHNIQUE,
         BENIGN_AGENT_SYSTEM)
     from redteamrl.policies.vllm_client import (
-        load_lora_adapter, make_vllm_generate, start_vllm_server, stop_vllm_server)
-    from redteamrl.policies.swap_check import SwapMismatch, describe, verify_served_adapter
+        load_lora_adapter, make_vllm_generate, served_lora_path, start_vllm_server,
+        stop_vllm_server)
+    from redteamrl.policies.swap_check import beats_noise, describe, measure_served_adapter
     from redteamrl.sandbox.shell import LocalShellSandbox
     from redteamrl.policies.prompt_pool import (
         DEFENDER_STYLES, PROMPT_POOL_VERSION, select_style)
@@ -470,23 +471,26 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                     tokenize=False)
             for u in ("Reply with one short JSON object.", "List the files you would inspect first.",
                       "State your next action in one sentence.")]
-        # The previous adapter's dir is kept until verification: a fresh load of it is what tells
-        # a stale swap (served == previous) from a noisy check (served_repeat > 0).
+        # 1. DETERMINISTIC check: vLLM must have the file just written registered under
+        #    "attacker". With the prefix-cache reset (raises on failure, inside load_lora_adapter)
+        #    and no load_inplace (pinned by tests), this covers every stale-swap cause we have seen.
+        registered = served_lora_path(f"http://localhost:{ATK_PORT}", "attacker")
+        if registered is None:
+            print(f"[{tag}] WARNING: vLLM reports no path for 'attacker'; registration "
+                  f"could not be verified", flush=True)
+        elif os.path.realpath(registered) != os.path.realpath(serve_dir):
+            raise RuntimeError(f"vLLM serves 'attacker' from {registered}, not the adapter just "
+                               f"published ({serve_dir}); rollouts would use the wrong policy")
+        # 2. DIAGNOSTIC only: the first-token signature. After a small update consecutive adapters
+        #    differ by less than this measurement's own noise (v5 iter 1 raised twice on a working
+        #    swap, served-vs-itself repeat > served-vs-fresh), so it warns, never stops the run.
         previous = _last_serve_dir["path"]
-        verify = lambda: verify_served_adapter(f"http://localhost:{ATK_PORT}", "attacker",
-                                               serve_dir, ATTACKER_MODEL, check_prompts,
-                                               previous_path=previous)
-        try:
-            d = verify()
-        except SwapMismatch as e:
-            # v4 arm 2 iter 1 (2026-10-18) raised at 0.0853 after a successful prefix reset, with
-            # no evidence of which failure it was. Log it, swap once more, and re-verify: a
-            # rollout still never starts on an adapter that did not pass.
-            print(f"[{tag}] SWAP CHECK FAILED, reloading once: {describe(e.measurement)}",
-                  flush=True)
-            load_lora_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir)
-            d = verify()
-        print(f"[{tag}] served policy verified ({describe(d)})", flush=True)
+        d = measure_served_adapter(f"http://localhost:{ATK_PORT}", "attacker", serve_dir,
+                                   ATTACKER_MODEL, check_prompts, previous_path=previous)
+        flag = ("  WARNING: differs from a fresh load beyond the check's own noise"
+                if beats_noise(d) else "")
+        print(f"[{tag}] served policy registered at {serve_dir} ({describe(d)}){flag}",
+              flush=True)
         if previous is not None:
             shutil.rmtree(previous, ignore_errors=True)
         _last_serve_dir["path"] = serve_dir

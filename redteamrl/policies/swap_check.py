@@ -127,3 +127,11 @@ def verify_served_adapter(base_url: str, served_name: str, adapter_path: str, ba
             f"The swap did not take, so rollouts would come from a model that is not the one "
             f"being trained.", out)
     return out
+
+
+def beats_noise(m: dict, tol: float = 0.05, margin: float = 2.0) -> bool:
+    """True only if served-vs-fresh is above `tol` AND clearly above the check's own noise floor
+    (`margin` x the served-vs-itself repeat). v5 iter 1 (2026-10-18) raised twice at 0.136 / 0.177
+    with repeats of 0.224 / 0.184: the same adapter measured twice differed MORE than the
+    "mismatch". A difference the check cannot reproduce is not evidence of a stale swap."""
+    return m["served_vs_fresh"] > tol and m["served_vs_fresh"] > margin * m["served_repeat"]

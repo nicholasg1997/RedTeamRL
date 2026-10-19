@@ -135,6 +135,24 @@ def unload_lora_adapter(base_url: str, name: str, timeout: float = 60.0) -> int 
 	return resp.status_code
 
 
+def served_lora_path(base_url: str, name: str, timeout: float = 30.0) -> str | None:
+	"""The file path vLLM has registered under adapter `name` (`/v1/models` lists each LoRA with
+	`root` = the path it was loaded from), or None if the name is absent or reports no root.
+
+	This is the deterministic swap check: after a publish, the served name must point at the file
+	just written. The first-token signature comparison (policies/swap_check.py) cannot do this job
+	once updates are small -- consecutive adapters differ by less than its own measurement noise,
+	so it both raised on working swaps and would miss a stale one. Raises if the server does not
+	answer, since "could not check" must not read as "fine"."""
+	resp = requests.get(f"{base_url.rstrip('/')}/v1/models", timeout=timeout)
+	if resp.status_code != 200:
+		raise RuntimeError(f"vLLM /v1/models returned {resp.status_code}; cannot verify the swap")
+	for card in resp.json().get("data", []):
+		if card.get("id") == name:
+			return card.get("root")
+	return None
+
+
 def load_lora_adapter(base_url: str, name: str, path: str, timeout: float = 300.0) -> None:
 	"""Swap the served adapter. This is how the GRPO policy reaches vLLM each iteration: a ~50MB
 	adapter file instead of streaming the whole backbone.

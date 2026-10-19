@@ -104,3 +104,14 @@ def test_nondeterministic_engine_shows_up_as_a_nonzero_repeat(monkeypatch):
     assert m["served_repeat"] > 0.05
     assert "served_vs_previous" not in m
     assert m["top1_agree"] == 1.0
+
+
+def test_beats_noise_ignores_a_difference_smaller_than_the_checks_own_repeat():
+    # The two v5 iter-1 false alarms, verbatim.
+    assert not sc.beats_noise({"served_vs_fresh": 0.1361, "served_repeat": 0.2239})
+    assert not sc.beats_noise({"served_vs_fresh": 0.1769, "served_repeat": 0.1842})
+
+
+def test_beats_noise_flags_a_large_reproducible_difference():
+    assert sc.beats_noise({"served_vs_fresh": 0.30, "served_repeat": 0.01})
+    assert not sc.beats_noise({"served_vs_fresh": 0.03, "served_repeat": 0.0})   # under tol

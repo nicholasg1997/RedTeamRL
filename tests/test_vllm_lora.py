@@ -117,3 +117,37 @@ def test_swap_never_requests_an_in_place_load(monkeypatch):
     load = payloads["/v1/load_lora_adapter"]
     assert load == {"lora_name": "attacker", "lora_path": "/tmp/x"}
     assert not load.get("load_inplace")
+
+
+import redteamrl.policies.vllm_client as vc   # noqa: E402  (module-level for the tests below)
+
+
+class _GetResp:
+    def __init__(self, payload, status=200):
+        self._payload, self.status_code = payload, status
+
+    def json(self):
+        return self._payload
+
+
+def _models(monkeypatch, cards, status=200):
+    monkeypatch.setattr(vc.requests, "get",
+                        lambda url, timeout=None: _GetResp({"data": cards}, status))
+
+
+def test_served_lora_path_reads_the_registered_root(monkeypatch):
+    _models(monkeypatch, [{"id": "Qwen/Qwen3-8B", "root": "Qwen/Qwen3-8B"},
+                          {"id": "attacker", "root": "/tmp/grpo-live-adapter-abc"}])
+    assert vc.served_lora_path("http://localhost:8001", "attacker") == "/tmp/grpo-live-adapter-abc"
+
+
+def test_served_lora_path_is_none_for_an_unknown_name_or_a_missing_root(monkeypatch):
+    _models(monkeypatch, [{"id": "attacker"}])
+    assert vc.served_lora_path("http://localhost:8001", "attacker") is None
+    assert vc.served_lora_path("http://localhost:8001", "other") is None
+
+
+def test_served_lora_path_raises_when_the_server_does_not_answer(monkeypatch):
+    _models(monkeypatch, [], status=500)
+    with pytest.raises(RuntimeError, match="/v1/models"):
+        vc.served_lora_path("http://localhost:8001", "attacker")
