@@ -135,3 +135,15 @@ def test_summary_separates_fresh_from_restart_and_averages_per_task():
     assert s["fresh_win_rate_task_avg"] == (0.5 + 0.0) / 2
     assert s["restart_win_rate"] == 1.0
     assert s["n_fresh_groups"] == 2 and s["n_restart_groups"] == 1
+
+
+def test_v5_identity_changes_with_every_allocation_parameter():
+    from dataclasses import replace
+    from redteamrl.train.v5_finalize import v5_identity
+    base = v5_identity(P)
+    for field_name, value in [("window", 4), ("revisit_every", 2), ("restart_fraction_max", 0.25),
+                              ("max_state_age_iters", 9), ("max_fresh_per_task", 3),
+                              ("lambda_staleness", 0.2), ("prior_wins", 2.0),
+                              ("restart_depth_rule", "other"), ("priority_version", "plr-v2")]:
+        assert v5_identity(replace(P, **{field_name: value})) != base, field_name
+    assert v5_identity(P, max_near_misses=5) != base

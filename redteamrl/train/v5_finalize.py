@@ -113,3 +113,10 @@ def summarize(episodes: dict[int, dict], plans: list[GroupPlan], n_rollouts: int
         "n_fresh_groups": sum(p.kind == "fresh" for p in plans),
         "n_restart_groups": sum(p.kind == "restart" for p in plans),
     }
+
+
+def v5_identity(params: AllocParams, max_near_misses: int = DEFAULT_MAX_NEAR_MISSES) -> dict:
+    """The v5 settings that change the episode distribution, for ``phase_identity``: resuming a
+    checkpoint across a change to any of them would silently mix two different training regimes."""
+    return {**params.as_identity(), "alloc_max_near_misses": max_near_misses,
+            "restart_state_version": 1}

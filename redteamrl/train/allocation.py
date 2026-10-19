@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from redteamrl.train.banks import BankEntry, StartStateBank
 
@@ -89,6 +89,14 @@ class GroupPlan:
     reason: str                          # for the log: new / live / revisit / leftover / restart-*
     entry: BankEntry | None = None
     restart_turn: int | None = None      # number of prefix turns kept; the policy acts from here
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GroupPlan":
+        entry = BankEntry(**d["entry"]) if d.get("entry") else None
+        return cls(**{**d, "entry": entry})
 
 
 def win_rate_estimate(stats: TaskStats, params: AllocParams = DEFAULT_PARAMS) -> float:

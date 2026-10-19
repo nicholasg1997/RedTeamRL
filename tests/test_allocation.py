@@ -148,3 +148,12 @@ def test_revisit_due_task_beats_live_tasks_when_slots_are_scarce():
     banks = _banks({"gen-4": [_entry("w4", "gen-4")]})
     plans = _plan(stats, banks)
     assert any(p.kind == "fresh" and p.task_id == "gen-0" and p.reason == "revisit" for p in plans)
+
+
+def test_group_plans_round_trip_through_json():
+    import json
+    banks = _banks({"gen-2": [_entry("w", "gen-2")]})
+    plans = _plan(_all_dead(since=1), banks)
+    assert any(p.kind == "restart" for p in plans)
+    restored = [GroupPlan.from_dict(json.loads(json.dumps(p.to_dict()))) for p in plans]
+    assert restored == plans
