@@ -80,3 +80,19 @@ def test_print_lines_untouched(path, prefixes):
     src = open(path).read()
     for prefix in prefixes:
         assert f'print(f"iter {{it:3d}} {prefix}' in src, prefix
+
+
+@pytest.mark.parametrize("path,builder", [
+    ("scripts/train_attacker.py", "attacker_metrics"),
+    ("scripts/train_defender.py", "defender_metrics"),
+])
+def test_metrics_build_and_log_are_guarded(path, builder):
+    # The writer never raises, but the BUILDER runs in the driver: a missing source key would raise
+    # KeyError and kill the run. Both calls must sit inside a try whose handler catches Exception.
+    _, loop = _loop(path)
+    guarded = [n for n in ast.walk(loop) if isinstance(n, ast.Try)
+               and any(getattr(h.type, "id", None) == "Exception" for h in n.handlers)]
+    assert guarded, "no try/except Exception in the loop"
+    inside = {id(c) for t in guarded for stmt in t.body for c in ast.walk(stmt)}
+    assert any(id(c) in inside for c in _calls_named(loop, builder))
+    assert any(id(c) in inside for c in _log_calls(loop))

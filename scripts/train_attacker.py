@@ -804,14 +804,17 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             print(f"iter {it:3d} heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
                   f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
             heldout_m = {"win_rate": win_rate, "stalled_rate": stalled, "dead_rate": dead}
-        metrics = attacker_metrics(
-            live=live, n_examples=len(examples), div=div, rew=rew, summary=summary,
-            tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
-            update_min=update_min, gen_tokens=iter_gen_tokens, peak_gib=peak_gib,
-            banks_size=sum(len(b) for b in banks.values()),
-            win_routes=sum(b.distinct_routes({3}) for b in banks.values()),
-            heldout=heldout_m)
-        metrics_log.log(it, "attacker", cum_gen=cumulative_gen_tokens, **metrics)
+        try:   # telemetry must never cost the run: a builder KeyError is a warning, not a crash
+            metrics = attacker_metrics(
+                live=live, n_examples=len(examples), div=div, rew=rew, summary=summary,
+                tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
+                update_min=update_min, gen_tokens=iter_gen_tokens, peak_gib=peak_gib,
+                banks_size=sum(len(b) for b in banks.values()),
+                win_routes=sum(b.distinct_routes({3}) for b in banks.values()),
+                heldout=heldout_m)
+            metrics_log.log(it, "attacker", cum_gen=cumulative_gen_tokens, **metrics)
+        except Exception as exc:
+            print(f"[metrics] iter {it}: could not build metrics: {exc!r}", flush=True)
         prune_checkpoints(ckpt_root, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.

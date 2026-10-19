@@ -447,11 +447,14 @@ def _train_impl(active_servers):
         model.save_pretrained(ckpt)
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity})
-        metrics = defender_metrics(
-            live=live, n_examples=len(examples), div=div, rew=rew, decomp=d,
-            tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
-            update_min=update_min, gen_tokens=gen_tokens, peak_gib=peak_gib)
-        metrics_log.log(it, "defender", cum_gen=None, **metrics)
+        try:   # telemetry must never cost the run: a builder KeyError is a warning, not a crash
+            metrics = defender_metrics(
+                live=live, n_examples=len(examples), div=div, rew=rew, decomp=d,
+                tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
+                update_min=update_min, gen_tokens=gen_tokens, peak_gib=peak_gib)
+            metrics_log.log(it, "defender", cum_gen=None, **metrics)
+        except Exception as exc:
+            print(f"[metrics] iter {it}: could not build metrics: {exc!r}", flush=True)
         prune_checkpoints(CKPT_ROOT, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.
