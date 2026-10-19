@@ -743,11 +743,20 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
     servers stay alive holding ~52 GiB and the retry OOMs before it can even take a CUDA context
     -- which is exactly what happened. Every return and every exception must release them.
+
+    A trainer OOM is RETURNED, not raised. `retries` exists for preemption, but Modal retries any
+    exception, and an OOM on the same banked rollout is deterministic: 2026-10-18's v4 OOM would
+    have rebuilt both engines (~7 min each) ten times to fail identically. Returning ends the run;
+    the bank and every checkpoint survive, so the relaunch after a memory fix resumes in place.
     """
+    import torch
     active_servers = []
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
                            skip_final_update, split_defender)
+    except torch.OutOfMemoryError as e:
+        print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
+        return "oom"
     finally:
         for stop_server, proc in reversed(active_servers):
             stop_server(proc)
@@ -756,4 +765,5 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_I
 @app.local_entrypoint()
 def main(arm: int = 3, repeat_penalty_coef: float = 0.05, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False):
-    train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender)
+    if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender) == "oom":
+        print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")
