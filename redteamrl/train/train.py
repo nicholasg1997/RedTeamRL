@@ -1,9 +1,14 @@
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import SimpleNamespace
 
 import torch
-from redteamrl.harness.episode import RedactionEnforcement, run_episode
+from redteamrl.harness.episode import RedactionEnforcement, build_result, run_episode, run_turns
+from redteamrl.harness.restart import (FsHashRecorder, NondeterministicSource, load_record,
+                                       record_episode, restore_state)
 from redteamrl.train.capture import Example
+from redteamrl.train.closeness import closeness
+from redteamrl.types import TaskSpec
 from redteamrl.train.episode_store import read_episodes, write_episode
 from redteamrl.train.grpo import group_advantages, example_loss
 from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT, _DEFENDER_FAIL_MARKER
@@ -27,30 +32,80 @@ def _tally_invalid(diag: dict, episode_type: str, result) -> None:
 					diag["def_fail"] += 1
 
 
+class RestartUnavailable(RuntimeError):
+	"""A restart source could not be restored (unreadable record, nondeterministic replay, a turn
+	at or past the source's stop, settings mismatch). The rollout falls back to a fresh episode."""
+
+
+def _restore(record, k, attacker, sandbox, max_turns, post_completion_turns,
+             redaction_enforcement):
+	"""`run_restart`'s restore half, with its failures narrowed to RestartUnavailable.
+
+	Kept apart from the continuation on purpose: only a failure to REBUILD the prefix may trigger
+	the fresh fallback. A ValueError raised while the live policy plays the suffix is a real bug and
+	must propagate, not be silently converted into a fresh episode."""
+	try:
+		if (record["redaction_enforcement"] != redaction_enforcement
+				or record["max_turns"] != max_turns
+				or record["post_completion_turns"] != post_completion_turns):
+			raise ValueError("restart settings differ from the source episode's "
+			                 "(redaction_enforcement / max_turns / post_completion_turns)")
+		return restore_state(record, k, attacker, sandbox)
+	except (NondeterministicSource, ValueError) as exc:
+		raise RestartUnavailable(str(exc)) from exc
+
+
 def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factory,
                      capturing_generate, max_turns, post_completion_turns,
-                     redaction_enforcement, trained_side, reward_transform=None):
+                     redaction_enforcement, trained_side, reward_transform=None,
+                     record_restart_state: bool = False, restart: tuple[dict, int] | None = None):
 	"""Run one episode into its OWN capture buffer and tag every example it produced.
 
 	`defender_factory(spec)` mirrors `attack_agent_factory(spec)`: the attacker phase varies the
 	frozen defender's system prompt per task, so the trainee cannot overfit one phrasing of its
 	opponent. (sft/collect.py keeps its own no-arg contract; it has separate callers.)
+
+	`restart=(record, k)` begins the episode at turn k of a recorded SOURCE episode (`spec` must be
+	the source's): the prefix is rebuilt from the record, never regenerated, so the capture buffer
+	only ever holds the live suffix's decisions -- prefix turns are context, not training data. The
+	reward is still the whole-episode reward. Raises RestartUnavailable if the prefix cannot be
+	rebuilt.
+
+	`record_restart_state` (attack episodes only) records what a bank needs to restart from this
+	episode later: the restart record (`record_episode`, with a sandbox hash after EVERY turn --
+	for a restart, the source's prefix hashes plus this episode's live ones), its closeness and
+	whether it won. Selection data only; none of it touches reward.
 	"""
 	agent = factory(spec)
 	sandbox = sandbox_factory()
-	with capturing_generate.episode_capture() as episode_examples:
-		try:
-			result = run_episode(
-				spec,
-				agent,
-				defender_factory(spec),
-				sandbox,
-				max_turns=max_turns,
-				post_completion_turns=post_completion_turns,
-				redaction_enforcement=redaction_enforcement,
-			)
-		finally:
-			sandbox.close()
+	recording = record_restart_state and spec.episode_type == "attack"
+	recorder = FsHashRecorder(sandbox) if recording else None
+	try:
+		if restart is None:
+			# `on_turn` only when recording, so run_episode's call shape is otherwise unchanged.
+			extra = {"on_turn": recorder} if recorder is not None else {}
+			with capturing_generate.episode_capture() as episode_examples:
+				result = run_episode(
+					spec,
+					agent,
+					defender_factory(spec),
+					sandbox,
+					max_turns=max_turns,
+					post_completion_turns=post_completion_turns,
+					redaction_enforcement=redaction_enforcement,
+					**extra,
+				)
+		else:
+			record, k = restart
+			defender = defender_factory(spec)
+			state = _restore(record, k, agent, sandbox, max_turns, post_completion_turns,
+			                 redaction_enforcement)
+			with capturing_generate.episode_capture() as episode_examples:
+				run_turns(state, spec, agent, defender, sandbox, max_turns, post_completion_turns,
+				          redaction_enforcement, start_turn=k, on_turn=recorder)
+			result = build_result(state, spec, max_turns, redaction_enforcement)
+	finally:
+		sandbox.close()
 
 	reward = result.defender_reward if trained_side == "defender" else result.attacker_reward
 	if reward_transform is not None:
@@ -68,13 +123,25 @@ def _run_one_episode(spec, episode_id, factory, defender_factory, sandbox_factor
 		ex.defender_protocol_failures = int(getattr(result, "defender_protocol_failures", 0))
 		ex.leak_attribution = getattr(result, "leak_attribution", None)
 		ex.passed_taint_counts = dict(getattr(result, "passed_taint_counts", {}) or {})
-	return {"episode_id": episode_id, "task_id": spec.id, "reward": reward,
-	        "tally": tally, "examples": episode_examples}
+	outcome = {"episode_id": episode_id, "task_id": spec.id, "reward": reward,
+	           "tally": tally, "examples": episode_examples}
+	if recording:
+		hashes = list(recorder.hashes)
+		if restart is not None:
+			hashes = list(restart[0]["fs_hash_after"][:restart[1]]) + hashes
+		outcome["record"] = record_episode(result, spec, getattr(agent, "_outputs", []), hashes,
+		                                   max_turns, post_completion_turns)
+		outcome["closeness"] = list(closeness(result))
+		outcome["won"] = bool(result.outcome == "leak")
+	return outcome
 
 
-def _report_task(ti, spec, outcomes: dict, n_rollouts: int, n_tasks: int) -> None:
+def _report_task(ti, spec, outcomes: dict, n_rollouts: int, n_tasks: int, tag: str = "") -> None:
 	"""Per task: rewards (all-identical = dead group; mixed = live) + WHERE invalid JSON came from
-	(agent truncating vs defender fail-closing) + avg episode length — no guessing."""
+	(agent truncating vs defender fail-closing) + avg episode length — no guessing.
+
+	In plan mode it is called once per GROUP (`ti` = slot) and `tag` labels the group; the tag is
+	appended at the END so the line's existing prefix format is unchanged."""
 	td = {"def_dec": 0, "def_fail": 0, "atk_act": 0, "atk_inv": 0, "ben_act": 0, "ben_inv": 0,
 	      "turns": []}
 	rewards = []
@@ -90,7 +157,15 @@ def _report_task(ti, spec, outcomes: dict, n_rollouts: int, n_tasks: int) -> Non
 	avg_turns = sum(td["turns"]) / max(len(td["turns"]), 1)
 	print(f"    [rollout] {ti + 1}/{n_tasks} {spec.id}: rewards={rewards}  "
 	      f"invalid[agent {agent_inv}/{agent_acts}, defender {td['def_fail']}/{td['def_dec']}]  "
-	      f"avg_turns={avg_turns:.1f}", flush=True)
+	      f"avg_turns={avg_turns:.1f}{tag}", flush=True)
+
+
+def _group_tag(plan, outcomes: dict) -> str:
+	if plan.kind != "restart":
+		return f"  [fresh {plan.group_key} {plan.reason}]"
+	fallbacks = sum(bool(o.get("restart_fallback")) for o in outcomes.values())
+	fb = f" FALLBACK={fallbacks}/{len(outcomes)}" if fallbacks else ""
+	return f"  [restart {plan.group_key} k={plan.restart_turn} {plan.reason}{fb}]"
 
 
 def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
@@ -98,7 +173,9 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
             redaction_enforcement: RedactionEnforcement = "unshielded",
             trained_side: str = "defender", post_completion_turns: int | None = None,
             max_workers: int = 1, episode_store: str | None = None,
-            commit=None, task_transform=None, reward_transform=None) -> list[Example]:
+            commit=None, task_transform=None, reward_transform=None,
+            group_plans: list | None = None, task_by_id: dict[str, TaskSpec] | None = None,
+            record_restart_state: bool = False, outcome_sink: dict | None = None) -> list[Example]:
 	"""Run n_rollouts episodes per task; tag every captured Example with that episode's reward for
 	the side being trained.
 
@@ -121,7 +198,23 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 	`episode_store` persists each finished episode, so a preemption mid-rollout costs one episode
 	rather than the whole iteration. Banked episodes stay valid on resume because the policy does
 	not move during a rollout. `commit` is invoked once per task FROM THIS THREAD — never from a
-	worker — to flush the store durably."""
+	worker — to flush the store durably.
+
+	PLAN MODE (`group_plans`, from train/allocation.allocate): the groups are the plans, not
+	`tasks x n_rollouts`. Episode id = `plan.slot * n_rollouts + r` (unique even when one task has
+	two groups) and every Example gets `group_key = plan.group_key`. A fresh plan runs
+	`task_by_id[plan.task_id]` (default: `tasks` keyed by id) through
+	`task_transform(spec, plan.slot * n_rollouts + r)`; a restart plan resumes its bank entry's
+	recorded source at `plan.restart_turn`, on the SOURCE's spec and canary (no transform). A source
+	that cannot be restored falls back, for that rollout, to a fresh episode of the same task under
+	the same episode id, marked `restart_fallback` and grouped under `group_key + "#fallback"`:
+	it did not begin in the restart's start state, so it must not share that baseline. Plan-mode
+	outcomes also carry `kind`, `slot`, `group_key`, `restart_turn`, `source_entry_id` and
+	`restart_fallback`; `commit` runs once per group.
+
+	`record_restart_state` adds `record` / `closeness` / `won` to each attack episode's outcome
+	(see `_run_one_episode`); they are persisted with the episode, so they survive a resume.
+	`outcome_sink`, if given, receives every outcome dict keyed by episode id (banked ones too)."""
 	if trained_side not in {"defender", "attacker"}:
 		raise ValueError("trained_side must be 'defender' or 'attacker'")
 	if max_workers < 1:
@@ -130,52 +223,127 @@ def rollout(tasks, attack_agent_factory, benign_agent_factory, defender_factory,
 	if banked:
 		print(f"    [rollout] resuming with {len(banked)} banked episodes", flush=True)
 
-	work = [(ti, spec, r) for ti, spec in enumerate(tasks) for r in range(n_rollouts)]
+	if group_plans is None:
+		groups = list(enumerate(tasks))
+		n_groups = len(tasks)
+	else:
+		plans = sorted(group_plans, key=lambda p: p.slot)
+		if len({p.slot for p in plans}) != len(plans):
+			raise ValueError("group plans must have distinct slots")
+		task_by_id = task_by_id if task_by_id is not None else {spec.id: spec for spec in tasks}
+		for plan in plans:
+			if plan.task_id not in task_by_id:
+				raise ValueError(f"plan for unknown task {plan.task_id!r}")
+			if plan.kind == "restart" and (plan.entry is None or plan.restart_turn is None):
+				raise ValueError(f"restart plan in slot {plan.slot} has no source entry / turn")
+			if plan.kind not in {"fresh", "restart"}:
+				raise ValueError(f"unknown plan kind {plan.kind!r}")
+		groups = [(plan.slot, plan) for plan in plans]
+		n_groups = len(plans)
+	work = [(gi, group, r) for gi, group in groups for r in range(n_rollouts)]
 
-	def run(item):
-		ti, spec, rollout_index = item
-		episode_id = ti * n_rollouts + rollout_index
-		if episode_id in banked:
-			return ti, rollout_index, banked[episode_id]
-		episode_spec = task_transform(spec, rollout_index) if task_transform else spec
+	def run_fresh(spec, episode_id, transform_index):
+		episode_spec = task_transform(spec, transform_index) if task_transform else spec
 		factory = (attack_agent_factory if episode_spec.episode_type == "attack"
 		           else benign_agent_factory)
-		outcome = _run_one_episode(
+		return _run_one_episode(
 			episode_spec, episode_id, factory, defender_factory, sandbox_factory,
 			capturing_generate, max_turns, post_completion_turns,
 			redaction_enforcement, trained_side, reward_transform,
+			**({"record_restart_state": True} if record_restart_state else {}),
 		)
+
+	def run_planned(plan, episode_id):
+		fallback = False
+		group_key = plan.group_key
+		outcome = None
+		if plan.kind == "restart":
+			try:
+				try:
+					record = load_record(plan.entry.record_path)
+					spec = TaskSpec.model_validate(record["spec"])
+				except (OSError, ValueError, KeyError) as exc:
+					raise RestartUnavailable(f"unreadable record: {exc}") from exc
+				if spec.id != plan.task_id:
+					# A bank pointing at another task's record would cross environments: a bug,
+					# never something to paper over with a fallback.
+					raise RuntimeError(f"restart source {plan.entry.entry_id} is task {spec.id!r}, "
+					                   f"plan is for {plan.task_id!r}")
+				outcome = _run_one_episode(
+					spec, episode_id, attack_agent_factory, defender_factory, sandbox_factory,
+					capturing_generate, max_turns, post_completion_turns,
+					redaction_enforcement, trained_side, reward_transform,
+					record_restart_state=record_restart_state,
+					restart=(record, plan.restart_turn),
+				)
+			except RestartUnavailable as exc:
+				print(f"    [rollout] restart fallback: slot {plan.slot} {plan.group_key} "
+				      f"episode {episode_id}: {exc}", flush=True)
+				fallback = True
+				group_key = plan.group_key + "#fallback"
+		if outcome is None:
+			outcome = run_fresh(task_by_id[plan.task_id], episode_id, episode_id)
+		for ex in outcome["examples"]:
+			ex.group_key = group_key
+		outcome.update({
+			"kind": plan.kind, "slot": plan.slot, "group_key": group_key,
+			"restart_turn": plan.restart_turn,
+			"source_entry_id": plan.entry.entry_id if plan.entry is not None else None,
+			"restart_fallback": fallback,
+		})
+		return outcome
+
+	def run(item):
+		gi, group, rollout_index = item
+		episode_id = gi * n_rollouts + rollout_index
+		if episode_id in banked:
+			return gi, rollout_index, banked[episode_id]
+		if group_plans is None:
+			outcome = run_fresh(group, episode_id, rollout_index)
+		else:
+			outcome = run_planned(group, episode_id)
 		if episode_store:
 			write_episode(episode_store, outcome)
-		return ti, rollout_index, outcome
+		return gi, rollout_index, outcome
 
-	by_task: dict[int, dict[int, dict]] = defaultdict(dict)
+	group_of = dict(groups)
+
+	def finish_group(gi, outcomes):
+		if group_plans is None:
+			_report_task(gi, group_of[gi], outcomes, n_rollouts, n_groups)
+		else:
+			plan = group_of[gi]
+			_report_task(gi, SimpleNamespace(id=plan.task_id), outcomes, n_rollouts, n_groups,
+			             tag=_group_tag(plan, outcomes))
+		if commit is not None:
+			commit()
+
+	by_group: dict[int, dict[int, dict]] = defaultdict(dict)
 	if max_workers == 1:
 		for item in work:
-			ti, rollout_index, outcome = run(item)
-			by_task[ti][rollout_index] = outcome
-			if len(by_task[ti]) == n_rollouts:
-				_report_task(ti, tasks[ti], by_task[ti], n_rollouts, len(tasks))
-				if commit is not None:
-					commit()
+			gi, rollout_index, outcome = run(item)
+			by_group[gi][rollout_index] = outcome
+			if len(by_group[gi]) == n_rollouts:
+				finish_group(gi, by_group[gi])
 	else:
 		with ThreadPoolExecutor(max_workers=max_workers) as pool:
 			futures = [pool.submit(run, item) for item in work]
 			# as_completed runs in THIS thread, so the per-task report and the Volume commit
 			# never fire from a worker.
 			for future in as_completed(futures):
-				ti, rollout_index, outcome = future.result()
-				by_task[ti][rollout_index] = outcome
-				if len(by_task[ti]) == n_rollouts:
-					_report_task(ti, tasks[ti], by_task[ti], n_rollouts, len(tasks))
-					if commit is not None:
-						commit()
+				gi, rollout_index, outcome = future.result()
+				by_group[gi][rollout_index] = outcome
+				if len(by_group[gi]) == n_rollouts:
+					finish_group(gi, by_group[gi])
 
 	# Reassemble by index: arrival order is nondeterministic, attribution must not be.
 	examples: list[Example] = []
-	for ti in range(len(tasks)):
+	for gi, _ in groups:
 		for rollout_index in range(n_rollouts):
-			examples.extend(by_task[ti][rollout_index]["examples"])
+			outcome = by_group[gi][rollout_index]
+			examples.extend(outcome["examples"])
+			if outcome_sink is not None:
+				outcome_sink[outcome["episode_id"]] = outcome
 	return examples
 
 
