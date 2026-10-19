@@ -74,7 +74,10 @@ def finalize_iteration(episodes: dict[int, dict], plans: list[GroupPlan],
             continue                     # nothing before it to restart from; takes no quota
         if level == 3:
             banked_wins += _bank_one(banks, ep, level, key_turn, iteration, record_dir)
-        elif level in (1, 2):
+        elif level in (1, 2) and _is_fresh(ep):
+            # A restart inherits its source's prefix, so its near miss is usually the source's own
+            # (already banked). Only fresh episodes add new near-miss starts; a restart's WIN is
+            # always new, since the prefix stops before the source's key turn.
             near_by_task.setdefault(ep["task_id"], []).append((level, key_turn, ep))
     for task_id, candidates in near_by_task.items():
         # Closest first, then earliest (most turns left to find its own way past the defender);

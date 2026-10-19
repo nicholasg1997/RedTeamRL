@@ -147,3 +147,24 @@ def test_v5_identity_changes_with_every_allocation_parameter():
                               ("restart_depth_rule", "other"), ("priority_version", "plr-v2")]:
         assert v5_identity(replace(P, **{field_name: value})) != base, field_name
     assert v5_identity(P, max_near_misses=5) != base
+
+
+def test_near_misses_come_only_from_fresh_episodes_but_restart_wins_are_banked(tmp_path):
+    banks, stats, rec = _setup(tmp_path)
+    plans = [_restart("A", 0)]
+    eps = _index([_ep(plans[0], 0, 2, 3), _ep(plans[0], 1, 3, 4)])
+    out = finalize_iteration(eps, plans, banks, stats, 1, N, rec, P)
+    assert out["banked_near"] == 0 and out["banked_wins"] == 1
+
+
+def test_driver_wires_v5_into_phase_identity_and_lineage():
+    # The driver needs Modal to import, so pin the wiring at the source level: a resume across a
+    # v5 parameter change is only refused if these lines stay in place.
+    import ast
+    src = open("scripts/train_attacker.py").read()
+    tree = ast.parse(src)
+    lineage = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                   and getattr(n.targets[0], "id", None) == "LINEAGE")
+    assert lineage == "v5"
+    assert "phase_identity.update(v5_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
+    assert "group_plans=plans" in src and "record_restart_state=True" in src
