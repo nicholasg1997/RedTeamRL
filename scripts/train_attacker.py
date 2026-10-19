@@ -338,6 +338,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from redteamrl.train.banks import StartStateBank
     from redteamrl.train.episode_store import read_episodes
     from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES, finalize_iteration, v5_identity
+    from redteamrl.train.metrics_log import MetricsLog
+    from redteamrl.train.iter_metrics import attacker_metrics
+    from redteamrl.train.train import tactic_counts
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
     from redteamrl.train.checkpoint import (
         latest_checkpoint,
@@ -691,6 +694,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     if start_iter >= end_iter:
         print(f"nothing to do: resumed at iter {start_iter}, until_iter={until_iter}", flush=True)
         return
+    # One structured row per iteration for the dashboard (scripts/watch_metrics.py). Additive:
+    # the print lines below are unchanged, and a logging failure never stops the run.
+    metrics_log = MetricsLog(os.path.join(ckpt_root, "metrics.jsonl"))
     for it in range(start_iter, end_iter):
         cap.buffer.clear()
         model.eval()
@@ -699,6 +705,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         print(f"iter {it:3d} alloc    " + "  ".join(
             f"{p.kind[0]}:{p.task_id}" + (f"@{p.restart_turn}({p.reason[8:]})" if p.entry else "")
             for p in plans), flush=True)
+        rollout_t0 = time.monotonic()
         examples = rollout(tasks, attack_agent_factory, benign_agent_factory,
                            defender_factory_for(it),
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
@@ -710,6 +717,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                            commit=runs.commit, task_transform=episode_task_for(it),
                            reward_transform=reward_transform,
                            group_plans=plans, task_by_id=task_by_id, record_restart_state=True)
+        rollout_min = (time.monotonic() - rollout_t0) / 60
         # Stats and banks update from the episode store right away. Both are safe to repeat after
         # a crash: stats are reloaded from the last checkpoint's meta, banking is idempotent, and
         # the plan above is fixed by plans.json.
@@ -764,6 +772,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                         inner_epochs=INNER_EPOCHS,
                         no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS)
         update_min = (time.monotonic() - update_t0) / 60
+        peak_gib = torch.cuda.max_memory_allocated() / 2**30   # before save/eval can move it
         # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish
         # "the gradient is tiny, raise LR" from "the gradient is fine, we need more steps" --
         # ratio alone cannot, and this script was silently dropping both.
@@ -783,6 +792,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
+        heldout_m = None
         if ((it + 1) % HELDOUT_EVAL_EVERY == 0 or it == N_ITERS - 1
                 or (eval_at_end and it == end_iter - 1)):
             heldout = _run_heldout_eval(HELDOUT_EVAL_EPISODES)
@@ -793,6 +803,15 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             dead = sum(dead_observation_rate(r.steps) for r in heldout) / len(heldout)
             print(f"iter {it:3d} heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
                   f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
+            heldout_m = {"win_rate": win_rate, "stalled_rate": stalled, "dead_rate": dead}
+        metrics = attacker_metrics(
+            live=live, n_examples=len(examples), div=div, rew=rew, summary=summary,
+            tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
+            update_min=update_min, gen_tokens=iter_gen_tokens, peak_gib=peak_gib,
+            banks_size=sum(len(b) for b in banks.values()),
+            win_routes=sum(b.distinct_routes({3}) for b in banks.values()),
+            heldout=heldout_m)
+        metrics_log.log(it, "attacker", cum_gen=cumulative_gen_tokens, **metrics)
         prune_checkpoints(ckpt_root, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.

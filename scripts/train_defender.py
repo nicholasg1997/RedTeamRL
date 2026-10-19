@@ -95,7 +95,7 @@ app = modal.App("redteamrl-defender-grpo", image=image)
 
 
 def _train_impl(active_servers):
-    import json, os, shutil, sys, tempfile, torch
+    import json, os, shutil, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
     # Preflight, before the opponent server and model load: every adapter swap must reset vLLM's
     # prefix cache (LoRA KV blocks are keyed on the adapter NAME in vLLM 0.21), and that route only
@@ -120,7 +120,10 @@ def _train_impl(active_servers):
     from redteamrl.envs.ci_build import CI_BUILD
     from redteamrl.train.capture import VLLMCapturingGenerate
     from redteamrl.train.learner import Learner
-    from redteamrl.train.train import rollout, assign_advantages, tactic_summary, update_step
+    from redteamrl.train.train import (
+        rollout, assign_advantages, tactic_counts, tactic_summary, update_step)
+    from redteamrl.train.metrics_log import MetricsLog
+    from redteamrl.train.iter_metrics import defender_metrics
     from redteamrl.train.checkpoint import (
         latest_checkpoint,
         prune_checkpoints,
@@ -376,9 +379,13 @@ def _train_impl(active_servers):
     # Verify the initial serve before spending a rollout on it.
     publish_policy(f"iter{start_iter} pre-rollout")
 
+    # One structured row per iteration for the dashboard (scripts/watch_metrics.py). Additive:
+    # the print lines below are unchanged, and a logging failure never stops the run.
+    metrics_log = MetricsLog(os.path.join(CKPT_ROOT, "metrics.jsonl"))
     for it in range(start_iter, N_ITERS):
         cap.buffer.clear()
         model.eval()
+        rollout_t0 = time.monotonic()
         examples = rollout(tasks, attack_agent_factory_for(it), benign_agent_factory_for(it),
                            defender_factory,
                            LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
@@ -387,6 +394,8 @@ def _train_impl(active_servers):
                            max_workers=ROLLOUT_WORKERS,
                            episode_store=os.path.join(CKPT_ROOT, f"rollout-iter{it}"),
                            commit=runs.commit, task_transform=episode_task_for(it))
+        rollout_min = (time.monotonic() - rollout_t0) / 60
+        gen_tokens = sum(len(ex.completion_ids) for ex in examples)
         assign_advantages(examples)
         d = decompose(examples)
         # An exposed weakness only teaches if the group's rewards actually differ. A dead group is
@@ -416,8 +425,12 @@ def _train_impl(active_servers):
         print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
 
         model.train()
+        torch.cuda.reset_peak_memory_stats()
+        update_t0 = time.monotonic()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
                         inner_epochs=INNER_EPOCHS)
+        update_min = (time.monotonic() - update_t0) / 60
+        peak_gib = torch.cuda.max_memory_allocated() / 2**30
         print(f"iter {it:3d} update   loss={m['loss']:.4f}  ratio={m['mean_ratio']:.3f}  "
               f"kl={m['mean_kl']:.5f}  grad={m['grad_norm']:.3f}  "
               f"epoch_ratios={[round(r, 3) for r in m['epoch_ratios']]}  "
@@ -434,6 +447,11 @@ def _train_impl(active_servers):
         model.save_pretrained(ckpt)
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity})
+        metrics = defender_metrics(
+            live=live, n_examples=len(examples), div=div, rew=rew, decomp=d,
+            tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
+            update_min=update_min, gen_tokens=gen_tokens, peak_gib=peak_gib)
+        metrics_log.log(it, "defender", cum_gen=None, **metrics)
         prune_checkpoints(CKPT_ROOT, keep=CKPT_KEEP)
         # The rollout bank is only disposable once THIS iteration's checkpoint exists: dropping it
         # earlier would make a preemption between update and checkpoint re-run the whole rollout.
