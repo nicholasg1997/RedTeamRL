@@ -58,11 +58,13 @@ CLIP_EPS = 0.2          # PPO trust region; only bites once inner epochs move th
 # steps. Two epochs at a higher LR cover similar ground for ~half the update compute.
 INNER_EPOCHS = 2
 # Micro-batches up to this many padded tokens skip activation checkpointing (store activations
-# instead of recomputing them in backward, ~25% of an epoch). ~2.7 MB/token of activations for the
-# 8B across 36 layers -> ~11 GB at 4096 tokens, inside the trainer's ~15 GB of headroom beside both
-# vLLM engines. Larger batches (and single long sequences) keep checkpointing. Set 0 if an update
-# OOMs: the rollout is banked and replays for free.
-NO_CHECKPOINT_MAX_TOKENS = 4096
+# instead of recomputing them in backward, ~25% of an epoch). 0 = always checkpoint.
+# 4096 OOM'd (v4 arm 2, iter 0, 2026-10-18): the trainer reached 33.8 GiB -- ~17 GiB past the 16.4
+# GiB of weights -- before a 4096-token batch's stored activations fit. The ~2.7 MB/token estimate
+# that chose 4096 left out LoRA's per-module dropout copies and fp32 norm upcasts. Re-enable only
+# from the measured `peak=` on the update line, never from an estimate. Not in phase_identity:
+# checkpointing changes memory, not math (tests/test_batched_update.py), so resume is unaffected.
+NO_CHECKPOINT_MAX_TOKENS = 0
 MAX_TURNS = 12
 REDACTION_ENFORCEMENT = "unshielded"  # the attacker must receive exploitable policy mistakes
 DEF_PORT = 8000
@@ -264,7 +266,7 @@ class RemoteDefender:
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False):
-    import os, sys, tempfile, torch
+    import os, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
     assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
@@ -679,16 +681,21 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             return
 
         model.train()
+        torch.cuda.reset_peak_memory_stats()
+        update_t0 = time.monotonic()
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
                         inner_epochs=INNER_EPOCHS,
                         no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS)
+        update_min = (time.monotonic() - update_t0) / 60
         # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish
         # "the gradient is tiny, raise LR" from "the gradient is fine, we need more steps" --
         # ratio alone cannot, and this script was silently dropping both.
         print(f"iter {it:3d} update   loss={m['loss']:.4f}  ratio={m['mean_ratio']:.3f}  "
               f"kl={m['mean_kl']:.5f}  grad={m['grad_norm']:.4f}  "
               f"epoch_ratios={[round(r, 4) for r in m['epoch_ratios']]}  "
-              f"live={m['n_live_examples']}/{m['n_examples']}", flush=True)
+              f"live={m['n_live_examples']}/{m['n_examples']}  "
+              f"time={update_min:.1f}min  peak={torch.cuda.max_memory_allocated() / 2**30:.1f}GiB",
+              flush=True)
 
         ckpt = os.path.join(ckpt_root, f"iter{it}")
         model.save_pretrained(ckpt)
