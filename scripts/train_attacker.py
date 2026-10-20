@@ -74,6 +74,9 @@ MINIBATCHES = 8
 TARGET_KL = 0.01
 # --overfit-task: GRPO groups per iteration on the single task (no restarts, no replacements).
 OVERFIT_GROUPS = 4
+# --tasks: train on a FIXED small set (Path A). Each gets this many fresh groups, like overfit but
+# for N tasks -- the generalised version of the one config proven to learn (17%%->73%% on one task).
+SUBSET_GROUPS = 4
 # Micro-batches up to this many padded tokens skip activation checkpointing (store activations
 # instead of recomputing them in backward, ~25% of an epoch). 0 = always checkpoint.
 # 4096 OOM'd (v4 arm 2, iter 0, 2026-10-18): the trainer reached 33.8 GiB -- ~17 GiB past the 16.4
@@ -198,7 +201,7 @@ ADVANTAGE_STD_NORMALIZE = False
 # v7 = 16 minibatch steps/iteration with a target-KL brake and a KL-adaptive LR, G=12, restarts
 # from the decisive turn (depth 1.0), graduation, same-iteration near-miss banking (spec
 # 2026-10-20).
-LINEAGE = "v7.2"
+LINEAGE = "v8"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -297,13 +300,14 @@ def _group_size_suffix(n_rollouts: int) -> str:
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False, eval_at_end=False,
                 n_rollouts=N_ROLLOUTS, baseline_eval=False, max_turns=MAX_TURNS,
-                overfit_task=""):
+                overfit_task="", tasks=""):
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
-    # v7.2 turns the repeat penalty ON: training losses repeated observations ~3-5x more than wins
-    # (v7.1 iters 0-1: stalled 40% vs 8-12%), and the 20-turn baseline's extra turns were 52% stalled.
-    assert arm == 3, "v7.2 pins arm 3 (repeat penalty); see REPEAT_PENALTY_SWEEP"
+    # v8 reverts the v7.2 repeat penalty: it ~doubled update cost (every group reward-varied) for no
+    # sustained stall drop and no held-out gain. Back to the outcome-only reward (arm 2).
+    assert arm == 2, "v8 pins arm 2 (repeat penalty reverted)"
+    focus = [t.strip() for t in tasks.split(",") if t.strip()]   # --tasks: fixed subset (Path A)
     # --max-turns only re-sizes the BASELINE eval (measuring what a longer budget buys the untrained
     # policy). For training it would change the episode distribution, the reward's turn penalty and
     # the viability-gate config, i.e. a new lineage -- a deliberate decision, never a flag typo.
@@ -324,6 +328,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # the failure is in the pipeline, not research difficulty. Its own lineage, never resumed
         # into (or from) the full-task run.
         ckpt_root += f"-overfit-{overfit_task}"
+    if focus and not overfit_task:
+        # Path A: a fixed task subset trained at overfit density. Own lineage; never mixes with a
+        # full run or a different subset.
+        ckpt_root += "-tasks-" + "+".join(sorted(focus))
 
     # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
     # /v1/load_lora_adapter when this is set, and publish_policy's swap 404s without it -- correct
@@ -440,19 +448,29 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     ])
     # Only attack tasks carry an attacker reward; benign episodes have no attacker to train.
     tasks = [task for task in tasks if task.episode_type == "attack"]
+    focus = [t.strip() for t in tasks.split(",") if t.strip()]
     if overfit_task:
         tasks = [task for task in tasks if task.id == overfit_task]
         if not tasks:
             raise ValueError(f"--overfit-task {overfit_task!r} is not a training attack task")
+    elif focus:
+        tasks = [task for task in tasks if task.id in set(focus)]
+        missing = set(focus) - {task.id for task in tasks}
+        if missing:
+            raise ValueError(f"--tasks ids not in the training split: {sorted(missing)}")
     print(f"{len(tasks)} attack tasks (generated envs x {N_GEN_ENVS})", flush=True)
     task_by_id = {task.id: task for task in tasks}
     # v7: restarts begin AT the decisive turn (k = key_turn) and widen earlier only once a group
     # can finish from there (spec s4.2).
+    _subset = bool(overfit_task) or bool(focus)
+    groups_per_task = OVERFIT_GROUPS if overfit_task else SUBSET_GROUPS
     alloc = (AllocParams(depth_start=1.0, restart_fraction_max=0.0, max_replacements=0,
-                         max_fresh_per_task=OVERFIT_GROUPS) if overfit_task
+                         max_fresh_per_task=groups_per_task, near_miss_offset=1,
+                         near_miss_min_turns_left=3) if _subset
              else AllocParams(depth_start=1.0, near_miss_offset=1, near_miss_min_turns_left=3))
-    # GRPO group slots per iteration: one per task normally; OVERFIT_GROUPS on the single task.
-    n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)
+    # GRPO group slots per iteration: one per task for a full run; groups_per_task x |tasks| for a
+    # subset run (overfit or --tasks), so each task gets the dense consistent gradient that learned.
+    n_slots = len(tasks) * groups_per_task if _subset else len(tasks)
     lr_rule = LrRule(initial=LR, target_kl=TARGET_KL)
 
     def episode_task_for(iteration):
@@ -634,6 +652,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                            "attacker_hint_version": ATTACKER_HINT_VERSION})
     if overfit_task:
         phase_identity.update({"overfit_task": overfit_task, "overfit_groups": OVERFIT_GROUPS})
+    if focus and not overfit_task:
+        phase_identity.update({"focus_tasks": sorted(focus), "subset_groups": SUBSET_GROUPS})
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
         # is unchanged. The opponent's hardware is part of the episode distribution.
@@ -1039,10 +1059,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 @app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_ITERS,
+def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
           eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
-          max_turns: int = MAX_TURNS, overfit_task: str = ""):
+          max_turns: int = MAX_TURNS, overfit_task: str = "", tasks: str = ""):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -1059,7 +1079,7 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_I
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
                            skip_final_update, split_defender, eval_at_end, n_rollouts,
-                           baseline_eval, max_turns, overfit_task)
+                           baseline_eval, max_turns, overfit_task, tasks)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -1069,10 +1089,10 @@ def train(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_I
 
 
 @app.local_entrypoint()
-def main(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_ITERS,
+def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
-          max_turns: int = MAX_TURNS, overfit_task: str = ""):
+          max_turns: int = MAX_TURNS, overfit_task: str = "", tasks: str = ""):
     if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
-                    eval_at_end, n_rollouts, baseline_eval, max_turns, overfit_task) == "oom":
+                    eval_at_end, n_rollouts, baseline_eval, max_turns, overfit_task, tasks) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")

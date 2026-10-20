@@ -81,7 +81,7 @@ def test_lr_rule_is_told_how_many_steps_were_taken():
 
 def test_v71_lineage_and_initial_lr():
     _, tree = _src_tree()
-    assert _const(tree, "LINEAGE").value == "v7.2"
+    assert _const(tree, "LINEAGE").value == "v8"
     assert _const(tree, "LR").value == 5e-5
 
 
@@ -104,7 +104,7 @@ def test_overfit_mode_is_a_flag_with_its_own_lineage():
     assert 'ckpt_root += f"-overfit-{overfit_task}"' in src
     assert '"overfit_task": overfit_task' in src
     assert "restart_fraction_max=0.0, max_replacements=0" in src
-    assert "n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)" in src
+    assert "n_slots = len(tasks) * groups_per_task if _subset else len(tasks)" in src
     assert "not overfit_task and (" in src          # held-out eval skipped in overfit mode
 
 
@@ -122,19 +122,32 @@ def test_brake_rule_is_in_the_identity_and_training_stall_is_logged_guarded():
 
 # --- v7.2: LR warmup + repeat penalty (arm 3) ---------------------------------------------------
 
-def test_v72_lineage_constants_and_arm3_pin():
+def test_v8_lineage_constants_and_arm2_pin():
     src, tree = _src_tree()
-    assert _const(tree, "LINEAGE").value == "v7.2"
+    assert _const(tree, "LINEAGE").value == "v8"
     assert _const(tree, "WARMUP_STEPS").value == 16
-    assert "assert arm == 3" in src
+    assert "assert arm == 2" in src
     for name in ("train", "main"):
         fn = _func(tree, name)
         args = fn.args.args
         defaults = dict(zip([a.arg for a in args[len(args) - len(fn.args.defaults):]],
                             fn.args.defaults))
-        assert defaults["arm"].value == 3, name
-        assert defaults["repeat_penalty_coef"].value == 0.02, name
+        assert defaults["arm"].value == 2, name
+        assert defaults["repeat_penalty_coef"].value == 0.0, name
 
+
+def test_tasks_flag_trains_a_fixed_subset_at_overfit_density():
+    src, tree = _src_tree()
+    for name in ("_train_impl", "train", "main"):
+        fn = _func(tree, name)
+        args = fn.args.args
+        defaults = dict(zip([a.arg for a in args[len(args) - len(fn.args.defaults):]],
+                            fn.args.defaults))
+        assert getattr(defaults.get("tasks"), "value", None) == "", name
+    assert 'focus = [t.strip() for t in tasks.split(",") if t.strip()]' in src
+    assert 'ckpt_root += "-tasks-" + "+".join(sorted(focus))' in src
+    assert "n_slots = len(tasks) * groups_per_task if _subset else len(tasks)" in src
+    assert '"focus_tasks": sorted(focus)' in src
 
 def test_warmup_is_wired_through_a_persisted_global_step():
     src, tree = _src_tree()
