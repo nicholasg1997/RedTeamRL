@@ -51,13 +51,16 @@ def _key(task_id: str, entry_id: str, k: int, slot: int) -> str:
 
 def plan_replacements(episodes: dict[int, dict], base_plans: list[GroupPlan],
                       banks: dict[str, StartStateBank], depths: dict[str, float], n_slots: int,
-                      n_rollouts: int, rng: random.Random, params: AllocParams) -> list[GroupPlan]:
+                      n_rollouts: int, rng: random.Random, params: AllocParams,
+                      graduated: set[str] | frozenset = frozenset(),
+                      iteration: int | None = None) -> list[GroupPlan]:
     """Dead base groups in ascending slot order, at most `params.max_replacements` replacements.
     A dead restart retries its own entry at a one-shot corrected depth; a dead all-loss fresh group
     becomes a restart from its task's bank. Conceded slots (no different start state, all-win fresh,
     empty bank) do not use up the cap."""
     dead = classify(episodes, base_plans, n_rollouts)
     used = {p.entry.entry_id for p in base_plans if p.kind == "restart" and p.entry is not None}
+    used |= set(graduated)
     out: list[GroupPlan] = []
     for plan in sorted(base_plans, key=lambda p: p.slot):
         if len(out) >= params.max_replacements:
@@ -85,7 +88,7 @@ def plan_replacements(episodes: dict[int, dict], base_plans: list[GroupPlan],
         else:
             if all_win:
                 continue                    # a restart is strictly easier: cannot make it live
-            entry = draw_restart(banks.get(plan.task_id), rng, used)
+            entry = draw_restart(banks.get(plan.task_id), rng, used, prefer_iteration=iteration)
             if entry is None:
                 continue
             used.add(entry.entry_id)

@@ -160,3 +160,15 @@ def test_all_win_group_with_turn_penalised_rewards_is_dead():
     assert is_dead(list(episodes.values()))
     rep = _plan(episodes, [base], _banks([e]))
     assert len(rep) == 1 and rep[0].reason.endswith("-earlier")
+
+
+def test_plan_replacements_skips_graduated_and_prefers_same_iteration():
+    import dataclasses
+    old = _entry("old", level=2)
+    new = dataclasses.replace(_entry("new", level=2), iteration=7)
+    grad = _entry("grad", level=3)
+    p = _fresh(0)
+    episodes = _group(p, [False] * N)
+    out = plan_replacements(episodes, [p], _banks([old, new, grad]), {}, N_SLOTS, N,
+                            random.Random(0), P, graduated={"grad"}, iteration=7)
+    assert len(out) == 1 and out[0].entry.entry_id == "new"

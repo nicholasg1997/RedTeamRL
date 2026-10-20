@@ -157,3 +157,36 @@ def test_group_plans_round_trip_through_json():
     assert any(p.kind == "restart" for p in plans)
     restored = [GroupPlan.from_dict(json.loads(json.dumps(p.to_dict()))) for p in plans]
     assert restored == plans
+
+
+# --- v7: graduation exclusion, same-iteration preference, can_go_earlier --------------------------
+
+def test_draw_restart_prefers_this_iterations_near_misses():
+    from redteamrl.train.allocation import draw_restart
+    old = _entry("old", "gen-0", level=2, iteration=3, route="a")
+    new = _entry("new", "gen-0", level=2, iteration=5, route="b")
+    bank = _banks({"gen-0": [old, new]})["gen-0"]
+    for seed in range(20):
+        assert draw_restart(bank, random.Random(seed), set(), prefer_iteration=5) is new
+    win = _entry("win", "gen-0", level=3, iteration=1, route="c")
+    bank.add(win)
+    assert draw_restart(bank, random.Random(0), set(), prefer_iteration=5) is win
+
+
+def test_allocate_never_draws_graduated_entries():
+    e = _entry("e0", "gen-0")
+    plans = allocate(_all_dead(), _banks({"gen-0": [e]}), 12, 3, random.Random(0), P,
+                     graduated={"e0"})
+    assert not [p for p in plans if p.kind == "restart"]
+
+
+def test_can_go_earlier_false_at_floor():
+    from redteamrl.train.allocation import can_go_earlier
+    def plan(key_turn, k, frac):
+        return GroupPlan("gen-0", "restart", 0, "k", "restart-win",
+                         _entry(f"e{key_turn}", "gen-0", key_turn=key_turn), k, frac)
+    assert not can_go_earlier(plan(1, 1, 1.0), P)         # k=1 is the floor
+    assert can_go_earlier(plan(8, 8, 1.0), P)
+    # One 0.2 step from 1.0 still rounds to k=2 here, but further steps reach k=1: not graduated.
+    assert can_go_earlier(plan(2, 2, 1.0), P)
+    assert not can_go_earlier(plan(20, 2, 0.1), P)        # clamped at depth_min

@@ -154,11 +154,21 @@ def _due_reason(stats: TaskStats, params: AllocParams) -> str | None:
     return None
 
 
-def draw_restart(bank: StartStateBank | None, rng: random.Random, used: set[str]):
+def draw_restart(bank: StartStateBank | None, rng: random.Random, used: set[str],
+                 prefer_iteration: int | None = None):
+    """Wins first; then near misses banked in `prefer_iteration` (v7: this iteration's own close
+    calls come from the policy about to be trained); then any near miss."""
     if bank is None:
         return None
-    return (bank.sample(rng, levels=WIN_LEVELS, exclude=used)
-            or bank.sample(rng, levels=NEAR_MISS_LEVELS, exclude=used))
+    win = bank.sample(rng, levels=WIN_LEVELS, exclude=used)
+    if win is not None:
+        return win
+    if prefer_iteration is not None:
+        others = {e.entry_id for e in bank.entries() if e.iteration != prefer_iteration}
+        same = bank.sample(rng, levels=NEAR_MISS_LEVELS, exclude=set(used) | others)
+        if same is not None:
+            return same
+    return bank.sample(rng, levels=NEAR_MISS_LEVELS, exclude=used)
 
 
 _draw_restart = draw_restart       # pre-v6 name
@@ -189,6 +199,13 @@ def step_depth(depth_frac: float, win_rate: float, params: AllocParams = DEFAULT
     return round(min(1.0, max(params.depth_min, depth_frac)), 6)
 
 
+def can_go_earlier(plan: GroupPlan, params: AllocParams = DEFAULT_PARAMS) -> bool:
+    """Whether any earlier start than the one this restart group ran at is reachable. False means
+    the entry sits at its floor (k = 1, or clamped at depth_min): an all-win group there cannot be
+    made harder, so the entry graduates (v7)."""
+    return turn_for(params.depth_min, plan.entry.key_turn) < plan.restart_turn
+
+
 def one_shot_depth(depth_frac: float, all_win: bool, params: AllocParams = DEFAULT_PARAMS) -> float:
     """The corrected depth for a dead restart group's same-iteration replacement. Never persisted:
     the stored depth moves only at finalize (spec s5, hybrid timing)."""
@@ -209,7 +226,8 @@ def update_depths(depths: dict[str, float], groups: list[tuple[str, float, float
 def allocate(task_stats: list[TaskStats], banks: dict[str, StartStateBank], n_slots: int,
              iteration: int, rng: random.Random,
              params: AllocParams = DEFAULT_PARAMS,
-             depths: dict[str, float] | None = None) -> list[GroupPlan]:
+             depths: dict[str, float] | None = None,
+             graduated: set[str] | frozenset = frozenset()) -> list[GroupPlan]:
     depths = depths or {}
     stats = sorted(task_stats, key=lambda s: s.task_id)
     max_restarts = int(params.restart_fraction_max * n_slots)
@@ -217,7 +235,7 @@ def allocate(task_stats: list[TaskStats], banks: dict[str, StartStateBank], n_sl
     # Restarts: one per task per pass, lowest estimated win rate first; each bank entry is used at
     # most once this iteration.
     restarts: list[tuple[str, BankEntry, int]] = []
-    used: set[str] = set()
+    used: set[str] = set(graduated)       # graduated entries (v7) are never drawn
     low_first = sorted(stats, key=lambda s: (win_rate_estimate(s, params), s.task_id))
     while len(restarts) < max_restarts:
         progressed = False
