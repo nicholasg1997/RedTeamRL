@@ -158,7 +158,9 @@ REPEAT_PENALTY_SWEEP = (0.02, 0.05, 0.1)  # the coef must be one of these; ignor
 # Eval every k iters (not every iter): single-iter win rates at n=128 have SE ~3pp and are read
 # only via the trailing-window mean, so a full eval every iteration burns temp-0 rollouts for
 # points we have pre-committed never to read individually (spec s13 review point 3).
-HELDOUT_EVAL_EPISODES = 128
+# 256 (2026-10-20): evals are now read PAIRED against the base policy's per-seed record
+# (eval/heldout_record.py); seeds 1000-1127 are unchanged, so a 128-seed record still pairs.
+HELDOUT_EVAL_EPISODES = 256
 HELDOUT_EVAL_EVERY = 5             # iterations between held-out evals (plus the final iteration)
 PATH_NORMALISED = True             # Task 1 landed; both arms see normalised observations.
 # Mean-centred advantages (r - mean), NOT std-normalised (2026-10-06). Arm 3 iter 0 showed why:
@@ -274,7 +276,7 @@ def _group_size_suffix(n_rollouts: int) -> str:
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False, eval_at_end=False,
-                n_rollouts=N_ROLLOUTS):
+                n_rollouts=N_ROLLOUTS, baseline_eval=False):
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
@@ -578,7 +580,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # is unchanged. The opponent's hardware is part of the episode distribution.
         phase_identity["defender_placement"] = f"remote-{REMOTE_DEF_GPU}"
     start_iter = 0
-    resume_dir = latest_checkpoint(ckpt_root)
+    # Baseline mode measures the UNTRAINED policy, so it must never load a lineage's weights.
+    resume_dir = None if baseline_eval else latest_checkpoint(ckpt_root)
     if resume_dir is not None:
         resume_meta = read_meta(resume_dir)
         validate_phase_identity(
@@ -597,7 +600,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         print(f"resuming from {resume_dir} at iter {start_iter}", flush=True)
     else:
         cumulative_gen_tokens = 0
-        print("no checkpoint found — starting fresh at iter 0", flush=True)
+        print("baseline eval: checkpoints ignored" if baseline_eval
+              else "no checkpoint found — starting fresh at iter 0", flush=True)
 
     # --- v5 allocation state ---------------------------------------------------------------
     # Banks live under the checkpoint root (one directory per task) with the source records they
@@ -641,6 +645,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from concurrent.futures import ThreadPoolExecutor
     from redteamrl.harness.episode import run_episode
     from redteamrl.attack_sft.eval_metrics import mean_stalled_turn_rate, dead_observation_rate
+    from redteamrl.eval.heldout_record import make_record, save_record
     # build_generated_tasks / randomize_task_canary / CANARY_SEED / CANARY_REVISION are imported
     # and defined above.
     HELDOUT_SEED_START = 1000
@@ -669,8 +674,13 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         attack = next(t for t in tasks if t.episode_type == "attack")
         return randomize_task_canary(attack, 0, CANARY_SEED, CANARY_REVISION)
 
+    def _heldout_seeds(n):
+        # One definition, used by the eval AND by the per-seed records: a record's seed list must be
+        # exactly the seeds its outcomes came from (pool.map keeps order), or pairing is garbage.
+        return list(range(HELDOUT_SEED_START, HELDOUT_SEED_START + n))
+
     def _run_heldout_eval(n):
-        seeds = range(HELDOUT_SEED_START, HELDOUT_SEED_START + n)
+        seeds = _heldout_seeds(n)
 
         def one(seed):
             # Mirror attack_agent_factory / defender_factory_for exactly (same system prompts, same
@@ -692,6 +702,37 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 
         with ThreadPoolExecutor(max_workers=ROLLOUT_WORKERS) as pool:
             return list(pool.map(one, seeds))
+
+    if baseline_eval:
+        # The UNTRAINED policy's held-out rate: the anchor every lineage's held-out number is read
+        # against (none was ever measured -- v4 skipped its eval). Nothing has been published yet,
+        # so vLLM still serves the startup adapter: a freshly initialised LoRA (B = 0), i.e.
+        # exactly the base model, through the same served name, prompts, greedy decode and frozen
+        # defender a training run's held-out eval uses. Prove that before measuring.
+        registered = served_lora_path(f"http://localhost:{ATK_PORT}", "attacker")
+        if (registered is None
+                or os.path.realpath(registered) != os.path.realpath(adapter_serve_dir)):
+            raise RuntimeError(f"baseline eval must measure the fresh startup adapter "
+                               f"({adapter_serve_dir}), but vLLM serves {registered}")
+        heldout = _run_heldout_eval(HELDOUT_EVAL_EPISODES)
+        wins = sum(r.outcome == "leak" for r in heldout)
+        win_rate = wins / len(heldout)
+        stalled = mean_stalled_turn_rate([r.steps for r in heldout])
+        dead = sum(dead_observation_rate(r.steps) for r in heldout) / len(heldout)
+        print(f"baseline heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
+              f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
+        # Per-seed, so any later checkpoint can be compared to it PAIRED (eval/heldout_record.py).
+        save_record(os.path.join("/runs/attacker-heldout-baseline", f"base-n{len(heldout)}.json"),
+                    make_record(_heldout_seeds(len(heldout)), [r.outcome for r in heldout],
+                                turns=[r.n_turns for r in heldout], policy="base",
+                                stalled_rate=stalled, dead_rate=dead,
+                                attacker=ATTACKER_MODEL,
+                                attacker_sft_adapter=ATTACKER_SFT_ADAPTER,
+                                defender_sft_adapter=DEFENDER_SFT_ADAPTER,
+                                defender_grpo_adapter=DEFENDER_GRPO_ADAPTER,
+                                max_turns=MAX_TURNS, atk_max_tokens=ATK_MAX_TOKENS))
+        runs.commit()
+        return
 
     # Per-process CPU every 60s: a single-threaded process pinned at ~100% (a vLLM scheduler loop,
     # an API server, or the GIL-bound rollout harness) is the leading suspect for the attacker
@@ -852,6 +893,16 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             print(f"iter {it:3d} heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
                   f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
             heldout_m = {"win_rate": win_rate, "stalled_rate": stalled, "dead_rate": dead}
+            try:   # per-seed record for paired comparisons; telemetry, never fatal
+                save_record(os.path.join(ckpt_root, "heldout", f"iter{it}.json"),
+                            make_record(_heldout_seeds(len(heldout)),
+                                        [r.outcome for r in heldout],
+                                        turns=[r.n_turns for r in heldout], policy=ckpt_root,
+                                        iter=it, cum_gen=cumulative_gen_tokens,
+                                        stalled_rate=stalled, dead_rate=dead))
+            except Exception as exc:
+                print(f"[heldout] iter {it}: could not save the per-seed record: {exc!r}",
+                      flush=True)
         try:   # telemetry must never cost the run: a builder KeyError is a warning, not a crash
             metrics = attacker_metrics(
                 live=live, n_examples=len(examples), div=div, rew=rew, summary=summary,
@@ -887,7 +938,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
-          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS):
+          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -903,7 +954,8 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
     active_servers = []
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
-                           skip_final_update, split_defender, eval_at_end, n_rollouts)
+                           skip_final_update, split_defender, eval_at_end, n_rollouts,
+                           baseline_eval)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -915,7 +967,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
 @app.local_entrypoint()
 def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
-         eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS):
+         eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False):
     if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
-                    eval_at_end, n_rollouts) == "oom":
+                    eval_at_end, n_rollouts, baseline_eval) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")
