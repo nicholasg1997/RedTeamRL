@@ -41,6 +41,37 @@ def _bank_one(banks: dict[str, StartStateBank], ep: dict, level: int, key_turn: 
     return True
 
 
+def bank_episodes(episodes: dict[int, dict], banks: dict[str, StartStateBank], iteration: int,
+                  record_dir: str, max_near_misses: int = DEFAULT_MAX_NEAR_MISSES) -> tuple[int, int]:
+    """Bank every win and each task's best fresh near misses; returns (wins, near misses) banked.
+
+    Idempotent: an entry id is a function of (task, iteration, episode), so re-banking the same
+    episodes rewrites the same entries. v7 relies on this to bank the base pass BEFORE replacement
+    planning and again at finalize."""
+    banked_wins = banked_near = 0
+    near_by_task: dict[str, list[tuple[int, int, dict]]] = {}
+    for ep in episodes.values():
+        if "record" not in ep:
+            continue
+        level, key_turn = ep["closeness"]
+        if key_turn < 1:
+            continue                     # nothing before it to restart from; takes no quota
+        if level == 3:
+            banked_wins += _bank_one(banks, ep, level, key_turn, iteration, record_dir)
+        elif level in (1, 2) and _is_fresh(ep):
+            # A restart inherits its source's prefix, so its near miss is usually the source's own
+            # (already banked). Only fresh episodes add new near-miss starts; a restart's WIN is
+            # always new, since the prefix stops before the source's key turn.
+            near_by_task.setdefault(ep["task_id"], []).append((level, key_turn, ep))
+    for task_id, candidates in near_by_task.items():
+        # Closest first, then earliest (most turns left to find its own way past the defender);
+        # episode id breaks ties so the choice is deterministic.
+        candidates.sort(key=lambda c: (-c[0], c[1], c[2]["episode_id"]))
+        for level, key_turn, ep in candidates[:max_near_misses]:
+            banked_near += _bank_one(banks, ep, level, key_turn, iteration, record_dir)
+    return banked_wins, banked_near
+
+
 def finalize_iteration(episodes: dict[int, dict], plans: list[GroupPlan],
                        banks: dict[str, StartStateBank], stats: dict[str, TaskStats],
                        iteration: int, n_rollouts: int, record_dir: str, params: AllocParams,
@@ -64,27 +95,8 @@ def finalize_iteration(episodes: dict[int, dict], plans: list[GroupPlan],
             else:
                 task_stats.skip()
 
-    banked_wins = banked_near = 0
-    near_by_task: dict[str, list[tuple[int, int, dict]]] = {}
-    for ep in episodes.values():
-        if "record" not in ep:
-            continue
-        level, key_turn = ep["closeness"]
-        if key_turn < 1:
-            continue                     # nothing before it to restart from; takes no quota
-        if level == 3:
-            banked_wins += _bank_one(banks, ep, level, key_turn, iteration, record_dir)
-        elif level in (1, 2) and _is_fresh(ep):
-            # A restart inherits its source's prefix, so its near miss is usually the source's own
-            # (already banked). Only fresh episodes add new near-miss starts; a restart's WIN is
-            # always new, since the prefix stops before the source's key turn.
-            near_by_task.setdefault(ep["task_id"], []).append((level, key_turn, ep))
-    for task_id, candidates in near_by_task.items():
-        # Closest first, then earliest (most turns left to find its own way past the defender);
-        # episode id breaks ties so the choice is deterministic.
-        candidates.sort(key=lambda c: (-c[0], c[1], c[2]["episode_id"]))
-        for level, key_turn, ep in candidates[:max_near_misses]:
-            banked_near += _bank_one(banks, ep, level, key_turn, iteration, record_dir)
+    banked_wins, banked_near = bank_episodes(episodes, banks, iteration, record_dir,
+                                             max_near_misses)
 
     evicted = 0
     for bank in banks.values():
