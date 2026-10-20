@@ -154,11 +154,14 @@ def _due_reason(stats: TaskStats, params: AllocParams) -> str | None:
     return None
 
 
-def _draw_restart(bank: StartStateBank | None, rng: random.Random, used: set[str]):
+def draw_restart(bank: StartStateBank | None, rng: random.Random, used: set[str]):
     if bank is None:
         return None
     return (bank.sample(rng, levels=WIN_LEVELS, exclude=used)
             or bank.sample(rng, levels=NEAR_MISS_LEVELS, exclude=used))
+
+
+_draw_restart = draw_restart       # pre-v6 name
 
 
 def turn_for(depth_frac: float, key_turn: int) -> int:
