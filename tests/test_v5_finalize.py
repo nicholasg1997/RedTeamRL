@@ -141,10 +141,12 @@ def test_v5_identity_changes_with_every_allocation_parameter():
     from dataclasses import replace
     from redteamrl.train.v5_finalize import v5_identity
     base = v5_identity(P)
-    for field_name, value in [("window", 4), ("revisit_every", 2), ("restart_fraction_max", 0.25),
+    for field_name, value in [("window", 4), ("revisit_backoff", (3, 6)), ("restart_fraction_max", 0.25),
                               ("max_state_age_iters", 9), ("max_fresh_per_task", 3),
                               ("lambda_staleness", 0.2), ("prior_wins", 2.0),
-                              ("restart_depth_rule", "other"), ("priority_version", "plr-v2")]:
+                              ("restart_depth_rule", "other"), ("priority_version", "plr-v2"),
+                              ("depth_start", 0.3), ("depth_high", 0.9), ("depth_low", 0.1),
+                              ("depth_step", 0.1), ("depth_min", 0.2), ("max_replacements", 2)]:
         assert v5_identity(replace(P, **{field_name: value})) != base, field_name
     assert v5_identity(P, max_near_misses=5) != base
 

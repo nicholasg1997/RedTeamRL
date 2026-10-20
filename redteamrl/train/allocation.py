@@ -5,8 +5,10 @@ produce all-loss groups, so full-length episodes on a task that never wins buy n
 fills a FIXED number of group slots (so token budgets stay comparable across lineages) with:
 
   * fresh groups  -- a normal episode from turn 0. A task gets one if it is live (it won recently),
-                     brand new, or has gone `revisit_every` iterations without one, so a dead task
-                     can come back to life. Leftover slots are filled by priority.
+                     brand new, or has gone its revisit gap without one, so a dead task can come
+                     back to life. The gap backs off along `revisit_backoff` (v6) each time a revisit
+                     stays dead, capped at the last value so no task is ever banished. Leftover slots
+                     are filled by priority.
   * restart groups -- begin part-way through an earlier episode on the SAME task: a past win first,
                      else a near miss. Lowest-win-rate tasks first, capped at `restart_fraction_max`
                      of the slots so fresh episodes always stay at least half of an iteration.
@@ -33,7 +35,7 @@ NEAR_MISS_LEVELS = {1, 2}
 @dataclass(frozen=True)
 class AllocParams:
     window: int = 3                      # iterations of fresh-start history behind a task's win rate
-    revisit_every: int = 3               # a dead task is fresh-sampled at least this often
+    revisit_backoff: tuple[int, ...] = (3, 6, 9)   # revisit gap by dead_revisits, capped at the last
     restart_fraction_max: float = 0.5    # restart groups never exceed this share of the slots
     max_state_age_iters: int = 5         # bank entries older than this are evicted by the driver
     max_fresh_per_task: int = 2
@@ -52,7 +54,9 @@ class AllocParams:
     max_replacements: int = 4            # v6 dynamic sampling: extra groups per iteration, hard cap
 
     def as_identity(self) -> dict:
-        return {f"alloc_{k}": v for k, v in self.__dict__.items()}
+        # JSON-safe: read_meta returns lists, so a tuple here would refuse every resume.
+        return {f"alloc_{k}": list(v) if isinstance(v, tuple) else v
+                for k, v in self.__dict__.items()}
 
 
 DEFAULT_PARAMS = AllocParams()
@@ -64,6 +68,7 @@ class TaskStats:
     task_id: str
     history: list[tuple[int, int]] = field(default_factory=list)   # (wins, episodes), newest last
     iters_since_fresh: int = 0
+    dead_revisits: int = 0               # consecutive unwon revisits; indexes revisit_backoff (v6)
 
     @property
     def wins(self) -> int:
@@ -82,13 +87,22 @@ class TaskStats:
         """This iteration gave the task no fresh group."""
         self.iters_since_fresh += 1
 
+    def note_fresh_outcome(self, won_any: bool, revisited: bool) -> None:
+        """A fresh group's outcome moves the revisit backoff: a win resets it, an unwon revisit
+        grows it, and an unwon new/leftover group leaves it alone."""
+        if won_any:
+            self.dead_revisits = 0
+        elif revisited:
+            self.dead_revisits += 1
+
     def to_dict(self) -> dict:
         return {"task_id": self.task_id, "history": [list(h) for h in self.history],
-                "iters_since_fresh": self.iters_since_fresh}
+                "iters_since_fresh": self.iters_since_fresh, "dead_revisits": self.dead_revisits}
 
     @classmethod
     def from_dict(cls, d: dict) -> "TaskStats":
-        return cls(d["task_id"], [tuple(h) for h in d["history"]], d["iters_since_fresh"])
+        return cls(d["task_id"], [tuple(h) for h in d["history"]], d["iters_since_fresh"],
+                   d.get("dead_revisits", 0))
 
 
 @dataclass
@@ -124,12 +138,18 @@ def task_priority(stats: TaskStats, params: AllocParams = DEFAULT_PARAMS) -> flo
     return p * (1.0 - p) + params.lambda_staleness * stats.iters_since_fresh
 
 
+def revisit_gap(stats: TaskStats, params: AllocParams = DEFAULT_PARAMS) -> int:
+    """Iterations a dead task waits between fresh revisits; capped, so it is never banished."""
+    backoff = params.revisit_backoff
+    return backoff[min(stats.dead_revisits, len(backoff) - 1)]
+
+
 def _due_reason(stats: TaskStats, params: AllocParams) -> str | None:
     if stats.episodes == 0:
         return "new"
     if stats.wins > 0:
         return "live"
-    if stats.iters_since_fresh >= params.revisit_every:
+    if stats.iters_since_fresh >= revisit_gap(stats, params):
         return "revisit"
     return None
 

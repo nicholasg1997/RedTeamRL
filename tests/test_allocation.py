@@ -59,7 +59,7 @@ def test_dead_task_is_not_fresh_sampled_until_the_revisit_is_due():
     banks = _banks({"gen-0": [_entry("w0", "gen-0")]})
     plans = _plan(stats(since=1), banks)
     assert not any(p.kind == "fresh" and p.task_id == "gen-0" for p in plans)
-    plans = _plan(stats(since=P.revisit_every), banks)
+    plans = _plan(stats(since=P.revisit_backoff[0]), banks)
     assert any(p.kind == "fresh" and p.task_id == "gen-0" for p in plans)
 
 
@@ -144,7 +144,7 @@ def test_revisit_due_task_beats_live_tasks_when_slots_are_scarce():
     # 12 tasks are due but only 11 fresh slots exist (one restart): the dead-but-due task must be
     # kept, otherwise live tasks could crowd it out indefinitely.
     stats = [_stats(t, history=[(7, 8)] * 3, since=1) for t in TASKS]      # very high win rate
-    stats[0] = _stats("gen-0", history=[(0, 8)] * 3, since=P.revisit_every)
+    stats[0] = _stats("gen-0", history=[(0, 8)] * 3, since=P.revisit_backoff[0])
     banks = _banks({"gen-4": [_entry("w4", "gen-4")]})
     plans = _plan(stats, banks)
     assert any(p.kind == "fresh" and p.task_id == "gen-0" and p.reason == "revisit" for p in plans)
