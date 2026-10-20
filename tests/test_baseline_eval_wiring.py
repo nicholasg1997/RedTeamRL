@@ -147,3 +147,13 @@ def test_baseline_record_names_a_non_default_turn_budget():
     path = ast.get_source_segment(src, _calls(branch, "save_record")[0].args[0])
     assert "{turns_tag}" in path
     assert 'turns_tag = "" if max_turns == MAX_TURNS else f"-t{max_turns}"' in src
+
+
+def test_baseline_record_names_a_non_default_hint_so_it_never_overwrites_v1():
+    # A v2-prompt baseline must not clobber base-n256.json (the v1 reference everything is read
+    # against). The hint version goes in the filename whenever it is not the original v1 hint.
+    src, tree = _src_tree()
+    branch = _baseline_branch(_func(tree, "_train_impl"))
+    path = ast.get_source_segment(src, _calls(branch, "save_record")[0].args[0])
+    assert "{hint_tag}" in path
+    assert 'hint_tag = "" if ATTACKER_HINT_VERSION == "technique-v1" else f"-{ATTACKER_HINT_VERSION}"' in src

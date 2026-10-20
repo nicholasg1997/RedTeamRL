@@ -788,8 +788,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
         # Per-seed, so any later checkpoint can be compared to it PAIRED (eval/heldout_record.py).
         turns_tag = "" if max_turns == MAX_TURNS else f"-t{max_turns}"   # 12-turn name unchanged
+        # The ORIGINAL hint keeps the original name (base-n256.json, the v1 reference); any other
+        # prompt version gets its own file so a new-prompt baseline can never overwrite it.
+        hint_tag = "" if ATTACKER_HINT_VERSION == "technique-v1" else f"-{ATTACKER_HINT_VERSION}"
         save_record(os.path.join("/runs/attacker-heldout-baseline",
-                                 f"base-n{len(heldout)}{turns_tag}.json"),
+                                 f"base-n{len(heldout)}{turns_tag}{hint_tag}.json"),
                     make_record(_heldout_seeds(len(heldout)), [r.outcome for r in heldout],
                                 turns=[r.n_turns for r in heldout], policy="base",
                                 stalled_rate=stalled, dead_rate=dead,
@@ -797,7 +800,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                 attacker_sft_adapter=ATTACKER_SFT_ADAPTER,
                                 defender_sft_adapter=DEFENDER_SFT_ADAPTER,
                                 defender_grpo_adapter=DEFENDER_GRPO_ADAPTER,
-                                max_turns=max_turns, atk_max_tokens=ATK_MAX_TOKENS))
+                                max_turns=max_turns, atk_max_tokens=ATK_MAX_TOKENS,
+                                attacker_hint_version=ATTACKER_HINT_VERSION))
         runs.commit()
         return
 
