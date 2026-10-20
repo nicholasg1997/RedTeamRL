@@ -10,6 +10,8 @@ fills a FIXED number of group slots (so token budgets stay comparable across lin
   * restart groups -- begin part-way through an earlier episode on the SAME task: a past win first,
                      else a near miss. Lowest-win-rate tasks first, capped at `restart_fraction_max`
                      of the slots so fresh episodes always stay at least half of an iteration.
+                     The prefix length is per entry (v6): each entry keeps a depth fraction that
+                     moves toward the trainable band at finalize (see step_depth).
 
 Selection only: nothing here touches reward. `allocate` is a pure function of its arguments (the
 caller seeds `rng` from the iteration), so a resumed iteration rebuilds the identical plan and its
@@ -17,6 +19,7 @@ banked episodes still line up with their groups.
 """
 from __future__ import annotations
 
+import math
 import random
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -37,8 +40,16 @@ class AllocParams:
     lambda_staleness: float = 0.05       # priority bonus per iteration without a fresh group
     prior_wins: float = 1.0              # smoothing: a task with 1 win in 8 is not "12.5% for sure"
     prior_losses: float = 9.0
-    restart_depth_rule: str = "uniform_1_to_key"
+    restart_depth_rule: str = "adaptive-v1"
     priority_version: str = "plr-v1"
+    # v6 adaptive restart depth (spec 2026-10-19 s5): each bank entry keeps the fraction of its key
+    # turn to replay as prefix, and moves it toward the trainable band at finalize.
+    depth_start: float = 0.5             # a new entry replays half its prefix
+    depth_high: float = 0.85             # group win rate >= this: too easy, start earlier
+    depth_low: float = 0.15              # group win rate <= this: too hard, start later
+    depth_step: float = 0.2
+    depth_min: float = 0.1               # reachable exactly from 0.5; turn_for's max(1, .) is the k >= 1 guard
+    max_replacements: int = 4            # v6 dynamic sampling: extra groups per iteration, hard cap
 
     def as_identity(self) -> dict:
         return {f"alloc_{k}": v for k, v in self.__dict__.items()}
@@ -89,6 +100,7 @@ class GroupPlan:
     reason: str                          # for the log: new / live / revisit / leftover / restart-*
     entry: BankEntry | None = None
     restart_turn: int | None = None      # number of prefix turns kept; the policy acts from here
+    depth_frac: float | None = None      # the depth this restart group ran at (None for fresh)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -129,9 +141,53 @@ def _draw_restart(bank: StartStateBank | None, rng: random.Random, used: set[str
             or bank.sample(rng, levels=NEAR_MISS_LEVELS, exclude=used))
 
 
+def turn_for(depth_frac: float, key_turn: int) -> int:
+    """Prefix turns to replay: `depth_frac` of the key turn, rounded half-up (Python's round() is
+    banker's: round(2.5) == 2), and always within [1, key_turn]."""
+    return max(1, min(key_turn, math.floor(depth_frac * key_turn + 0.5)))
+
+
+def stored_depth(entry_id: str, depths: dict[str, float],
+                 params: AllocParams = DEFAULT_PARAMS) -> float:
+    return depths.get(entry_id, params.depth_start)
+
+
+def depth_for(entry: BankEntry, depths: dict[str, float], params: AllocParams = DEFAULT_PARAMS) -> int:
+    return turn_for(stored_depth(entry.entry_id, depths, params), entry.key_turn)
+
+
+def step_depth(depth_frac: float, win_rate: float, params: AllocParams = DEFAULT_PARAMS) -> float:
+    """One move toward the trainable band. All wins: start earlier (hand the policy less). All
+    losses: start later. In band: hold. Rounded so repeated steps land on exact values."""
+    if win_rate >= params.depth_high:
+        depth_frac -= params.depth_step
+    elif win_rate <= params.depth_low:
+        depth_frac += params.depth_step
+    return round(min(1.0, max(params.depth_min, depth_frac)), 6)
+
+
+def one_shot_depth(depth_frac: float, all_win: bool, params: AllocParams = DEFAULT_PARAMS) -> float:
+    """The corrected depth for a dead restart group's same-iteration replacement. Never persisted:
+    the stored depth moves only at finalize (spec s5, hybrid timing)."""
+    return step_depth(depth_frac, 1.0 if all_win else 0.0, params)
+
+
+def update_depths(depths: dict[str, float], groups: list[tuple[str, float, float]],
+                  live_entry_ids: set[str], params: AllocParams = DEFAULT_PARAMS) -> dict[str, float]:
+    """The finalize-time depth update. `groups` is (entry_id, depth it ran at, win rate) in ascending
+    slot order; an entry with several groups takes the last. Entries no longer banked are dropped.
+    Returns a new dict."""
+    out = dict(depths)
+    for entry_id, ran_at, win_rate in groups:
+        out[entry_id] = step_depth(ran_at, win_rate, params)
+    return {k: v for k, v in out.items() if k in live_entry_ids}
+
+
 def allocate(task_stats: list[TaskStats], banks: dict[str, StartStateBank], n_slots: int,
              iteration: int, rng: random.Random,
-             params: AllocParams = DEFAULT_PARAMS) -> list[GroupPlan]:
+             params: AllocParams = DEFAULT_PARAMS,
+             depths: dict[str, float] | None = None) -> list[GroupPlan]:
+    depths = depths or {}
     stats = sorted(task_stats, key=lambda s: s.task_id)
     max_restarts = int(params.restart_fraction_max * n_slots)
 
@@ -149,7 +205,7 @@ def allocate(task_stats: list[TaskStats], banks: dict[str, StartStateBank], n_sl
             if entry is None:
                 continue
             used.add(entry.entry_id)
-            restarts.append((s.task_id, entry, rng.randint(1, entry.key_turn)))
+            restarts.append((s.task_id, entry, depth_for(entry, depths, params)))
             progressed = True
         if not progressed:
             break
@@ -185,5 +241,6 @@ def allocate(task_stats: list[TaskStats], banks: dict[str, StartStateBank], n_sl
         kind = "win" if entry.level in WIN_LEVELS else "near-miss"
         plans.append(GroupPlan(task_id, "restart", slot,
                                f"{task_id}@{entry.entry_id}:{k}#slot{slot}",
-                               f"restart-{kind}", entry, k))
+                               f"restart-{kind}", entry, k,
+                               stored_depth(entry.entry_id, depths, params)))
     return plans
