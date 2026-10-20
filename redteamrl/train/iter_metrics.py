@@ -25,6 +25,16 @@ def _common(*, live, n_examples, div, rew, tactics, update, rollout_min, update_
         "update.grad_norm": update["grad_norm"],
         "update.ratio": update["mean_ratio"],
     }
+    # v7 minibatch-update keys: present only when the update reported them (absent, never 0).
+    if "steps" in update:
+        out.update({
+            "update.steps": update["steps"],
+            "update.early_stopped": int(update["early_stopped"]),
+            "update.kl_iter": update["kl_iter"],
+            "update.clip_frac": update["clip_frac"],
+        })
+    if "lr" in update:
+        out["update.lr"] = update["lr"]
     for tactic, count in tactics["leaks"].items():
         out[f"diversity.leaks.{tactic}"] = count
     return out
@@ -61,6 +71,14 @@ def attacker_metrics(*, live: int, n_examples: int, div: dict, rew: dict, summar
         })
         for bucket, rate in summary["win_by_depth"].items():
             out[f"restart.win_by_depth.{bucket}"] = rate
+    # v7 graduation / same-iteration banking keys exist only when the summary came from finalize_v7.
+    if "graduated" in summary:
+        out.update({
+            "restart.graduated": summary["graduated"],
+            "restart.graduated_total": summary["graduated_total"],
+            "restart.same_iter_replacements": summary["same_iter_replacements"],
+            "restart.same_iter_replacements_live": summary["same_iter_replacements_live"],
+        })
     # Held-out keys exist only on iterations that ran the eval: ABSENT, never 0, so the chart
     # shows sparse points instead of a fake drop to zero.
     if heldout is not None:

@@ -151,3 +151,37 @@ def test_v6_restart_keys_present_only_with_v6_summary():
 
 def test_v6_rates_none_when_no_base_groups():
     assert _attacker_with(_v6_summary(n_base_groups=0))["restart.dead_before"] is None
+
+
+# --- v7 -------------------------------------------------------------------------------------------
+
+V7_UPDATE = {"steps": 16, "early_stopped": False, "kl_iter": 0.008, "clip_frac": 0.02, "lr": 4.5e-5}
+
+
+def test_v7_update_metrics_present_when_reported():
+    from redteamrl.train.iter_metrics import attacker_metrics
+    div, rew, summary, tactics, m, _ = _inputs()
+    got = attacker_metrics(live=386, n_examples=900, div=div, rew=rew, summary=summary,
+                           tactics=tactics, update={**m, **V7_UPDATE}, rollout_min=5.0,
+                           update_min=9.0, gen_tokens=72000, peak_gib=26.7, banks_size=127,
+                           win_routes=29)
+    assert got["update.steps"] == 16 and got["update.early_stopped"] == 0
+    assert got["update.kl_iter"] == 0.008 and got["update.clip_frac"] == 0.02
+    assert got["update.lr"] == 4.5e-5
+
+
+def test_defender_update_without_new_keys_still_builds():
+    assert set(_defender()) == DEFENDER_KEYS
+
+
+def test_v7_restart_metrics_present_only_with_graduation_summary():
+    from redteamrl.train.iter_metrics import attacker_metrics
+    div, rew, summary, tactics, m, _ = _inputs()
+    v7 = {**summary, "graduated": 2, "graduated_total": 5, "same_iter_replacements": 3,
+          "same_iter_replacements_live": 1}
+    got = attacker_metrics(live=386, n_examples=900, div=div, rew=rew, summary=v7,
+                           tactics=tactics, update=m, rollout_min=5.0, update_min=9.0,
+                           gen_tokens=72000, peak_gib=26.7, banks_size=127, win_routes=29)
+    assert (got["restart.graduated"], got["restart.graduated_total"]) == (2, 5)
+    assert (got["restart.same_iter_replacements"], got["restart.same_iter_replacements_live"]) == (3, 1)
+    assert "restart.graduated" not in _attacker()
