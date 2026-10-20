@@ -1,9 +1,11 @@
 """v6 dynamic sampling: give dead base groups one bounded replacement attempt per iteration.
 
-A group whose episodes all scored the same carries no gradient. Under v6's arm-2 win/loss reward,
-"all rewards equal" is exactly "zero advantage"; under a shaped reward (the arm-3 repeat penalty) it
-is not, which is why the driver refuses any other arm. A dead group's episodes are still banked; it
-just does not count as a slot that delivered gradient.
+A group is DEAD when its outcome is already decided: every episode won, or every episode lost.
+Deadness is judged on outcome (`won`), not on reward equality, because a win's reward carries a small
+turn penalty (1 - 0.1*turns/max_turns): eight wins on different turns differ by a few hundredths
+and so are not reward-uniform, yet they only teach "win slightly faster" at ~1/10 the advantage of
+a real mixed group. A dead group's episodes are still banked; it just does not count as a slot that
+delivered the win-or-lose signal.
 
 Pure and deterministic: replacements are a function of the completed base episodes, the banks, the
 stored depths and a seeded rng, and are persisted as replacements.json beside plans.json, so a
@@ -32,11 +34,11 @@ def slot_episodes(episodes: dict[int, dict], plan: GroupPlan, n_rollouts: int) -
 
 def is_dead(group: list[dict]) -> bool:
     """True iff every group_key bucket (the buckets assign_advantages uses; restart fallbacks form
-    their own) has a single distinct reward."""
+    their own) is outcome-uniform: all won or all lost."""
     buckets: dict[str, set] = {}
     for ep in group:
-        buckets.setdefault(ep["group_key"], set()).add(ep["reward"])
-    return all(len(rewards) == 1 for rewards in buckets.values())
+        buckets.setdefault(ep["group_key"], set()).add(bool(ep["won"]))
+    return all(len(outcomes) == 1 for outcomes in buckets.values())
 
 
 def classify(episodes: dict[int, dict], plans: list[GroupPlan], n_rollouts: int) -> dict[int, bool]:

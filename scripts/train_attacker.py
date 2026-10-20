@@ -278,7 +278,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
-    assert arm == 2, "v6 pins arm 2: 'dead' = uniform reward only under win/loss reward (spec s3)"
+    assert arm == 2, "v6 pins arm 2: a clean continuation of the v5 result (spec s3 decision)"
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag

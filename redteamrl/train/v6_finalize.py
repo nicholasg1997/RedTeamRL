@@ -80,5 +80,5 @@ def finalize_v6(episodes: dict[int, dict], base_plans: list[GroupPlan],
 
 
 def v6_identity(params: AllocParams, max_near_misses: int = DEFAULT_MAX_NEAR_MISSES) -> dict:
-    return {**v5_identity(params, max_near_misses), "dead_rule": "uniform-reward-arm2",
+    return {**v5_identity(params, max_near_misses), "dead_rule": "uniform-outcome",
             "replacement_version": 1}

@@ -146,3 +146,17 @@ def test_empty_plan_is_persisted_as_empty_list(tmp_path):
     calls = []
     load_or_plan(path, lambda: calls.append(1) or [])
     assert calls == []
+
+
+def test_all_win_group_with_turn_penalised_rewards_is_dead():
+    # A win scores 1 - 0.1*turns/max_turns, so 8 wins on different turns have different rewards.
+    # They are still a decided (all-win) group and must be replaced with a harder start.
+    e = _entry("w")
+    base = _restart(0, e)
+    episodes = {}
+    for r, reward in enumerate([0.925, 0.95, 0.975, 0.9]):
+        ep = _ep(base, r, reward, True)
+        episodes[ep["episode_id"]] = ep
+    assert is_dead(list(episodes.values()))
+    rep = _plan(episodes, [base], _banks([e]))
+    assert len(rep) == 1 and rep[0].reason.endswith("-earlier")
