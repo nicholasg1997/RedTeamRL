@@ -174,8 +174,9 @@ ADVANTAGE_STD_NORMALIZE = False
 # old_lp taken from epoch 0, checkpoint recompute skipped for small micro-batches, and the update
 # hyperparameters (inner_epochs, beta, clip_eps) are now in phase_identity. v5 = adaptive task
 # allocation + restarts from earlier win / near-miss states (spec 2026-10-18): who gets a fresh
-# group vs a restart group changes every iteration's episode distribution.
-LINEAGE = "v5"
+# group vs a restart group changes every iteration's episode distribution. v6 = dynamic sampling
+# (dead base groups get bounded replacement groups), revisit backoff, adaptive restart depth.
+LINEAGE = "v6"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -266,14 +267,21 @@ class RemoteDefender:
         stop_vllm_server(getattr(self, "proc", None))
 
 
+def _group_size_suffix(n_rollouts: int) -> str:
+    """Checkpoint-root suffix for a non-default group size, so a G=12 run never resumes a G=8 one."""
+    return "" if n_rollouts == N_ROLLOUTS else f"-g{n_rollouts}"
+
+
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
-                skip_final_update=False, split_defender=False, eval_at_end=False):
+                skip_final_update=False, split_defender=False, eval_at_end=False,
+                n_rollouts=N_ROLLOUTS):
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
-    assert arm in (2, 3), f"arm must be 2 or 3, got {arm}"
+    assert arm == 2, "v6 pins arm 2: 'dead' = uniform reward only under win/loss reward (spec s3)"
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
+    ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag
     if split_defender:
         # Separate lineage: the defender on L4 kernels can flip near-tied greedy tokens vs the
         # A100, i.e. a (slightly) different opponent -- never mix the two in one checkpoint chain.
@@ -337,7 +345,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from redteamrl.train.allocation import AllocParams, GroupPlan, TaskStats, allocate
     from redteamrl.train.banks import StartStateBank
     from redteamrl.train.episode_store import read_episodes
-    from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES, finalize_iteration, v5_identity
+    from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES
+    from redteamrl.train.v6_finalize import finalize_v6, v6_identity
+    from redteamrl.train.replacement import load_or_plan, plan_replacements
     from redteamrl.train.metrics_log import MetricsLog
     from redteamrl.train.iter_metrics import attacker_metrics
     from redteamrl.train.train import tactic_counts
@@ -400,13 +410,15 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         Keying on rollout_index alone replants the SAME six secrets every iteration, so a policy
         could earn the whole reward by memorizing six strings and generalize to nothing. Including
         the iteration makes every episode a secret the model has not seen, so improvement has to
-        transfer. `rollout_index` is slot * N_ROLLOUTS + r (v5), so a task that holds two groups in
+        transfer. `rollout_index` is slot * n_rollouts + r, and v6 replacement slots run past the
+        base slots, so the stride reserves room for them; a task that holds two groups in
         one iteration still draws distinct secrets. Still a pure function of its arguments, so a
         resumed run reproduces exactly the canaries its banked episodes were generated with.
         """
         def episode_task(spec, rollout_index):
             return randomize_task_canary(
-                spec, iteration * len(tasks) * N_ROLLOUTS + rollout_index, CANARY_SEED,
+                spec, iteration * (len(tasks) + alloc.max_replacements) * n_rollouts
+                + rollout_index, CANARY_SEED,
                 CANARY_REVISION)
         return episode_task
 
@@ -545,7 +557,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "atk_enable_thinking": False,
         "use_prompt_pool": USE_PROMPT_POOL,
         "prompt_pool_version": PROMPT_POOL_VERSION,
-        "n_rollouts": N_ROLLOUTS,
+        "n_rollouts": n_rollouts,
         "lr": LR,
         "temp": TEMP,
         "max_turns": MAX_TURNS,
@@ -560,7 +572,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "inner_epochs": INNER_EPOCHS, "beta": BETA, "clip_eps": CLIP_EPS,
         "lineage": LINEAGE,
     }
-    phase_identity.update(v5_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
+    phase_identity.update(v6_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
         # is unchanged. The opponent's hardware is part of the episode distribution.
@@ -596,6 +608,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     saved_stats = {d["task_id"]: TaskStats.from_dict(d) for d in
                    (read_meta(resume_dir).get("task_stats", []) if resume_dir is not None else [])}
     task_stats = {task.id: saved_stats.get(task.id, TaskStats(task.id)) for task in tasks}
+    # Per-entry restart depth (v6): moves only at finalize, persisted in each checkpoint's meta.
+    restart_depths: dict[str, float] = (
+        dict(read_meta(resume_dir).get("restart_depths", {})) if resume_dir is not None else {})
 
     def plans_for(iteration, rollout_dir):
         """This iteration's group plan, persisted beside its rollout.
@@ -608,7 +623,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             with open(path) as handle:
                 return [GroupPlan.from_dict(d) for d in json.load(handle)]
         plans = allocate(list(task_stats.values()), banks, len(tasks), iteration,
-                         random.Random(f"alloc-{LINEAGE}-{iteration}"), alloc)
+                         random.Random(f"alloc-{LINEAGE}-{iteration}"), alloc,
+                         depths=restart_depths)
         os.makedirs(rollout_dir, exist_ok=True)
         with open(path + ".tmp", "w") as handle:
             json.dump([plan.to_dict() for plan in plans], handle)
@@ -708,7 +724,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         rollout_t0 = time.monotonic()
         examples = rollout(tasks, attack_agent_factory, benign_agent_factory,
                            defender_factory_for(it),
-                           LocalShellSandbox, cap, n_rollouts=N_ROLLOUTS, max_turns=MAX_TURNS,
+                           LocalShellSandbox, cap, n_rollouts=n_rollouts, max_turns=MAX_TURNS,
                            redaction_enforcement=REDACTION_ENFORCEMENT,
                            trained_side="attacker",
                            post_completion_turns=POST_COMPLETION_TURNS,
@@ -717,12 +733,37 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                            commit=runs.commit, task_transform=episode_task_for(it),
                            reward_transform=reward_transform,
                            group_plans=plans, task_by_id=task_by_id, record_restart_state=True)
+        # v6 dynamic sampling: dead base groups get at most alloc.max_replacements extra groups.
+        # The plan is a function of the completed base episodes and is persisted, so a resume
+        # replays the same replacements against the banked episodes instead of recomputing.
+        replacements = load_or_plan(
+            os.path.join(rollout_dir, "replacements.json"),
+            lambda: plan_replacements(read_episodes(rollout_dir), plans, banks, restart_depths,
+                                      len(tasks), n_rollouts,
+                                      random.Random(f"replace-{LINEAGE}-{it}"), alloc))
+        print(f"iter {it:3d} replace  " + ("  ".join(
+            f"{p.slot}:{p.task_id}@{p.restart_turn}({p.reason})" for p in replacements) or "none"),
+            flush=True)
+        if replacements:
+            examples += rollout(tasks, attack_agent_factory, benign_agent_factory,
+                                defender_factory_for(it),
+                                LocalShellSandbox, cap, n_rollouts=n_rollouts, max_turns=MAX_TURNS,
+                                redaction_enforcement=REDACTION_ENFORCEMENT,
+                                trained_side="attacker",
+                                post_completion_turns=POST_COMPLETION_TURNS,
+                                max_workers=ROLLOUT_WORKERS,
+                                episode_store=rollout_dir,
+                                commit=runs.commit, task_transform=episode_task_for(it),
+                                reward_transform=reward_transform,
+                                group_plans=replacements, task_by_id=task_by_id,
+                                record_restart_state=True)
         rollout_min = (time.monotonic() - rollout_t0) / 60
-        # Stats and banks update from the episode store right away. Both are safe to repeat after
-        # a crash: stats are reloaded from the last checkpoint's meta, banking is idempotent, and
-        # the plan above is fixed by plans.json.
-        summary = finalize_iteration(read_episodes(rollout_dir), plans, banks, task_stats, it,
-                                     N_ROLLOUTS, bank_record_dir, alloc)
+        # Stats, banks and restart depths update from the episode store right away. All are safe to
+        # repeat after a crash: stats and depths reload from the last checkpoint's meta, banking is
+        # idempotent, and both plans are fixed by plans.json / replacements.json.
+        summary, restart_depths = finalize_v6(read_episodes(rollout_dir), plans, replacements,
+                                              banks, task_stats, restart_depths, it, n_rollouts,
+                                              bank_record_dir, alloc)
         runs.commit()
         assign_advantages(examples, normalize_std=ADVANTAGE_STD_NORMALIZE)
         iter_gen_tokens = sum(len(ex.completion_ids) for ex in examples)
@@ -754,6 +795,12 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               f"evicted={summary['evicted']}  bank sizes="
               f"{sum(len(b) for b in banks.values())} win routes="
               f"{sum(b.distinct_routes({3}) for b in banks.values())}", flush=True)
+        depth_mean = summary["depth_frac_mean"]
+        print(f"iter {it:3d} v6       dead_before={summary['dead_before']}/{summary['n_base_groups']} "
+              f"dead_after={summary['dead_after']}  replacements={summary['replacements_live']}/"
+              f"{summary['replacements']} live  depth_mean="
+              f"{'-' if depth_mean is None else f'{depth_mean:.2f}'}  "
+              f"win_by_depth={summary['win_by_depth']}  backoff={summary['backed_off']}", flush=True)
         print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
               flush=True)
         print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
@@ -788,7 +835,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         torch.save(opt.state_dict(), os.path.join(ckpt, "optimizer.pt"))
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity,
                           "cumulative_gen_tokens": cumulative_gen_tokens,
-                          "task_stats": [s.to_dict() for s in task_stats.values()]})
+                          "task_stats": [s.to_dict() for s in task_stats.values()],
+                          "restart_depths": restart_depths})
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
@@ -839,7 +887,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
-          eval_at_end: bool = False):
+          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -855,7 +903,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
     active_servers = []
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
-                           skip_final_update, split_defender, eval_at_end)
+                           skip_final_update, split_defender, eval_at_end, n_rollouts)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -867,7 +915,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
 @app.local_entrypoint()
 def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
-         eval_at_end: bool = False):
+         eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS):
     if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
-                    eval_at_end) == "oom":
+                    eval_at_end, n_rollouts) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")

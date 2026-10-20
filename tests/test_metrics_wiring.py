@@ -73,7 +73,7 @@ def test_defender_driver_logs_metrics_once_per_iteration():
 
 
 @pytest.mark.parametrize("path,prefixes", [
-    ("scripts/train_attacker.py", ["alloc", "rollout", "v5", "tokens", "tactics", "update", "heldout"]),
+    ("scripts/train_attacker.py", ["alloc", "rollout", "v5", "v6", "replace", "tokens", "tactics", "update", "heldout"]),
     ("scripts/train_defender.py", ["rollout", "tactics", "update"]),
 ])
 def test_print_lines_untouched(path, prefixes):

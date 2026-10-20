@@ -159,14 +159,8 @@ def test_near_misses_come_only_from_fresh_episodes_but_restart_wins_are_banked(t
     assert out["banked_near"] == 0 and out["banked_wins"] == 1
 
 
-def test_driver_wires_v5_into_phase_identity_and_lineage():
-    # The driver needs Modal to import, so pin the wiring at the source level: a resume across a
-    # v5 parameter change is only refused if these lines stay in place.
-    import ast
+def test_driver_wires_plan_mode_rollout():
+    # The driver needs Modal to import, so pin the wiring at the source level. Lineage and identity
+    # checks moved to tests/test_v6_wiring.py when the driver became v6.
     src = open("scripts/train_attacker.py").read()
-    tree = ast.parse(src)
-    lineage = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
-                   and getattr(n.targets[0], "id", None) == "LINEAGE")
-    assert lineage == "v5"
-    assert "phase_identity.update(v5_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
     assert "group_plans=plans" in src and "record_restart_state=True" in src
