@@ -46,7 +46,9 @@ N_ITERS = 20
 # the step on the win signal. Doubling restores it there, while repeat-only groups (std ~0.02-0.1)
 # now step ~20-50x smaller -- the intended effect. The ratio sat at ~0.998 after 4 epochs, far
 # from the 0.2 clip, so there is headroom. 3e-5 (2026-10-18) with INNER_EPOCHS 4 -> 2.
-LR = 3e-5
+# 1e-4 (v7.1): at 3e-5 a 16-step update moved the policy only kl_iter 0.0009-0.0065 and KL to the
+# reference did not accumulate (v7 iters 0-1). KL grows ~quadratically with the step, so ~10x.
+LR = 1e-4
 # 0.7 is what attacker_viability measured 16.7% at (make_vllm_generate's default). 1.0 was
 # chosen to buy within-group variance, but it bought the opposite: iteration 0 came back
 # 100% dead groups at a 0% win rate. Exploration you cannot convert into a win is not
@@ -67,6 +69,8 @@ MINIBATCHES = 8
 # minibatch past 2x this is not stepped and ends the update (the brake). LR above is the INITIAL
 # learning rate; the live one is checkpoint state, moved by the rule after every update.
 TARGET_KL = 0.01
+# --overfit-task: GRPO groups per iteration on the single task (no restarts, no replacements).
+OVERFIT_GROUPS = 4
 # Micro-batches up to this many padded tokens skip activation checkpointing (store activations
 # instead of recomputing them in backward, ~25% of an epoch). 0 = always checkpoint.
 # 4096 OOM'd (v4 arm 2, iter 0, 2026-10-18): the trainer reached 33.8 GiB -- ~17 GiB past the 16.4
@@ -191,7 +195,7 @@ ADVANTAGE_STD_NORMALIZE = False
 # v7 = 16 minibatch steps/iteration with a target-KL brake and a KL-adaptive LR, G=12, restarts
 # from the decisive turn (depth 1.0), graduation, same-iteration near-miss banking (spec
 # 2026-10-20).
-LINEAGE = "v7"
+LINEAGE = "v7.1"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -289,7 +293,8 @@ def _group_size_suffix(n_rollouts: int) -> str:
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False, eval_at_end=False,
-                n_rollouts=N_ROLLOUTS, baseline_eval=False, max_turns=MAX_TURNS):
+                n_rollouts=N_ROLLOUTS, baseline_eval=False, max_turns=MAX_TURNS,
+                overfit_task=""):
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
@@ -307,6 +312,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # Separate lineage: the defender on L4 kernels can flip near-tied greedy tokens vs the
         # A100, i.e. a (slightly) different opponent -- never mix the two in one checkpoint chain.
         ckpt_root += "-splitdef"
+    if overfit_task:
+        # The overfit test: can the pipeline master ONE training task it trains on directly? If not,
+        # the failure is in the pipeline, not research difficulty. Its own lineage, never resumed
+        # into (or from) the full-task run.
+        ckpt_root += f"-overfit-{overfit_task}"
 
     # Preflight, before ~10 minutes of model loading and two server startups. vLLM only registers
     # /v1/load_lora_adapter when this is set, and publish_policy's swap 404s without it -- correct
@@ -422,11 +432,19 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     ])
     # Only attack tasks carry an attacker reward; benign episodes have no attacker to train.
     tasks = [task for task in tasks if task.episode_type == "attack"]
+    if overfit_task:
+        tasks = [task for task in tasks if task.id == overfit_task]
+        if not tasks:
+            raise ValueError(f"--overfit-task {overfit_task!r} is not a training attack task")
     print(f"{len(tasks)} attack tasks (generated envs x {N_GEN_ENVS})", flush=True)
     task_by_id = {task.id: task for task in tasks}
     # v7: restarts begin AT the decisive turn (k = key_turn) and widen earlier only once a group
     # can finish from there (spec s4.2).
-    alloc = AllocParams(depth_start=1.0)
+    alloc = (AllocParams(depth_start=1.0, restart_fraction_max=0.0, max_replacements=0,
+                         max_fresh_per_task=OVERFIT_GROUPS) if overfit_task
+             else AllocParams(depth_start=1.0))
+    # GRPO group slots per iteration: one per task normally; OVERFIT_GROUPS on the single task.
+    n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)
     lr_rule = LrRule(initial=LR, target_kl=TARGET_KL)
 
     def episode_task_for(iteration):
@@ -442,7 +460,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         """
         def episode_task(spec, rollout_index):
             return randomize_task_canary(
-                spec, iteration * (len(tasks) + alloc.max_replacements) * n_rollouts
+                spec, iteration * (n_slots + alloc.max_replacements) * n_rollouts
                 + rollout_index, CANARY_SEED,
                 CANARY_REVISION)
         return episode_task
@@ -600,6 +618,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     phase_identity.update(lr_rule.as_identity())
     phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY})
+    if overfit_task:
+        phase_identity.update({"overfit_task": overfit_task, "overfit_groups": OVERFIT_GROUPS})
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
         # is unchanged. The opponent's hardware is part of the episode distribution.
@@ -656,7 +676,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         if os.path.exists(path):
             with open(path) as handle:
                 return [GroupPlan.from_dict(d) for d in json.load(handle)]
-        plans = allocate(list(task_stats.values()), banks, len(tasks), iteration,
+        plans = allocate(list(task_stats.values()), banks, n_slots, iteration,
                          random.Random(f"alloc-{LINEAGE}-{iteration}"), alloc,
                          depths=restart_depths, graduated=graduated)
         os.makedirs(rollout_dir, exist_ok=True)
@@ -818,7 +838,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         replacements = load_or_plan(
             os.path.join(rollout_dir, "replacements.json"),
             lambda: plan_replacements(read_episodes(rollout_dir), plans, banks, restart_depths,
-                                      len(tasks), n_rollouts,
+                                      n_slots, n_rollouts,
                                       random.Random(f"replace-{LINEAGE}-{it}"), alloc,
                                       graduated=graduated, iteration=it))
         print(f"iter {it:3d} replace  " + ("  ".join(
@@ -937,7 +957,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
         heldout_m = None
-        if ((it + 1) % HELDOUT_EVAL_EVERY == 0 or it == N_ITERS - 1
+        # Overfit mode reads its one task's training win rate; the held-out set is not the question.
+        if not overfit_task and ((it + 1) % HELDOUT_EVAL_EVERY == 0 or it == N_ITERS - 1
                 or (eval_at_end and it == end_iter - 1)):
             heldout = _run_heldout_eval(HELDOUT_EVAL_EPISODES)
             win_rate = sum(r.outcome == "leak" for r in heldout) / len(heldout)
@@ -994,7 +1015,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
           eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
-          max_turns: int = MAX_TURNS):
+          max_turns: int = MAX_TURNS, overfit_task: str = ""):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -1011,7 +1032,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
                            skip_final_update, split_defender, eval_at_end, n_rollouts,
-                           baseline_eval, max_turns)
+                           baseline_eval, max_turns, overfit_task)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -1024,7 +1045,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
 def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
-          max_turns: int = MAX_TURNS):
+          max_turns: int = MAX_TURNS, overfit_task: str = ""):
     if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
-                    eval_at_end, n_rollouts, baseline_eval, max_turns) == "oom":
+                    eval_at_end, n_rollouts, baseline_eval, max_turns, overfit_task) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")

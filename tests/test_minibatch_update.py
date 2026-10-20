@@ -58,3 +58,14 @@ def test_no_live_examples_returns_the_new_keys():
     exs = [Example([1], [2], task_id="t", episode_id=0, advantage=0.0)]
     m = update_step(Learner(_tiny_model(), None, None), exs, minibatches=8, target_kl=0.01)
     assert (m["steps"], m["early_stopped"], m["kl_iter"], m["clip_frac"]) == (0, False, 0.0, 0.0)
+
+
+# --- v7.1: the brake judges the epoch's running mean, not one noisy minibatch ---------------------
+
+def test_brake_ignores_a_single_spike_when_the_running_mean_is_in_band():
+    from redteamrl.train.train import brake_fires
+    # v7 iter 0: mean 0.0065 but one ~10-episode minibatch spiked past 0.02 and stopped the update.
+    assert not brake_fires([0.002, 0.004, 0.03], target_kl=0.01)       # mean 0.012 < 0.02
+    assert brake_fires([0.02, 0.025, 0.03], target_kl=0.01)             # mean 0.025 > 0.02
+    assert not brake_fires([0.5], target_kl=None)
+    assert not brake_fires([], target_kl=0.01)

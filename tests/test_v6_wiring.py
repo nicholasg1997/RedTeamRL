@@ -34,7 +34,7 @@ def test_lineage_identity_and_arm_pin():
     src, tree = _src_tree()
     lineage = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
                    and getattr(n.targets[0], "id", None) == "LINEAGE")
-    assert lineage == "v7"          # v7 keeps every v6 mechanism (tests/test_v7_wiring.py)
+    assert lineage == "v7.1"        # keeps every v6 mechanism (tests/test_v7_wiring.py)
     assert "phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
     assert '"n_rollouts": n_rollouts' in src
     assert "v5_identity(" not in src
@@ -64,7 +64,7 @@ def test_replacements_are_planned_before_finalize_and_rolled_into_the_same_store
 def test_canary_stride_reserves_replacement_slots():
     src, tree = _src_tree()
     body = ast.get_source_segment(src, _func(tree, "episode_task_for"))
-    assert "(len(tasks) + alloc.max_replacements) * n_rollouts" in body
+    assert "(n_slots + alloc.max_replacements) * n_rollouts" in body
 
 
 def test_depths_round_trip_through_meta():

@@ -12,7 +12,7 @@ def _const(tree, name):
 def test_v7_constants():
     _, tree = _src_tree()
     for name, value in (("N_ROLLOUTS", 12), ("MINIBATCHES", 8), ("HELDOUT_EVAL_EVERY", 3),
-                        ("INNER_EPOCHS", 2), ("TARGET_KL", 0.01), ("LR", 3e-5)):
+                        ("INNER_EPOCHS", 2), ("TARGET_KL", 0.01), ("LR", 1e-4)):
         assert getattr(_const(tree, name), "value", None) == value, name
     # Module scope imports only modal (redteamrl is imported inside _train_impl), so the rule
     # object is built there from the module constants.
@@ -75,3 +75,34 @@ def test_lr_rule_is_told_how_many_steps_were_taken():
     src, tree = _src_tree()
     call = _calls(_loop(tree), "next_lr")[0]
     assert 'm["steps"]' in ast.get_source_segment(src, _kw(call, "steps"))
+
+
+# --- v7.1 ------------------------------------------------------------------------------------------
+
+def test_v71_lineage_and_initial_lr():
+    _, tree = _src_tree()
+    assert _const(tree, "LINEAGE").value == "v7.1"
+    assert _const(tree, "LR").value == 1e-4
+
+
+def test_slots_come_from_n_slots_not_the_task_count():
+    src, tree = _src_tree()
+    for name in ("allocate", "plan_replacements"):
+        for call in _calls(tree, name):
+            assert "n_slots" in ast.get_source_segment(src, call), name
+    assert "(n_slots + alloc.max_replacements) * n_rollouts" in src
+
+
+def test_overfit_mode_is_a_flag_with_its_own_lineage():
+    src, tree = _src_tree()
+    for name in ("train", "main", "_train_impl"):
+        fn = _func(tree, name)
+        args = fn.args.args
+        defaults = dict(zip([a.arg for a in args[len(args) - len(fn.args.defaults):]],
+                            fn.args.defaults))
+        assert getattr(defaults.get("overfit_task"), "value", None) == "", name
+    assert 'ckpt_root += f"-overfit-{overfit_task}"' in src
+    assert '"overfit_task": overfit_task' in src
+    assert "restart_fraction_max=0.0, max_replacements=0" in src
+    assert "n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)" in src
+    assert "not overfit_task and (" in src          # held-out eval skipped in overfit mode

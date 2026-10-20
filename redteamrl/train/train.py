@@ -458,6 +458,15 @@ def episode_minibatches(live: list[Example], n: int, seed: str | None) -> list[l
 	return [batch for batch in batches if batch]
 
 
+def brake_fires(kl_history: list[float], target_kl: float | None) -> bool:
+	"""The target-KL brake: True when the RUNNING MEAN of this epoch's minibatch KLs (behaviour ->
+	current) exceeds 2x the target. v7 braked on any single minibatch, and a ~10-episode minibatch's
+	KL is noisy enough that one spike stopped an update whose mean (0.0065) was inside the band."""
+	if target_kl is None or not kl_history:
+		return False
+	return sum(kl_history) / len(kl_history) > 2 * target_kl
+
+
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2,
                 inner_epochs: int = 1, max_batch_tokens: int = 16384,
                 max_batch_logit_rows: int = 4096, no_checkpoint_max_tokens: int = 0,
@@ -479,8 +488,8 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	almost nowhere (~2 Adam steps per iteration, KL 0.003 after five iterations), so `minibatches > 1`
 	partitions the episodes each epoch (`episode_minibatches`, seeded by `shuffle_seed`) and steps
 	once per minibatch. Behaviour log-probs then come from a frozen pass before any step, and
-	`target_kl` arms a brake: a minibatch whose behaviour-to-current KL exceeds 2x the target is not
-	stepped, and the update ends (PPO's early stop). `kl_iter` reports that KL for the last epoch.
+	`target_kl` arms a brake: when the epoch's running mean behaviour-to-current KL exceeds 2x the
+	target, that minibatch is not stepped and the update ends (PPO's early stop; `brake_fires`). `kl_iter` reports that KL for the last epoch.
 
 	Episodes are weighted equally regardless of trajectory length. A learner with
 	`logprobs_batch` is scored in micro-batches (one autograd graph per micro-batch, bounded by
@@ -608,7 +617,7 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 			kl_old = sum(mb_kl) / max(len(mb_kl), 1)
 			minibatch_kl_old.append(kl_old)
 			epoch_kl_old.append(kl_old)
-			if target_kl is not None and kl_old > 2 * target_kl:
+			if brake_fires(epoch_kl_old, target_kl):
 				learner.optimizer.zero_grad()
 				early_stopped = True
 				break
