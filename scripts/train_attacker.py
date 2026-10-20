@@ -899,7 +899,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                         minibatches=MINIBATCHES, target_kl=lr_rule.target_kl,
                         shuffle_seed=f"{LINEAGE}-{it}")
         m["lr"] = current_lr
-        current_lr = next_lr(current_lr, m["kl_iter"], m["early_stopped"], lr_rule)
+        current_lr = next_lr(current_lr, m["kl_iter"], m["early_stopped"], lr_rule,
+                             steps=m["steps"])
         update_min = (time.monotonic() - update_t0) / 60
         peak_gib = torch.cuda.max_memory_allocated() / 2**30   # before save/eval can move it
         # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish

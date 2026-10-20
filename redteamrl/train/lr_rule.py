@@ -25,8 +25,14 @@ class LrRule:
         return {f"lr_{k}": v for k, v in self.__dict__.items()}
 
 
-def next_lr(lr: float, kl_iter: float, early_stopped: bool, rule: LrRule) -> float:
-    """Hold inside [target/2, 2*target]; step by `factor` outside it; clamp to [lo, hi]."""
+def next_lr(lr: float, kl_iter: float, early_stopped: bool, rule: LrRule,
+            steps: int | None = None) -> float:
+    """Hold inside [target/2, 2*target]; step by `factor` outside it; clamp to [lo, hi].
+
+    `steps == 0` (an all-dead iteration, or a brake on the very first minibatch) holds: no step was
+    taken, so `kl_iter` measured nothing and must not move the LR."""
+    if steps == 0:
+        return lr
     if early_stopped or kl_iter > 2 * rule.target_kl:
         lr = lr / rule.factor
     elif kl_iter < rule.target_kl / 2:

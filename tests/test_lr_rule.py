@@ -37,3 +37,11 @@ def test_identity_is_json_safe():
     json.dumps(R.as_identity())
     assert R.as_identity()["lr_version"] == "kl-adaptive-v1"
     assert R.as_identity()["lr_initial"] == 3e-5
+
+
+def test_no_step_taken_holds_lr():
+    # An all-dead iteration returns kl_iter=0 with zero steps: nothing was measured, so the LR must
+    # not be raised (five such iterations would otherwise ratchet 3e-5 to the 3e-4 clamp).
+    assert next_lr(3e-5, 0.0, False, R, steps=0) == 3e-5
+    assert next_lr(3e-5, 0.0, True, R, steps=0) == 3e-5
+    assert next_lr(3e-5, 0.0, False, R, steps=16) == pytest.approx(4.5e-5)

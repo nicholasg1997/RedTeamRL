@@ -69,3 +69,9 @@ def test_lr_and_graduated_round_trip_through_meta():
     assert {"lr", "graduated"} <= keys
     assert '.get("lr", lr_rule.initial)' in src
     assert '.get("graduated", [])' in src
+
+
+def test_lr_rule_is_told_how_many_steps_were_taken():
+    src, tree = _src_tree()
+    call = _calls(_loop(tree), "next_lr")[0]
+    assert 'm["steps"]' in ast.get_source_segment(src, _kw(call, "steps"))
