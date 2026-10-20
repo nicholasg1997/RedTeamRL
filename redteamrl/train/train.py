@@ -476,7 +476,8 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
                 inner_epochs: int = 1, max_batch_tokens: int = 16384,
                 max_batch_logit_rows: int = 4096, no_checkpoint_max_tokens: int = 0,
                 minibatches: int = 1, target_kl: float | None = None,
-                shuffle_seed: str | None = None) -> dict:
+                shuffle_seed: str | None = None, warmup_steps: int = 0,
+                global_step: int = 0) -> dict:
 	"""GRPO update: `inner_epochs` passes over ONE batch of rollouts.
 
 	Generation dominates cost — a rollout is hours, an optimizer step is seconds. Taking a single
@@ -495,6 +496,12 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	once per minibatch. Behaviour log-probs then come from a frozen pass before any step, and
 	`target_kl` arms a brake: when the epoch's running mean behaviour-to-current KL exceeds 2x the
 	target, that minibatch is not stepped and the update ends (PPO's early stop; `brake_fires`). `kl_iter` reports that KL for the last epoch.
+
+	`warmup_steps > 0` ramps each param group's lr linearly over the RUN's first `warmup_steps`
+	optimizer steps (`global_step` = steps already taken before this call), then restores the base
+	lr. Adam's first steps move every parameter by ~lr whatever the gradient size, so without a ramp
+	the run's opening steps are large and mostly noise (v7.1 iter 0: 1 step, kl 0.054; iter 1: 4 steps,
+	kl 0.37).
 
 	Episodes are weighted equally regardless of trajectory length. A learner with
 	`logprobs_batch` is scored in micro-batches (one autograd graph per micro-batch, bounded by
@@ -574,6 +581,7 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 			return score(indices, True, True)
 
 	trainable = [p for p in learner.model.parameters() if p.requires_grad]
+	base_lrs = [group["lr"] for group in learner.optimizer.param_groups]
 	epoch_ratios, minibatch_kl_old = [], []
 	total_loss = grad_norm = 0.0
 	kls, epoch_kl_old = [], []
@@ -627,11 +635,17 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 				early_stopped = True
 				break
 			grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=float("inf")))
+			if warmup_steps > 0:
+				ramp = min(1.0, (global_step + steps + 1) / warmup_steps)
+				for group, base_lr in zip(learner.optimizer.param_groups, base_lrs):
+					group["lr"] = base_lr * ramp
 			learner.optimizer.step()
 			steps += 1
 		epoch_ratios.append(sum(ratios) / max(len(ratios), 1))
 		if early_stopped:
 			break
+	for group, base_lr in zip(learner.optimizer.param_groups, base_lrs):
+		group["lr"] = base_lr                    # the caller's lr, untouched by the warmup ramp
 
 	return {
 		"loss": total_loss,

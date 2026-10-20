@@ -12,7 +12,7 @@ def _const(tree, name):
 def test_v7_constants():
     _, tree = _src_tree()
     for name, value in (("N_ROLLOUTS", 12), ("MINIBATCHES", 8), ("HELDOUT_EVAL_EVERY", 3),
-                        ("INNER_EPOCHS", 2), ("TARGET_KL", 0.01), ("LR", 1e-4)):
+                        ("INNER_EPOCHS", 2), ("TARGET_KL", 0.01), ("LR", 5e-5)):
         assert getattr(_const(tree, name), "value", None) == value, name
     # Module scope imports only modal (redteamrl is imported inside _train_impl), so the rule
     # object is built there from the module constants.
@@ -81,8 +81,8 @@ def test_lr_rule_is_told_how_many_steps_were_taken():
 
 def test_v71_lineage_and_initial_lr():
     _, tree = _src_tree()
-    assert _const(tree, "LINEAGE").value == "v7.1"
-    assert _const(tree, "LR").value == 1e-4
+    assert _const(tree, "LINEAGE").value == "v7.2"
+    assert _const(tree, "LR").value == 5e-5
 
 
 def test_slots_come_from_n_slots_not_the_task_count():
@@ -118,3 +118,36 @@ def test_brake_rule_is_in_the_identity_and_training_stall_is_logged_guarded():
                and any(getattr(h.type, "id", None) == "Exception" for h in n.handlers)]
     inside = {id(c) for t in guarded for stmt in t.body for c in ast.walk(stmt)}
     assert id(stalls[0]) in inside
+
+
+# --- v7.2: LR warmup + repeat penalty (arm 3) ---------------------------------------------------
+
+def test_v72_lineage_constants_and_arm3_pin():
+    src, tree = _src_tree()
+    assert _const(tree, "LINEAGE").value == "v7.2"
+    assert _const(tree, "WARMUP_STEPS").value == 16
+    assert "assert arm == 3" in src
+    for name in ("train", "main"):
+        fn = _func(tree, name)
+        args = fn.args.args
+        defaults = dict(zip([a.arg for a in args[len(args) - len(fn.args.defaults):]],
+                            fn.args.defaults))
+        assert defaults["arm"].value == 3, name
+        assert defaults["repeat_penalty_coef"].value == 0.02, name
+
+
+def test_warmup_is_wired_through_a_persisted_global_step():
+    src, tree = _src_tree()
+    call = _calls(_loop(tree), "update_step")[0]
+    assert getattr(_kw(call, "warmup_steps"), "id", None) == "WARMUP_STEPS"
+    assert getattr(_kw(call, "global_step"), "id", None) == "optimizer_steps"
+    writes = [c for c in _calls(tree, "write_meta") if isinstance(c.args[1], ast.Dict)]
+    keys = {k.value for c in writes for k in c.args[1].keys if isinstance(k, ast.Constant)}
+    assert "optimizer_steps" in keys
+    assert '.get("optimizer_steps", 0)' in src
+    assert '"lr_warmup_steps": WARMUP_STEPS' in src
+
+
+def test_repeat_penalty_coef_is_checked_against_the_sweep():
+    src, _ = _src_tree()
+    assert "if coef not in REPEAT_PENALTY_SWEEP:" in src

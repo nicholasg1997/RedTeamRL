@@ -77,3 +77,45 @@ def test_brake_ceiling_stops_a_runaway_minibatch_the_mean_still_hides():
     # ran away (kl_iter 0.44, ~40x target). Any single minibatch past 10x the target now brakes.
     assert brake_fires([0.0] * 7 + [0.11], target_kl=0.01)         # mean 0.014, but 0.11 > 0.1
     assert not brake_fires([0.002, 0.004, 0.03], target_kl=0.01)  # v7's in-band spike still passes
+
+
+# --- v7.2: LR warmup over the run's first optimizer steps ---------------------------------------
+
+class _RecordingSGD(torch.optim.SGD):
+    """SGD that records the learning rate in force at every step."""
+    def __init__(self, params, lr):
+        super().__init__(params, lr=lr)
+        self.seen = []
+
+    def step(self, closure=None):
+        self.seen.append(self.param_groups[0]["lr"])
+        return super().step(closure)
+
+
+def test_warmup_ramps_the_lr_over_the_runs_first_steps_and_restores_it():
+    # Adam's first steps move every parameter by ~lr whatever the gradient size (v7.1 iter 0: one
+    # step, kl 0.054; iter 1: four steps, kl 0.37). A linear ramp over the run's first optimizer
+    # steps keeps those steps small while the moment estimates build up.
+    model = _tiny_model()
+    opt = _RecordingSGD(model.parameters(), lr=0.1)
+    m = update_step(Learner(model, None, opt), _examples(), beta=0.0, inner_epochs=2, minibatches=2,
+                    shuffle_seed="x", warmup_steps=4, global_step=0)
+    assert m["steps"] == 4
+    assert opt.seen == pytest.approx([0.025, 0.05, 0.075, 0.1])
+    assert opt.param_groups[0]["lr"] == 0.1                  # the base lr is restored afterwards
+
+
+def test_warmup_resumes_mid_ramp_from_the_global_step():
+    model = _tiny_model()
+    opt = _RecordingSGD(model.parameters(), lr=0.1)
+    update_step(Learner(model, None, opt), _examples(), beta=0.0, inner_epochs=2, minibatches=2,
+                shuffle_seed="x", warmup_steps=4, global_step=2)
+    assert opt.seen == pytest.approx([0.075, 0.1, 0.1, 0.1])
+
+
+def test_no_warmup_by_default():
+    model = _tiny_model()
+    opt = _RecordingSGD(model.parameters(), lr=0.1)
+    update_step(Learner(model, None, opt), _examples(), beta=0.0, inner_epochs=2, minibatches=2,
+                shuffle_seed="x")
+    assert opt.seen == [0.1] * 4

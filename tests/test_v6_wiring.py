@@ -34,11 +34,11 @@ def test_lineage_identity_and_arm_pin():
     src, tree = _src_tree()
     lineage = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
                    and getattr(n.targets[0], "id", None) == "LINEAGE")
-    assert lineage == "v7.1"        # keeps every v6 mechanism (tests/test_v7_wiring.py)
+    assert lineage == "v7.2"        # keeps every v6 mechanism (tests/test_v7_wiring.py)
     assert "phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
     assert '"n_rollouts": n_rollouts' in src
     assert "v5_identity(" not in src
-    assert "assert arm == 2" in src
+    assert "assert arm == 3" in src     # v7.2: repeat penalty on
 
 
 def test_replacements_are_planned_before_finalize_and_rolled_into_the_same_store():

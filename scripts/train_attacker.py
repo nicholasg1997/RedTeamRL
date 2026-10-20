@@ -46,9 +46,12 @@ N_ITERS = 20
 # the step on the win signal. Doubling restores it there, while repeat-only groups (std ~0.02-0.1)
 # now step ~20-50x smaller -- the intended effect. The ratio sat at ~0.998 after 4 epochs, far
 # from the 0.2 clip, so there is headroom. 3e-5 (2026-10-18) with INNER_EPOCHS 4 -> 2.
-# 1e-4 (v7.1): at 3e-5 a 16-step update moved the policy only kl_iter 0.0009-0.0065 and KL to the
-# reference did not accumulate (v7 iters 0-1). KL grows ~quadratically with the step, so ~10x.
-LR = 1e-4
+# 5e-5 (v7.2): 3e-5 moved the policy too little (v7: kl_iter 0.0009-0.0065, KL to the reference flat);
+# 1e-4 too much and noisily (v7.1: 1 then 4 steps before the brake, kl_iter 0.054 then 0.37). Most of
+# v7.1's overshoot was Adam's warm-up, which WARMUP_STEPS now absorbs; the KL rule adapts from here.
+LR = 5e-5
+# Linear LR ramp over the run's first optimizer steps (one full iteration at MINIBATCHES x INNER_EPOCHS).
+WARMUP_STEPS = 16
 # 0.7 is what attacker_viability measured 16.7% at (make_vllm_generate's default). 1.0 was
 # chosen to buy within-group variance, but it bought the opposite: iteration 0 came back
 # 100% dead groups at a 0% win rate. Exploration you cannot convert into a win is not
@@ -195,7 +198,7 @@ ADVANTAGE_STD_NORMALIZE = False
 # v7 = 16 minibatch steps/iteration with a target-KL brake and a KL-adaptive LR, G=12, restarts
 # from the decisive turn (depth 1.0), graduation, same-iteration near-miss banking (spec
 # 2026-10-20).
-LINEAGE = "v7.1"
+LINEAGE = "v7.2"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -298,7 +301,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
-    assert arm == 2, "v7 pins arm 2 (spec 2026-10-20 s7)"
+    # v7.2 turns the repeat penalty ON: training losses repeated observations ~3-5x more than wins
+    # (v7.1 iters 0-1: stalled 40% vs 8-12%), and the 20-turn baseline's extra turns were 52% stalled.
+    assert arm == 3, "v7.2 pins arm 3 (repeat penalty); see REPEAT_PENALTY_SWEEP"
     # --max-turns only re-sizes the BASELINE eval (measuring what a longer budget buys the untrained
     # policy). For training it would change the episode distribution, the reward's turn penalty and
     # the viability-gate config, i.e. a new lineage -- a deliberate decision, never a flag typo.
@@ -306,6 +311,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         raise ValueError(f"--max-turns {max_turns} is baseline-only; training runs MAX_TURNS="
                          f"{MAX_TURNS} (change the constant for a new lineage)")
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
+    if coef not in REPEAT_PENALTY_SWEEP:
+        raise ValueError(f"repeat_penalty_coef {coef} is not one of {REPEAT_PENALTY_SWEEP}")
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag
     if split_defender:
@@ -618,7 +625,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     phase_identity.update(lr_rule.as_identity())
     phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY,
-                           "brake_rule": "mean2x-or-single10x-v1"})
+                           "brake_rule": "mean2x-or-single10x-v1", "lr_warmup_steps": WARMUP_STEPS})
     if overfit_task:
         phase_identity.update({"overfit_task": overfit_task, "overfit_groups": OVERFIT_GROUPS})
     if split_defender:
@@ -666,6 +673,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     resume_meta_v7 = read_meta(resume_dir) if resume_dir is not None else {}
     graduated: set[str] = set(resume_meta_v7.get("graduated", []))
     current_lr: float = float(resume_meta_v7.get("lr", lr_rule.initial))
+    optimizer_steps: int = int(resume_meta_v7.get("optimizer_steps", 0))   # drives the LR warmup
 
     def plans_for(iteration, rollout_dir):
         """This iteration's group plan, persisted beside its rollout.
@@ -926,7 +934,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                         inner_epochs=INNER_EPOCHS,
                         no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS,
                         minibatches=MINIBATCHES, target_kl=lr_rule.target_kl,
-                        shuffle_seed=f"{LINEAGE}-{it}")
+                        shuffle_seed=f"{LINEAGE}-{it}", warmup_steps=WARMUP_STEPS,
+                        global_step=optimizer_steps)
+        optimizer_steps += m["steps"]
         m["lr"] = current_lr
         current_lr = next_lr(current_lr, m["kl_iter"], m["early_stopped"], lr_rule,
                              steps=m["steps"])
@@ -953,7 +963,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                           "cumulative_gen_tokens": cumulative_gen_tokens,
                           "task_stats": [s.to_dict() for s in task_stats.values()],
                           "restart_depths": restart_depths,
-                          "graduated": sorted(graduated), "lr": current_lr})
+                          "graduated": sorted(graduated), "lr": current_lr,
+                          "optimizer_steps": optimizer_steps})
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).
@@ -1018,7 +1029,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
 @app.function(gpu="A100-80GB", cpu=8.0, timeout=24 * 60 * 60,
               retries=modal.Retries(initial_delay=0.0, max_retries=10),
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
-def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
+def train(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
           eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
           max_turns: int = MAX_TURNS, overfit_task: str = ""):
@@ -1048,7 +1059,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
 
 
 @app.local_entrypoint()
-def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
+def main(arm: int = 3, repeat_penalty_coef: float = 0.02, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
           max_turns: int = MAX_TURNS, overfit_task: str = ""):
