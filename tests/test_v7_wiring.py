@@ -106,3 +106,15 @@ def test_overfit_mode_is_a_flag_with_its_own_lineage():
     assert "restart_fraction_max=0.0, max_replacements=0" in src
     assert "n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)" in src
     assert "not overfit_task and (" in src          # held-out eval skipped in overfit mode
+
+
+def test_brake_rule_is_in_the_identity_and_training_stall_is_logged_guarded():
+    src, tree = _src_tree()
+    assert '"brake_rule": "mean2x-or-single10x-v1"' in src
+    loop = _loop(tree)
+    stalls = _calls(loop, "training_stall")
+    assert len(stalls) == 1
+    guarded = [n for n in ast.walk(loop) if isinstance(n, ast.Try)
+               and any(getattr(h.type, "id", None) == "Exception" for h in n.handlers)]
+    inside = {id(c) for t in guarded for stmt in t.body for c in ast.walk(stmt)}
+    assert id(stalls[0]) in inside

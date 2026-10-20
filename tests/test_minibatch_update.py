@@ -69,3 +69,11 @@ def test_brake_ignores_a_single_spike_when_the_running_mean_is_in_band():
     assert brake_fires([0.02, 0.025, 0.03], target_kl=0.01)             # mean 0.025 > 0.02
     assert not brake_fires([0.5], target_kl=None)
     assert not brake_fires([], target_kl=0.01)
+
+
+def test_brake_ceiling_stops_a_runaway_minibatch_the_mean_still_hides():
+    from redteamrl.train.train import brake_fires
+    # v7.1 overfit iter 0: early minibatches sit near 0, so the running mean lagged while the policy
+    # ran away (kl_iter 0.44, ~40x target). Any single minibatch past 10x the target now brakes.
+    assert brake_fires([0.0] * 7 + [0.11], target_kl=0.01)         # mean 0.014, but 0.11 > 0.1
+    assert not brake_fires([0.002, 0.004, 0.03], target_kl=0.01)  # v7's in-band spike still passes

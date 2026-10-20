@@ -185,3 +185,29 @@ def test_v7_restart_metrics_present_only_with_graduation_summary():
     assert (got["restart.graduated"], got["restart.graduated_total"]) == (2, 5)
     assert (got["restart.same_iter_replacements"], got["restart.same_iter_replacements_live"]) == (3, 1)
     assert "restart.graduated" not in _attacker()
+
+
+def _stall_ep(won, observations):
+    return {"won": won, "record": {"steps": [{"returned": o} for o in observations]}}
+
+
+def test_training_stall_splits_wins_from_losses():
+    from redteamrl.train.iter_metrics import training_stall
+    episodes = {0: _stall_ep(True, ["a", "b", "c"]),          # 0 repeats
+                1: _stall_ep(False, ["a", "a", "a", "b"]),    # 2/4 repeat
+                2: _stall_ep(False, ["x", "y", "x", "y"]),    # 2/4 repeat
+                3: {"won": False}}                            # no record: skipped
+    got = training_stall(episodes)
+    assert got == {"learning.stalled_win": 0.0, "learning.stalled_loss": 0.5}
+    assert training_stall({}) == {"learning.stalled_win": None, "learning.stalled_loss": None}
+
+
+def test_stall_keys_present_only_when_passed():
+    from redteamrl.train.iter_metrics import attacker_metrics
+    div, rew, summary, tactics, m, _ = _inputs()
+    got = attacker_metrics(live=386, n_examples=900, div=div, rew=rew, summary=summary,
+                           tactics=tactics, update=m, rollout_min=5.0, update_min=9.0,
+                           gen_tokens=72000, peak_gib=26.7, banks_size=127, win_routes=29,
+                           stall={"learning.stalled_win": 0.1, "learning.stalled_loss": 0.4})
+    assert got["learning.stalled_loss"] == 0.4
+    assert "learning.stalled_loss" not in _attacker()

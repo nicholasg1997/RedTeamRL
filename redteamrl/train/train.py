@@ -458,13 +458,18 @@ def episode_minibatches(live: list[Example], n: int, seed: str | None) -> list[l
 	return [batch for batch in batches if batch]
 
 
-def brake_fires(kl_history: list[float], target_kl: float | None) -> bool:
-	"""The target-KL brake: True when the RUNNING MEAN of this epoch's minibatch KLs (behaviour ->
-	current) exceeds 2x the target. v7 braked on any single minibatch, and a ~10-episode minibatch's
-	KL is noisy enough that one spike stopped an update whose mean (0.0065) was inside the band."""
+def brake_fires(kl_history: list[float], target_kl: float | None, ceiling: float = 10.0) -> bool:
+	"""The target-KL brake over this epoch's minibatch KLs (behaviour -> current), newest last.
+
+	Fires when the RUNNING MEAN exceeds 2x the target, or when the newest minibatch alone exceeds
+	`ceiling` x the target. Each guards the other's failure: v7 braked on any single minibatch past
+	2x, and one noisy ~10-episode minibatch stopped an update whose mean (0.0065) was in band; v7.1
+	braked on the mean only, which lags behind early near-zero minibatches and let the overfit run's
+	iter 0 reach kl 0.44 (~40x target)."""
 	if target_kl is None or not kl_history:
 		return False
-	return sum(kl_history) / len(kl_history) > 2 * target_kl
+	return (sum(kl_history) / len(kl_history) > 2 * target_kl
+	        or kl_history[-1] > ceiling * target_kl)
 
 
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2,

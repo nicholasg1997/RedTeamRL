@@ -40,10 +40,23 @@ def _common(*, live, n_examples, div, rew, tactics, update, rollout_min, update_
     return out
 
 
+def training_stall(episodes: dict[int, dict]) -> dict:
+    """Mean stalled-turn rate of this iteration's TRAINING episodes, split by outcome: do losses
+    loop (verbatim-repeated observations) or keep exploring? The held-out eval's metric, applied to
+    the restart records every training episode carries. None when a side has no episodes."""
+    from redteamrl.attack_sft.eval_metrics import stalled_turn_rate   # lazy: keep this module light
+    rates: dict[bool, list[float]] = {True: [], False: []}
+    for ep in episodes.values():
+        if "record" in ep:
+            rates[bool(ep["won"])].append(stalled_turn_rate(ep["record"]["steps"]))
+    mean = lambda xs: sum(xs) / len(xs) if xs else None  # noqa: E731
+    return {"learning.stalled_win": mean(rates[True]), "learning.stalled_loss": mean(rates[False])}
+
+
 def attacker_metrics(*, live: int, n_examples: int, div: dict, rew: dict, summary: dict,
                      tactics: dict, update: dict, rollout_min: float, update_min: float,
                      gen_tokens: int, peak_gib: float, banks_size: int, win_routes: int,
-                     heldout: dict | None = None) -> dict:
+                     heldout: dict | None = None, stall: dict | None = None) -> dict:
     out = _common(live=live, n_examples=n_examples, div=div, rew=rew, tactics=tactics,
                   update=update, rollout_min=rollout_min, update_min=update_min,
                   gen_tokens=gen_tokens, peak_gib=peak_gib)
@@ -79,6 +92,8 @@ def attacker_metrics(*, live: int, n_examples: int, div: dict, rew: dict, summar
             "restart.same_iter_replacements": summary["same_iter_replacements"],
             "restart.same_iter_replacements_live": summary["same_iter_replacements_live"],
         })
+    if stall is not None:
+        out.update(stall)
     # Held-out keys exist only on iterations that ran the eval: ABSENT, never 0, so the chart
     # shows sparse points instead of a fake drop to zero.
     if heldout is not None:

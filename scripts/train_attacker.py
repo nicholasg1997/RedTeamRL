@@ -381,7 +381,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from redteamrl.train.lr_rule import LrRule, next_lr
     from redteamrl.train.replacement import load_or_plan, plan_replacements
     from redteamrl.train.metrics_log import MetricsLog
-    from redteamrl.train.iter_metrics import attacker_metrics
+    from redteamrl.train.iter_metrics import attacker_metrics, training_stall
     from redteamrl.train.train import tactic_counts
     from redteamrl.sft.canary import CANARY_SCHEME_VERSION, randomize_task_canary
     from redteamrl.train.checkpoint import (
@@ -617,7 +617,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     }
     phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     phase_identity.update(lr_rule.as_identity())
-    phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY})
+    phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY,
+                           "brake_rule": "mean2x-or-single10x-v1"})
     if overfit_task:
         phase_identity.update({"overfit_task": overfit_task, "overfit_groups": OVERFIT_GROUPS})
     if split_defender:
@@ -980,13 +981,18 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 print(f"[heldout] iter {it}: could not save the per-seed record: {exc!r}",
                       flush=True)
         try:   # telemetry must never cost the run: a builder KeyError is a warning, not a crash
+            stall = training_stall(read_episodes(rollout_dir))
+            fmt = lambda x: "-" if x is None else f"{x:.1%}"  # noqa: E731
+            print(f"iter {it:3d} stall    wins={fmt(stall['learning.stalled_win'])}  "
+                  f"losses={fmt(stall['learning.stalled_loss'])}  (verbatim-repeated observations)",
+                  flush=True)
             metrics = attacker_metrics(
                 live=live, n_examples=len(examples), div=div, rew=rew, summary=summary,
                 tactics=tactic_counts(examples), update=m, rollout_min=rollout_min,
                 update_min=update_min, gen_tokens=iter_gen_tokens, peak_gib=peak_gib,
                 banks_size=sum(len(b) for b in banks.values()),
                 win_routes=sum(b.distinct_routes({3}) for b in banks.values()),
-                heldout=heldout_m)
+                heldout=heldout_m, stall=stall)
             metrics_log.log(it, "attacker", cum_gen=cumulative_gen_tokens, **metrics)
         except Exception as exc:
             print(f"[metrics] iter {it}: could not build metrics: {exc!r}", flush=True)
