@@ -145,4 +145,5 @@ def test_baseline_record_names_a_non_default_turn_budget():
     src, tree = _src_tree()
     branch = _baseline_branch(_func(tree, "_train_impl"))
     path = ast.get_source_segment(src, _calls(branch, "save_record")[0].args[0])
-    assert "max_turns" in path
+    assert "{turns_tag}" in path
+    assert 'turns_tag = "" if max_turns == MAX_TURNS else f"-t{max_turns}"' in src
