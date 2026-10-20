@@ -289,11 +289,17 @@ def _group_size_suffix(n_rollouts: int) -> str:
 
 def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 skip_final_update=False, split_defender=False, eval_at_end=False,
-                n_rollouts=N_ROLLOUTS, baseline_eval=False):
+                n_rollouts=N_ROLLOUTS, baseline_eval=False, max_turns=MAX_TURNS):
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
     assert arm == 2, "v7 pins arm 2 (spec 2026-10-20 s7)"
+    # --max-turns only re-sizes the BASELINE eval (measuring what a longer budget buys the untrained
+    # policy). For training it would change the episode distribution, the reward's turn penalty and
+    # the viability-gate config, i.e. a new lineage -- a deliberate decision, never a flag typo.
+    if max_turns != MAX_TURNS and not baseline_eval:
+        raise ValueError(f"--max-turns {max_turns} is baseline-only; training runs MAX_TURNS="
+                         f"{MAX_TURNS} (change the constant for a new lineage)")
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag
@@ -719,7 +725,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                         max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
             sandbox = LocalShellSandbox()
             try:
-                return run_episode(spec, attacker, defender, sandbox, max_turns=MAX_TURNS,
+                return run_episode(spec, attacker, defender, sandbox, max_turns=max_turns,
                                    redaction_enforcement=REDACTION_ENFORCEMENT)
             finally:
                 sandbox.close()
@@ -746,7 +752,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         print(f"baseline heldout  n={len(heldout)}  win_rate={win_rate:.1%}  "
               f"stalled_rate={stalled:.1%}  dead_rate={dead:.1%}", flush=True)
         # Per-seed, so any later checkpoint can be compared to it PAIRED (eval/heldout_record.py).
-        save_record(os.path.join("/runs/attacker-heldout-baseline", f"base-n{len(heldout)}.json"),
+        turns_tag = "" if max_turns == MAX_TURNS else f"-t{max_turns}"   # 12-turn name unchanged
+        save_record(os.path.join("/runs/attacker-heldout-baseline",
+                                 f"base-n{len(heldout)}{turns_tag}.json"),
                     make_record(_heldout_seeds(len(heldout)), [r.outcome for r in heldout],
                                 turns=[r.n_turns for r in heldout], policy="base",
                                 stalled_rate=stalled, dead_rate=dead,
@@ -754,7 +762,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                 attacker_sft_adapter=ATTACKER_SFT_ADAPTER,
                                 defender_sft_adapter=DEFENDER_SFT_ADAPTER,
                                 defender_grpo_adapter=DEFENDER_GRPO_ADAPTER,
-                                max_turns=MAX_TURNS, atk_max_tokens=ATK_MAX_TOKENS))
+                                max_turns=max_turns, atk_max_tokens=ATK_MAX_TOKENS))
         runs.commit()
         return
 
@@ -985,7 +993,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               volumes={"/cache/huggingface": hf_cache, "/runs": runs})
 def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
           skip_final_update: bool = False, split_defender: bool = False,
-          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False):
+          eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
+          max_turns: int = MAX_TURNS):
     """Own the vLLM lifecycle OUTSIDE the training body.
 
     Modal can retry a failed input in the SAME container. Without this, the previous attempt's
@@ -1002,7 +1011,7 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
     try:
         return _train_impl(active_servers, arm, repeat_penalty_coef, until_iter,
                            skip_final_update, split_defender, eval_at_end, n_rollouts,
-                           baseline_eval)
+                           baseline_eval, max_turns)
     except torch.OutOfMemoryError as e:
         print(f"TRAINER OOM -- NOT retrying (deterministic on a banked rollout): {e}", flush=True)
         return "oom"
@@ -1014,7 +1023,8 @@ def train(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_IT
 @app.local_entrypoint()
 def main(arm: int = 2, repeat_penalty_coef: float = 0.0, until_iter: int = N_ITERS,
          skip_final_update: bool = False, split_defender: bool = False,
-         eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False):
+         eval_at_end: bool = False, n_rollouts: int = N_ROLLOUTS, baseline_eval: bool = False,
+          max_turns: int = MAX_TURNS):
     if train.remote(arm, repeat_penalty_coef, until_iter, skip_final_update, split_defender,
-                    eval_at_end, n_rollouts, baseline_eval) == "oom":
+                    eval_at_end, n_rollouts, baseline_eval, max_turns) == "oom":
         print("run ended on a trainer OOM (not retried) -- see the remote log for the allocation")

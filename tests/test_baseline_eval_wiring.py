@@ -116,3 +116,33 @@ def test_training_eval_saves_a_guarded_per_seed_record_per_iteration():
                and any(getattr(h.type, "id", None) == "Exception" for h in n.handlers)]
     inside = {id(c) for t in guarded for stmt in t.body for c in ast.walk(stmt)}
     assert id(saves[0]) in inside, "a record-writing failure must never stop the run"
+
+
+# --- --max-turns: baseline-mode only, default MAX_TURNS --------------------------------------------
+
+def test_every_entrypoint_takes_max_turns_defaulting_to_the_constant():
+    _, tree = _src_tree()
+    for name in ("_train_impl", "train", "main"):
+        default = _arg_default(_func(tree, name), "max_turns")
+        assert getattr(default, "id", None) == "MAX_TURNS", name
+
+
+def test_heldout_eval_uses_the_override_not_the_constant():
+    src, tree = _src_tree()
+    run_eval = _func(_func(tree, "_train_impl"), "_run_heldout_eval")
+    episodes = _calls(run_eval, "run_episode")
+    assert len(episodes) == 1
+    kw = next(k.value for k in episodes[0].keywords if k.arg == "max_turns")
+    assert getattr(kw, "id", None) == "max_turns"
+
+
+def test_training_refuses_a_non_default_turn_budget():
+    src, _ = _src_tree()
+    assert "if max_turns != MAX_TURNS and not baseline_eval:" in src
+
+
+def test_baseline_record_names_a_non_default_turn_budget():
+    src, tree = _src_tree()
+    branch = _baseline_branch(_func(tree, "_train_impl"))
+    path = ast.get_source_segment(src, _calls(branch, "save_record")[0].args[0])
+    assert "max_turns" in path
