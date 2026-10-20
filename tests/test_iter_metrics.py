@@ -120,3 +120,34 @@ def test_tactic_summary_output_unchanged():
         "episodes passing a carrier: base64=2 fragment=1 hex=1 | encoded_pass_rate=40.0%")
     assert tactic_summary([]) == (
         "leaks by tactic: none | episodes passing a carrier: none | encoded_pass_rate=0.0%")
+
+
+def _v6_summary(**overrides):
+    summary = dict(_inputs()[2], n_base_groups=12, dead_before=9, dead_after=6, replacements=4,
+                   replacements_live=3, depth_frac_mean=0.45, win_by_depth={"lo": 0.0, "hi": 0.5},
+                   backed_off={"gen-6": 2})
+    summary.update(overrides)
+    return summary
+
+
+def _attacker_with(summary):
+    from redteamrl.train.iter_metrics import attacker_metrics
+    div, rew, _, tactics, m, _ = _inputs()
+    return attacker_metrics(live=386, n_examples=900, div=div, rew=rew, summary=summary,
+                            tactics=tactics, update=m, rollout_min=5.0, update_min=9.0,
+                            gen_tokens=72000, peak_gib=26.7, banks_size=127, win_routes=29)
+
+
+def test_v6_restart_keys_present_only_with_v6_summary():
+    assert "restart.dead_before" not in _attacker()
+    got = _attacker_with(_v6_summary())
+    assert got["restart.dead_before"] == 0.75 and got["restart.dead_after"] == 0.5
+    assert got["restart.replacements"] == 4 and got["restart.replacements_live"] == 3
+    assert got["restart.win_by_depth.lo"] == 0.0 and got["restart.win_by_depth.hi"] == 0.5
+    assert "restart.win_by_depth.mid" not in got
+    assert got["restart.backed_off_tasks"] == 1
+    assert all(isinstance(v, (int, float)) or v is None for v in got.values())
+
+
+def test_v6_rates_none_when_no_base_groups():
+    assert _attacker_with(_v6_summary(n_base_groups=0))["restart.dead_before"] is None

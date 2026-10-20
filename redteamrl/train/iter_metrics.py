@@ -48,6 +48,19 @@ def attacker_metrics(*, live: int, n_examples: int, div: dict, rew: dict, summar
         "diversity.banked_wins": summary["banked_wins"],
         "diversity.banked_near": summary["banked_near"],
     })
+    # v6 dynamic-sampling keys exist only when the summary came from finalize_v6 (absent for v5).
+    if "dead_before" in summary:
+        n_base = summary["n_base_groups"]
+        out.update({
+            "restart.dead_before": summary["dead_before"] / n_base if n_base else None,
+            "restart.dead_after": summary["dead_after"] / n_base if n_base else None,
+            "restart.replacements": summary["replacements"],
+            "restart.replacements_live": summary["replacements_live"],
+            "restart.depth_frac_mean": summary["depth_frac_mean"],
+            "restart.backed_off_tasks": len(summary["backed_off"]),
+        })
+        for bucket, rate in summary["win_by_depth"].items():
+            out[f"restart.win_by_depth.{bucket}"] = rate
     # Held-out keys exist only on iterations that ran the eval: ABSENT, never 0, so the chart
     # shows sparse points instead of a fake drop to zero.
     if heldout is not None:
