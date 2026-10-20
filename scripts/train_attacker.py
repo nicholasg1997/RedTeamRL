@@ -37,7 +37,9 @@ DEFENDER_MODEL = "Qwen/Qwen3-4B"     # frozen opponent this phase
 # probe_grpo_adapter.py and attacker_viability.py). Set GRPO to None for an SFT-only opponent.
 DEFENDER_SFT_ADAPTER = "/runs/sft-defender/round9/training/7eeae96976a4/adapter"
 DEFENDER_GRPO_ADAPTER = "/runs/defender-grpo-r9-vllm/iter1"
-N_ROLLOUTS = 8          # GRPO group size; larger groups buy within-group variance
+# GRPO group size; larger groups buy within-group variance. 12 (v7): at a 15% win rate a group
+# of 8 is all-loss 27% of the time, a group of 12 only 14%.
+N_ROLLOUTS = 12
 N_ITERS = 20
 # 2e-5 (was 1e-5) to go with mean-centred advantages: dropping the std division shrinks a
 # 1-win-in-8 group's winner advantage 2.65 -> 1.18 (~2.2x), which at 1e-5 would quietly halve
@@ -57,6 +59,14 @@ CLIP_EPS = 0.2          # PPO trust region; only bites once inner epochs move th
 # the ratio reached only 1.0003 -- nowhere near the 0.2 clip -- so epochs 3-4 were small repeat
 # steps. Two epochs at a higher LR cover similar ground for ~half the update compute.
 INNER_EPOCHS = 2
+# v7: one optimizer step per MINIBATCH, not per epoch. Pre-v7 the update took ~2 Adam steps per
+# iteration (one per epoch over the whole batch) and the attacker barely moved: KL to the
+# reference 0.003 after five v6 iterations, held-out at the base rate (11.7%). 8 x 2 = 16 steps.
+MINIBATCHES = 8
+# Per-iteration behaviour->new KL the LR rule steers toward (redteamrl/train/lr_rule.py); a
+# minibatch past 2x this is not stepped and ends the update (the brake). LR above is the INITIAL
+# learning rate; the live one is checkpoint state, moved by the rule after every update.
+TARGET_KL = 0.01
 # Micro-batches up to this many padded tokens skip activation checkpointing (store activations
 # instead of recomputing them in backward, ~25% of an epoch). 0 = always checkpoint.
 # 4096 OOM'd (v4 arm 2, iter 0, 2026-10-18): the trainer reached 33.8 GiB -- ~17 GiB past the 16.4
@@ -161,7 +171,7 @@ REPEAT_PENALTY_SWEEP = (0.02, 0.05, 0.1)  # the coef must be one of these; ignor
 # 256 (2026-10-20): evals are now read PAIRED against the base policy's per-seed record
 # (eval/heldout_record.py); seeds 1000-1127 are unchanged, so a 128-seed record still pairs.
 HELDOUT_EVAL_EPISODES = 256
-HELDOUT_EVAL_EVERY = 5             # iterations between held-out evals (plus the final iteration)
+HELDOUT_EVAL_EVERY = 3             # iterations between held-out evals (plus the final iteration)
 PATH_NORMALISED = True             # Task 1 landed; both arms see normalised observations.
 # Mean-centred advantages (r - mean), NOT std-normalised (2026-10-06). Arm 3 iter 0 showed why:
 # all-loss groups differing by ONE repeat (-0.30 vs -0.35, std 0.02) got +-1..2 advantages -- as
@@ -178,7 +188,10 @@ ADVANTAGE_STD_NORMALIZE = False
 # allocation + restarts from earlier win / near-miss states (spec 2026-10-18): who gets a fresh
 # group vs a restart group changes every iteration's episode distribution. v6 = dynamic sampling
 # (dead base groups get bounded replacement groups), revisit backoff, adaptive restart depth.
-LINEAGE = "v6"
+# v7 = 16 minibatch steps/iteration with a target-KL brake and a KL-adaptive LR, G=12, restarts
+# from the decisive turn (depth 1.0), graduation, same-iteration near-miss banking (spec
+# 2026-10-20).
+LINEAGE = "v7"
 # The attacker's last K raw outputs (prose + action), kept in full in its OWN prompt so it stops
 # re-deriving the same conclusions each turn; older ones are dropped, a runaway output keeps its
 # tail. Never shown to the defender. Changes the attacker's inputs, so it is in phase_identity.
@@ -280,7 +293,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     import json, os, random, sys, tempfile, time, torch
     sys.path.insert(0, "/root")
 
-    assert arm == 2, "v6 pins arm 2: a clean continuation of the v5 result (spec s3 decision)"
+    assert arm == 2, "v7 pins arm 2 (spec 2026-10-20 s7)"
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag
@@ -347,8 +360,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from redteamrl.train.allocation import AllocParams, GroupPlan, TaskStats, allocate
     from redteamrl.train.banks import StartStateBank
     from redteamrl.train.episode_store import read_episodes
-    from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES
-    from redteamrl.train.v6_finalize import finalize_v6, v6_identity
+    from redteamrl.train.v5_finalize import DEFAULT_MAX_NEAR_MISSES, bank_episodes
+    from redteamrl.train.v7_finalize import finalize_v7, v7_identity
+    from redteamrl.train.lr_rule import LrRule, next_lr
     from redteamrl.train.replacement import load_or_plan, plan_replacements
     from redteamrl.train.metrics_log import MetricsLog
     from redteamrl.train.iter_metrics import attacker_metrics
@@ -404,7 +418,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     tasks = [task for task in tasks if task.episode_type == "attack"]
     print(f"{len(tasks)} attack tasks (generated envs x {N_GEN_ENVS})", flush=True)
     task_by_id = {task.id: task for task in tasks}
-    alloc = AllocParams()
+    # v7: restarts begin AT the decisive turn (k = key_turn) and widen earlier only once a group
+    # can finish from there (spec s4.2).
+    alloc = AllocParams(depth_start=1.0)
+    lr_rule = LrRule(initial=LR, target_kl=TARGET_KL)
 
     def episode_task_for(iteration):
         """A fresh high-entropy secret per (iteration, slot, rollout) -- never repeated.
@@ -574,7 +591,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         "inner_epochs": INNER_EPOCHS, "beta": BETA, "clip_eps": CLIP_EPS,
         "lineage": LINEAGE,
     }
-    phase_identity.update(v6_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
+    phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
+    phase_identity.update(lr_rule.as_identity())
+    phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY})
     if split_defender:
         # Only added when split, so the co-located path's identity (and its existing checkpoints)
         # is unchanged. The opponent's hardware is part of the episode distribution.
@@ -615,6 +634,11 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     # Per-entry restart depth (v6): moves only at finalize, persisted in each checkpoint's meta.
     restart_depths: dict[str, float] = (
         dict(read_meta(resume_dir).get("restart_depths", {})) if resume_dir is not None else {})
+    # v7 checkpoint state: graduated bank entries (never drawn again) and the live learning rate
+    # the KL-adaptive rule chose after the last completed update.
+    resume_meta_v7 = read_meta(resume_dir) if resume_dir is not None else {}
+    graduated: set[str] = set(resume_meta_v7.get("graduated", []))
+    current_lr: float = float(resume_meta_v7.get("lr", lr_rule.initial))
 
     def plans_for(iteration, rollout_dir):
         """This iteration's group plan, persisted beside its rollout.
@@ -628,7 +652,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                 return [GroupPlan.from_dict(d) for d in json.load(handle)]
         plans = allocate(list(task_stats.values()), banks, len(tasks), iteration,
                          random.Random(f"alloc-{LINEAGE}-{iteration}"), alloc,
-                         depths=restart_depths)
+                         depths=restart_depths, graduated=graduated)
         os.makedirs(rollout_dir, exist_ok=True)
         with open(path + ".tmp", "w") as handle:
             json.dump([plan.to_dict() for plan in plans], handle)
@@ -777,11 +801,18 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # v6 dynamic sampling: dead base groups get at most alloc.max_replacements extra groups.
         # The plan is a function of the completed base episodes and is persisted, so a resume
         # replays the same replacements against the banked episodes instead of recomputing.
+        # v7 same-iteration banking: this base pass's wins and near misses enter the banks BEFORE
+        # replacements are planned, so a dead group can restart from a close call made by the policy
+        # about to be trained. Base slots only (a resume may already hold replacement episodes);
+        # finalize re-banks the same entries idempotently.
+        bank_episodes({i: ep for i, ep in read_episodes(rollout_dir).items() if ep["slot"] < len(plans)},
+                      banks, it, bank_record_dir)
         replacements = load_or_plan(
             os.path.join(rollout_dir, "replacements.json"),
             lambda: plan_replacements(read_episodes(rollout_dir), plans, banks, restart_depths,
                                       len(tasks), n_rollouts,
-                                      random.Random(f"replace-{LINEAGE}-{it}"), alloc))
+                                      random.Random(f"replace-{LINEAGE}-{it}"), alloc,
+                                      graduated=graduated, iteration=it))
         print(f"iter {it:3d} replace  " + ("  ".join(
             f"{p.slot}:{p.task_id}@{p.restart_turn}({p.reason})" for p in replacements) or "none"),
             flush=True)
@@ -802,9 +833,9 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # Stats, banks and restart depths update from the episode store right away. All are safe to
         # repeat after a crash: stats and depths reload from the last checkpoint's meta, banking is
         # idempotent, and both plans are fixed by plans.json / replacements.json.
-        summary, restart_depths = finalize_v6(read_episodes(rollout_dir), plans, replacements,
-                                              banks, task_stats, restart_depths, it, n_rollouts,
-                                              bank_record_dir, alloc)
+        summary, restart_depths, graduated = finalize_v7(
+            read_episodes(rollout_dir), plans, replacements, banks, task_stats, restart_depths,
+            graduated, it, n_rollouts, bank_record_dir, alloc)
         runs.commit()
         assign_advantages(examples, normalize_std=ADVANTAGE_STD_NORMALIZE)
         iter_gen_tokens = sum(len(ex.completion_ids) for ex in examples)
@@ -842,6 +873,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               f"{summary['replacements']} live  depth_mean="
               f"{'-' if depth_mean is None else f'{depth_mean:.2f}'}  "
               f"win_by_depth={summary['win_by_depth']}  backoff={summary['backed_off']}", flush=True)
+        print(f"iter {it:3d} v7       graduated={summary['graduated']} "
+              f"(total {summary['graduated_total']})  same_iter_replacements="
+              f"{summary['same_iter_replacements_live']}/{summary['same_iter_replacements']} live",
+              flush=True)
         print(f"iter {it:3d} tokens   gen={iter_gen_tokens}  cum_gen={cumulative_gen_tokens}",
               flush=True)
         print(f"iter {it:3d} tactics  {tactic_summary(examples)}", flush=True)
@@ -856,9 +891,15 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         model.train()
         torch.cuda.reset_peak_memory_stats()
         update_t0 = time.monotonic()
+        for group in opt.param_groups:     # the KL-adaptive LR (checkpoint state), not the initial
+            group["lr"] = current_lr
         m = update_step(learner, examples, beta=BETA, clip_eps=CLIP_EPS,
                         inner_epochs=INNER_EPOCHS,
-                        no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS)
+                        no_checkpoint_max_tokens=NO_CHECKPOINT_MAX_TOKENS,
+                        minibatches=MINIBATCHES, target_kl=lr_rule.target_kl,
+                        shuffle_seed=f"{LINEAGE}-{it}")
+        m["lr"] = current_lr
+        current_lr = next_lr(current_lr, m["kl_iter"], m["early_stopped"], lr_rule)
         update_min = (time.monotonic() - update_t0) / 60
         peak_gib = torch.cuda.max_memory_allocated() / 2**30   # before save/eval can move it
         # Same fields train_defender reports. grad_norm and epoch_ratios are what distinguish
@@ -870,6 +911,10 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
               f"live={m['n_live_examples']}/{m['n_examples']}  "
               f"time={update_min:.1f}min  peak={torch.cuda.max_memory_allocated() / 2**30:.1f}GiB",
               flush=True)
+        print(f"iter {it:3d} steps    steps={m['steps']}  kl_iter={m['kl_iter']:.5f} "
+              f"(target {lr_rule.target_kl})  clip_frac={m['clip_frac']:.3f}  "
+              f"brake={'FIRED' if m['early_stopped'] else 'no'}  lr={m['lr']:.2e} -> {current_lr:.2e}",
+              flush=True)
 
         ckpt = os.path.join(ckpt_root, f"iter{it}")
         model.save_pretrained(ckpt)
@@ -877,7 +922,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         write_meta(ckpt, {"iter": it, "phase_identity": phase_identity,
                           "cumulative_gen_tokens": cumulative_gen_tokens,
                           "task_stats": [s.to_dict() for s in task_stats.values()],
-                          "restart_depths": restart_depths})
+                          "restart_depths": restart_depths,
+                          "graduated": sorted(graduated), "lr": current_lr})
         publish_policy(f"iter{it} post-update")
         # Eval every HELDOUT_EVAL_EVERY iters (+ the final one). Single points are noisy (SE ~3pp
         # at n=128); only the trailing-window mean is read (spec s13).

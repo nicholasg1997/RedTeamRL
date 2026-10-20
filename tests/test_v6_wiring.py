@@ -34,8 +34,8 @@ def test_lineage_identity_and_arm_pin():
     src, tree = _src_tree()
     lineage = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
                    and getattr(n.targets[0], "id", None) == "LINEAGE")
-    assert lineage == "v6"
-    assert "phase_identity.update(v6_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
+    assert lineage == "v7"          # v7 keeps every v6 mechanism (tests/test_v7_wiring.py)
+    assert "phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))" in src
     assert '"n_rollouts": n_rollouts' in src
     assert "v5_identity(" not in src
     assert "assert arm == 2" in src
@@ -55,7 +55,7 @@ def test_replacements_are_planned_before_finalize_and_rolled_into_the_same_store
     planned = _calls(loop, "load_or_plan")
     assert len(planned) == 1 and rollouts[0].lineno < planned[0].lineno < second.lineno
     assert "replacements.json" in ast.get_source_segment(src, planned[0].args[0])
-    finalize = _calls(loop, "finalize_v6")
+    finalize = _calls(loop, "finalize_v7")
     advantages = _calls(loop, "assign_advantages")
     assert finalize and second.lineno < finalize[0].lineno < advantages[0].lineno
     assert not _calls(loop, "finalize_iteration")
