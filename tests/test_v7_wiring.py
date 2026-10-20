@@ -163,7 +163,7 @@ def test_warmup_is_wired_through_a_persisted_global_step():
 
 def test_repeat_penalty_coef_is_checked_against_the_sweep():
     src, _ = _src_tree()
-    assert "if coef not in REPEAT_PENALTY_SWEEP:" in src
+    assert "if arm == 3 and coef not in REPEAT_PENALTY_SWEEP:" in src
 
 
 def test_v72_near_misses_restart_after_the_redaction():
@@ -178,3 +178,10 @@ def test_v72_uses_the_foundational_hint_and_records_it_in_identity():
     assert "hint=ATTACKER_HINT" in src
     assert "HINT_TECHNIQUE," not in src.split("def _train_impl")[1].split("return PromptedAttacker")[0] or "ATTACKER_HINT" in src
     assert '"attacker_hint_version"' in src
+
+
+def test_coef_guard_only_applies_to_arm3():
+    # arm 2 (v8 default) uses coef 0.0, which is NOT in REPEAT_PENALTY_SWEEP -- the guard must not
+    # reject it. The guard is for arm 3's sweep only.
+    src, _ = _src_tree()
+    assert "if arm == 3 and coef not in REPEAT_PENALTY_SWEEP:" in src

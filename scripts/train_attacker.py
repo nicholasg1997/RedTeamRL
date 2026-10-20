@@ -315,7 +315,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         raise ValueError(f"--max-turns {max_turns} is baseline-only; training runs MAX_TURNS="
                          f"{MAX_TURNS} (change the constant for a new lineage)")
     coef = repeat_penalty_coef if arm == 3 else 0.0   # arm 2 ignores the coef
-    if coef not in REPEAT_PENALTY_SWEEP:
+    if arm == 3 and coef not in REPEAT_PENALTY_SWEEP:
         raise ValueError(f"repeat_penalty_coef {coef} is not one of {REPEAT_PENALTY_SWEEP}")
     ckpt_root = f"/runs/attacker-grpo-{LINEAGE}-arm{arm}-coef{coef}"
     ckpt_root += _group_size_suffix(n_rollouts)       # group size is a lineage flag
