@@ -1,3 +1,4 @@
+import random
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from redteamrl.train.capture import Example
 from redteamrl.train.closeness import closeness
 from redteamrl.types import TaskSpec
 from redteamrl.train.episode_store import read_episodes, write_episode
-from redteamrl.train.grpo import group_advantages, example_loss
+from redteamrl.train.grpo import group_advantages, example_loss, k3_kl
 from redteamrl.harness.protocol import _INVALID_ATTACKER_OUTPUT, _DEFENDER_FAIL_MARKER
 
 
@@ -440,10 +441,29 @@ def micro_batches(examples: list[Example], max_tokens: int, max_logit_rows: int)
 	return batches
 
 
+def episode_minibatches(live: list[Example], n: int, seed: str | None) -> list[list[int]]:
+	"""Partition `live` (by index) into at most `n` minibatches, never splitting an episode.
+
+	Episodes are dealt round-robin after a shuffle seeded by `seed` (None keeps sorted episode-id
+	order), so a preempted update reruns identically. Never returns an empty minibatch: with fewer
+	episodes than `n`, there is one minibatch per episode."""
+	episodes = sorted({example.episode_id for example in live}, key=repr)
+	if seed is not None:
+		random.Random(seed).shuffle(episodes)
+	k = max(1, min(n, len(episodes)))
+	slot = {episode: j % k for j, episode in enumerate(episodes)}
+	batches: list[list[int]] = [[] for _ in range(k)]
+	for i, example in enumerate(live):
+		batches[slot[example.episode_id]].append(i)
+	return [batch for batch in batches if batch]
+
+
 def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: float = 0.2,
                 inner_epochs: int = 1, max_batch_tokens: int = 16384,
-                max_batch_logit_rows: int = 4096, no_checkpoint_max_tokens: int = 0) -> dict:
-	"""GRPO update: `inner_epochs` gradient steps over ONE batch of rollouts.
+                max_batch_logit_rows: int = 4096, no_checkpoint_max_tokens: int = 0,
+                minibatches: int = 1, target_kl: float | None = None,
+                shuffle_seed: str | None = None) -> dict:
+	"""GRPO update: `inner_epochs` passes over ONE batch of rollouts.
 
 	Generation dominates cost — a rollout is hours, an optimizer step is seconds. Taking a single
 	step per rollout wastes the batch and leaves the clipped objective inert: `new_lp` and `old_lp`
@@ -454,35 +474,52 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 	reference) are computed ONCE. Recomputing `old_lp` after a step would re-pin the ratio at 1
 	and silently remove the trust region — the epochs would become unconstrained repeats.
 
+	`minibatches == 1` (the default, and the defender's path) takes ONE optimizer step per epoch over
+	the whole batch -- the pre-v7 update, bit for bit. Lineage v7 found that this moved the attacker
+	almost nowhere (~2 Adam steps per iteration, KL 0.003 after five iterations), so `minibatches > 1`
+	partitions the episodes each epoch (`episode_minibatches`, seeded by `shuffle_seed`) and steps
+	once per minibatch. Behaviour log-probs then come from a frozen pass before any step, and
+	`target_kl` arms a brake: a minibatch whose behaviour-to-current KL exceeds 2x the target is not
+	stepped, and the update ends (PPO's early stop). `kl_iter` reports that KL for the last epoch.
+
 	Episodes are weighted equally regardless of trajectory length. A learner with
 	`logprobs_batch` is scored in micro-batches (one autograd graph per micro-batch, bounded by
 	`max_batch_tokens` / `max_batch_logit_rows`); one without it is scored one example at a time.
 	The per-example losses and weights are identical either way -- batching changes speed, not math.
-	Micro-batches are fixed once and reused for the frozen pass and every epoch, so epoch 0's ratio
-	stays exactly 1.
 	"""
 	if inner_epochs < 1:
 		raise ValueError("inner_epochs must be at least 1")
+	if minibatches < 1:
+		raise ValueError("minibatches must be at least 1")
 	live = [example for example in examples if example.advantage != 0]
 	if not live:
 		return {"loss": 0.0, "mean_ratio": 0.0, "mean_kl": 0.0, "grad_norm": 0.0,
 		        "n_live_episodes": 0, "n_live_examples": 0, "n_examples": len(examples),
-		        "inner_epochs": inner_epochs, "epoch_ratios": []}
+		        "inner_epochs": inner_epochs, "epoch_ratios": [], "steps": 0,
+		        "early_stopped": False, "kl_iter": 0.0, "clip_frac": 0.0, "minibatch_kl_old": []}
 
 	decisions_per_episode = Counter(example.episode_id for example in live)
 	n_episodes = len(decisions_per_episode)
 
-	# The reference is frozen before any weights move; the behaviour policy is captured in epoch 0
-	# (below). Both are CLONED: a no-grad path returning a view of the parameters would otherwise
-	# alias live storage and let the optimizer step mutate them silently.
+	# The reference is frozen before any weights move. Both frozen passes are CLONED: a no-grad
+	# path returning a view of the parameters would otherwise alias live storage and let the
+	# optimizer step mutate them silently.
 	batched = hasattr(learner, "logprobs_batch")
 	# When checkpoint-skipping is on, cap batches at its threshold: otherwise micro_batches packs to
 	# max_batch_tokens and almost no batch is small enough to skip -- the saving would silently be
 	# zero. Smaller batches cost nothing here; the update is compute-bound at ~2k tokens/example.
 	token_cap = (min(max_batch_tokens, no_checkpoint_max_tokens) if no_checkpoint_max_tokens > 0
 	             else max_batch_tokens)
-	batches = (micro_batches(live, token_cap, max_batch_logit_rows) if batched
-	           else [[i] for i in range(len(live))])
+
+	def pack(indices):
+		"""Memory packing of `indices` (into `live`) into forward-pass micro-batches."""
+		if not batched:
+			return [[i] for i in indices]
+		subset = [live[i] for i in indices]
+		return [[indices[j] for j in batch]
+		        for batch in micro_batches(subset, token_cap, max_batch_logit_rows)]
+
+	batches = pack(list(range(len(live))))
 
 	def score(indices, use_adapter, with_grad):
 		if not batched:
@@ -493,15 +530,19 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 			[(live[i].prompt_ids, live[i].completion_ids) for i in indices],
 			use_adapter=use_adapter, with_grad=with_grad)
 
-	# Only the REFERENCE needs its own pass. The behaviour policy's log-probs (`old_lp`) are taken
-	# from epoch 0's forward instead: no optimizer step happens until epoch 0 has scored every
-	# micro-batch, so its weights ARE the behaviour policy and the values are identical by
-	# construction (ratio exactly 1 at epoch 0, as before). Saves one forward per example.
 	ref: list = [None] * len(live)
 	old: list = [None] * len(live)
 	for indices in batches:
 		for i, ref_lp in zip(indices, score(indices, False, False)):
 			ref[i] = ref_lp.detach().clone()
+	if minibatches > 1:
+		# Steps happen mid-epoch, so epoch 0's forward is no longer the behaviour policy: freeze it
+		# first. With one minibatch, old_lp is taken from epoch 0's forward instead (below): no
+		# step happens until epoch 0 has scored everything, so the values are identical by
+		# construction and one forward per example is saved.
+		for indices in batches:
+			for i, lp in zip(indices, score(indices, True, False)):
+				old[i] = lp.detach().clone()
 
 	def padded_tokens(indices):
 		return len(indices) * max(len(live[i].prompt_ids) + len(live[i].completion_ids)
@@ -518,38 +559,65 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 		with learner.no_checkpointing():
 			return score(indices, True, True)
 
-	epoch_ratios = []
+	trainable = [p for p in learner.model.parameters() if p.requires_grad]
+	epoch_ratios, minibatch_kl_old = [], []
 	total_loss = grad_norm = 0.0
-	kls = []
+	kls, epoch_kl_old = [], []
+	clipped = tokens = 0
+	steps, early_stopped = 0, False
 	for epoch in range(inner_epochs):
-		learner.optimizer.zero_grad()
-		ratios = []
-		kls = []
+		ratios, kls, epoch_kl_old = [], [], []
+		clipped = tokens = 0
 		total_loss = 0.0
-		for indices in batches:
-			batch_loss = 0.0
-			for i, new_lp in zip(indices, score_with_grad(indices)):
-				example = live[i]
-				if epoch == 0:
-					# CLONE, not just detach: a view would alias live storage, so the optimizer step
-					# would silently mutate old_lp, re-pin the ratio at 1, and remove the trust region.
-					old[i] = new_lp.detach().clone()
-				old_lp, ref_lp = old[i], ref[i]
-				mask = torch.ones_like(new_lp)
-				loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta,
-				                    clip_eps)
-				weight = 1.0 / (n_episodes * decisions_per_episode[example.episode_id])
-				batch_loss = batch_loss + loss * weight
-				total_loss += loss.item() * weight
-				ratios.append(torch.exp(new_lp - old_lp).mean().item())
-				# Report the same non-negative k3 estimator used by the optimization objective.
-				delta = ref_lp - new_lp
-				kls.append((torch.exp(delta) - delta - 1.0).mean().item())
-			batch_loss.backward()       # one graph per micro-batch
-		trainable = [p for p in learner.model.parameters() if p.requires_grad]
-		grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=float("inf")))
-		learner.optimizer.step()
+		if minibatches == 1:
+			plan = [list(range(len(live)))]
+			chunks = [batches]                # the epoch-wide micro-batches, as before v7
+		else:
+			seed = None if shuffle_seed is None else f"{shuffle_seed}-e{epoch}"
+			plan = episode_minibatches(live, minibatches, seed)
+			chunks = [pack(minibatch) for minibatch in plan]
+		for minibatch, micro in zip(plan, chunks):
+			learner.optimizer.zero_grad()
+			mb_episodes = len({live[i].episode_id for i in minibatch})
+			mb_kl = []
+			for indices in micro:
+				batch_loss = 0.0
+				for i, new_lp in zip(indices, score_with_grad(indices)):
+					example = live[i]
+					if epoch == 0 and minibatches == 1:
+						# CLONE, not just detach: a view would alias live storage, so the optimizer
+						# step would silently mutate old_lp, re-pin the ratio at 1, and remove the
+						# trust region.
+						old[i] = new_lp.detach().clone()
+					old_lp, ref_lp = old[i], ref[i]
+					mask = torch.ones_like(new_lp)
+					loss = example_loss(new_lp, old_lp, ref_lp, example.advantage, mask, beta,
+					                    clip_eps)
+					weight = 1.0 / (mb_episodes * decisions_per_episode[example.episode_id])
+					batch_loss = batch_loss + loss * weight
+					total_loss += loss.item() * weight
+					with torch.no_grad():
+						log_ratio = new_lp.detach() - old_lp
+						ratios.append(torch.exp(log_ratio).mean().item())
+						clipped += int(((torch.exp(log_ratio) - 1.0).abs() > clip_eps).sum())
+						tokens += log_ratio.numel()
+						mb_kl.append(k3_kl(new_lp.detach(), old_lp).mean().item())
+						# Report the same non-negative k3 estimator used by the optimization objective.
+						kls.append(k3_kl(new_lp.detach(), ref_lp).mean().item())
+				batch_loss.backward()       # one graph per micro-batch
+			kl_old = sum(mb_kl) / max(len(mb_kl), 1)
+			minibatch_kl_old.append(kl_old)
+			epoch_kl_old.append(kl_old)
+			if target_kl is not None and kl_old > 2 * target_kl:
+				learner.optimizer.zero_grad()
+				early_stopped = True
+				break
+			grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, max_norm=float("inf")))
+			learner.optimizer.step()
+			steps += 1
 		epoch_ratios.append(sum(ratios) / max(len(ratios), 1))
+		if early_stopped:
+			break
 
 	return {
 		"loss": total_loss,
@@ -563,4 +631,9 @@ def update_step(learner, examples: list[Example], beta: float = 0.04, clip_eps: 
 		# Ratio per epoch: starts at 1.0 and should drift modestly. Drifting past ~1+clip_eps
 		# means later epochs are fully clipped and contributing nothing.
 		"epoch_ratios": epoch_ratios,
+		"steps": steps,
+		"early_stopped": early_stopped,
+		"kl_iter": sum(epoch_kl_old) / max(len(epoch_kl_old), 1),
+		"clip_frac": clipped / tokens if tokens else 0.0,
+		"minibatch_kl_old": minibatch_kl_old,
 	}
