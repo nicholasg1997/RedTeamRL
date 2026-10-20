@@ -449,7 +449,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     # can finish from there (spec s4.2).
     alloc = (AllocParams(depth_start=1.0, restart_fraction_max=0.0, max_replacements=0,
                          max_fresh_per_task=OVERFIT_GROUPS) if overfit_task
-             else AllocParams(depth_start=1.0))
+             else AllocParams(depth_start=1.0, near_miss_offset=1, near_miss_min_turns_left=3))
     # GRPO group slots per iteration: one per task normally; OVERFIT_GROUPS on the single task.
     n_slots = OVERFIT_GROUPS if overfit_task else len(tasks)
     lr_rule = LrRule(initial=LR, target_kl=TARGET_KL)
@@ -843,7 +843,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
         # about to be trained. Base slots only (a resume may already hold replacement episodes);
         # finalize re-banks the same entries idempotently.
         bank_episodes({i: ep for i, ep in read_episodes(rollout_dir).items() if ep["slot"] < len(plans)},
-                      banks, it, bank_record_dir)
+                      banks, it, bank_record_dir, params=alloc)
         replacements = load_or_plan(
             os.path.join(rollout_dir, "replacements.json"),
             lambda: plan_replacements(read_episodes(rollout_dir), plans, banks, restart_depths,

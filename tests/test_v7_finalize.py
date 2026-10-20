@@ -70,3 +70,43 @@ def test_v7_identity_extends_v6():
     ident = v7_identity(P)
     assert {k: v for k, v in ident.items() if k in v6_identity(P)} == v6_identity(P)
     assert ident["graduation"] == "all-win-at-floor-v1" and ident["same_iter_banking"] == 1
+
+
+# --- v7.2: near misses restart AFTER the redaction ---------------------------------------------
+
+from dataclasses import replace as _replace  # noqa: E402
+
+from test_v6_finalize import _record  # noqa: E402
+
+V72 = _replace(P, near_miss_offset=1, near_miss_min_turns_left=3)
+
+
+def _near_miss(key_turn, n_steps=12, eid=0):
+    return {eid: {"episode_id": eid, "task_id": "A", "kind": "fresh", "slot": 0, "won": False,
+                  "reward": -0.1, "group_key": "A#slot0", "closeness": [1, key_turn],
+                  "record": _record("nm", n_steps=n_steps), "restart_fallback": False}}
+
+
+def test_near_miss_is_banked_at_the_turn_after_the_redaction(tmp_path):
+    # Restarting AT the redaction turn re-reads the secret and is redacted again (v7/v7.1: 0/9 live).
+    banks, _, rec = _setup(tmp_path)
+    assert bank_episodes(_near_miss(4), banks, IT, rec, params=V72) == (0, 1)
+    assert banks["A"].entries()[0].key_turn == 5
+
+
+def test_near_miss_without_enough_turns_left_is_not_banked(tmp_path):
+    banks, _, rec = _setup(tmp_path)
+    assert bank_episodes(_near_miss(9), banks, IT, rec, params=V72) == (0, 0)  # 12 - 10 = 2 < 3
+    assert bank_episodes(_near_miss(8), banks, IT, rec, params=V72) == (0, 1)  # 12 - 9 = 3
+
+
+def test_wins_keep_their_decisive_turn(tmp_path):
+    banks, _, rec = _setup(tmp_path)
+    bank_episodes(_group(_fresh(0), [True, False, False, False]), banks, IT, rec, params=V72)
+    assert banks["A"].entries()[0].key_turn == 4
+
+
+def test_default_params_bank_near_misses_unchanged(tmp_path):
+    banks, _, rec = _setup(tmp_path)
+    bank_episodes(_near_miss(4), banks, IT, rec)
+    assert banks["A"].entries()[0].key_turn == 4

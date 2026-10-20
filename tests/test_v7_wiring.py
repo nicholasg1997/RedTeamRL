@@ -25,7 +25,7 @@ def test_identity_carries_the_v7_rules():
     assert "phase_identity.update(lr_rule.as_identity())" in src
     assert '"minibatches": MINIBATCHES' in src
     assert '"heldout_eval_every": HELDOUT_EVAL_EVERY' in src
-    assert "AllocParams(depth_start=1.0)" in src
+    assert "AllocParams(depth_start=1.0" in src
     assert "finalize_v6(" not in src
 
 
@@ -151,3 +151,9 @@ def test_warmup_is_wired_through_a_persisted_global_step():
 def test_repeat_penalty_coef_is_checked_against_the_sweep():
     src, _ = _src_tree()
     assert "if coef not in REPEAT_PENALTY_SWEEP:" in src
+
+
+def test_v72_near_misses_restart_after_the_redaction():
+    src, _ = _src_tree()
+    assert "near_miss_offset=1, near_miss_min_turns_left=3" in src
+    assert "banks, it, bank_record_dir, params=alloc)" in src

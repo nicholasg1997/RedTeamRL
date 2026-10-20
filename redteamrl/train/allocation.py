@@ -52,6 +52,11 @@ class AllocParams:
     depth_step: float = 0.2
     depth_min: float = 0.1               # reachable exactly from 0.5; turn_for's max(1, .) is the k >= 1 guard
     max_replacements: int = 4            # v6 dynamic sampling: extra groups per iteration, hard cap
+    # v7.2: a near miss restarts AFTER its redaction (key_turn + offset), with the redacted result
+    # already in context: restarting AT the redaction re-reads the secret and is redacted again
+    # (v7/v7.1: 0 of 9 such groups live). Near misses leaving fewer turns than this are not banked.
+    near_miss_offset: int = 0
+    near_miss_min_turns_left: int = 0
 
     def as_identity(self) -> dict:
         # JSON-safe: read_meta returns lists, so a tuple here would refuse every resume.
