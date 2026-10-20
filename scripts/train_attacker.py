@@ -366,6 +366,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     from peft import LoraConfig, get_peft_model
     from redteamrl.policies.prompted import (
         PromptedDefender, PromptedAttacker, ATTACKER_SYSTEM_SHELL, HINT_TECHNIQUE,
+        HINT_FOUNDATIONAL_V2,
         BENIGN_AGENT_SYSTEM)
     from redteamrl.policies.vllm_client import (
         load_lora_adapter, make_vllm_generate, served_lora_path, start_vllm_server,
@@ -586,10 +587,14 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
                                     max_context_chars=TRANSCRIPT_CONTEXT_CHARS)
         return defender_factory
 
+    # v7.2+: foundational hint (principles, no named tactic). Part of phase_identity so a hint
+    # change forks the lineage and a resume never mixes two prompt versions.
+    ATTACKER_HINT = HINT_FOUNDATIONAL_V2
+    ATTACKER_HINT_VERSION = "foundational-v2"
     def attack_agent_factory(spec):
         # The LIVE model. HINT_TECHNIQUE stays as-is: freezing the hint keeps improvements
         # attributable to learning rather than to us writing better attacks by hand.
-        return PromptedAttacker(cap, goal=spec.goal, cover=spec.request, hint=HINT_TECHNIQUE,
+        return PromptedAttacker(cap, goal=spec.goal, cover=spec.request, hint=ATTACKER_HINT,
                                 system_template=ATTACKER_SYSTEM_SHELL,
                                 max_context_chars=TRANSCRIPT_CONTEXT_CHARS,
                                 history_turns=ATTACKER_HISTORY_TURNS)
@@ -625,7 +630,8 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
     phase_identity.update(v7_identity(alloc, DEFAULT_MAX_NEAR_MISSES))
     phase_identity.update(lr_rule.as_identity())
     phase_identity.update({"minibatches": MINIBATCHES, "heldout_eval_every": HELDOUT_EVAL_EVERY,
-                           "brake_rule": "mean2x-or-single10x-v1", "lr_warmup_steps": WARMUP_STEPS})
+                           "brake_rule": "mean2x-or-single10x-v1", "lr_warmup_steps": WARMUP_STEPS,
+                           "attacker_hint_version": ATTACKER_HINT_VERSION})
     if overfit_task:
         phase_identity.update({"overfit_task": overfit_task, "overfit_groups": OVERFIT_GROUPS})
     if split_defender:
@@ -747,7 +753,7 @@ def _train_impl(active_servers, arm, repeat_penalty_coef, until_iter=N_ITERS,
             # the frozen temp-0 opponent gen_def already serving on DEF_PORT.
             spec = _heldout_attack_task(seed)
             attacker = PromptedAttacker(eval_gen, goal=spec.goal, cover=spec.request,
-                                        hint=HINT_TECHNIQUE, system_template=ATTACKER_SYSTEM_SHELL,
+                                        hint=ATTACKER_HINT, system_template=ATTACKER_SYSTEM_SHELL,
                                         max_context_chars=TRANSCRIPT_CONTEXT_CHARS,
                                         history_turns=ATTACKER_HISTORY_TURNS)
             defender = PromptedDefender(generate=gen_def, system_template=None,

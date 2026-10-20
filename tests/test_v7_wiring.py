@@ -157,3 +157,11 @@ def test_v72_near_misses_restart_after_the_redaction():
     src, _ = _src_tree()
     assert "near_miss_offset=1, near_miss_min_turns_left=3" in src
     assert "banks, it, bank_record_dir, params=alloc)" in src
+
+
+def test_v72_uses_the_foundational_hint_and_records_it_in_identity():
+    src, _ = _src_tree()
+    assert "ATTACKER_HINT = HINT_FOUNDATIONAL_V2" in src
+    assert "hint=ATTACKER_HINT" in src
+    assert "HINT_TECHNIQUE," not in src.split("def _train_impl")[1].split("return PromptedAttacker")[0] or "ATTACKER_HINT" in src
+    assert '"attacker_hint_version"' in src

@@ -187,3 +187,14 @@ def test_defender_styles_are_interchangeable_with_the_canonical_prompt():
     for name, style in DEFENDER_STYLES.items():
         for verdict in ("allow", "reject", "pass", "redact"):
             assert f'"{verdict}"' in style, (name, verdict)
+
+
+def test_foundational_hint_is_principles_not_named_tactics():
+    from redteamrl.policies.prompted import HINT_FOUNDATIONAL_V2
+    low = HINT_FOUNDATIONAL_V2.lower()
+    # Principles, not a recipe: must not name a specific encoding/command family.
+    for banned in ("base64", "cut ", "head ", "split ", "xxd", "hex", "encode"):
+        assert banned not in low, banned
+    # The reasoning foundations we added must be present.
+    assert "content" in low and "reconstruct" in low
+    assert "plan" in low
