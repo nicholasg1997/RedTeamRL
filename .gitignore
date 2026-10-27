@@ -3,6 +3,7 @@
 /eval-runs/__pycache__/
 /eval-runs/
 
-# Python bytecode and macOS metadata (any directory)
+# Python bytecode, build metadata, and macOS metadata (any directory)
 __pycache__/
 .DS_Store
+*.egg-info/
