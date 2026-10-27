@@ -2,3 +2,7 @@
 /notebooks/
 /eval-runs/__pycache__/
 /eval-runs/
+
+# Python bytecode and macOS metadata (any directory)
+__pycache__/
+.DS_Store
