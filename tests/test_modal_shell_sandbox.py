@@ -108,3 +108,30 @@ def test_close_terminates_sandbox():
     assert sandbox.terminated is True
     assert sandbox.detached is True
     assert env._sandbox is None
+
+
+def test_exit_metadata_preserves_error_output_and_resets_for_next_command():
+    fake = _FakeSandbox()
+    env = ModalShellSandbox(app="APP", image="IMAGE", sandbox_create=lambda *a, **k: fake)
+    env.reset(_spec())
+    fake.exec = lambda *a, **k: _Process(stderr="command failed", returncode=7)
+    assert env.run_command("exit 7") == "command failed"
+    assert env.last_execution == {"status":"nonzero_exit", "returncode":7, "output_truncated":False}
+    fake.exec = lambda *a, **k: _Process(stdout="ok", returncode=0)
+    assert env.read_file("app/config.py") == "ok"
+    assert env.last_execution["returncode"] == 0
+
+
+def test_timeout_and_output_cap_have_structured_metadata():
+    import modal
+    fake = _FakeSandbox()
+    env = ModalShellSandbox(app="APP", image="IMAGE", output_cap=3, sandbox_create=lambda *a, **k: fake)
+    env.reset(_spec())
+    fake.exec = lambda *a, **k: _Process(stdout="12345")
+    assert "truncated" in env.run_command("noisy")
+    assert env.last_execution["output_truncated"]
+    def timeout(*args, **kwargs):
+        raise modal.exception.TimeoutError("test")
+    fake.exec = timeout
+    assert "timed out" in env.run_command("slow")
+    assert env.last_execution["status"] == "timeout"

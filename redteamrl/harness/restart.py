@@ -155,7 +155,8 @@ def restore_state(record: dict, k: int, attacker, sandbox) -> TurnState:
         was_complete = state.complete
         stopped = finish_turn(state, spec, step["turn"], step["phase"], was_complete, action,
                               call_decision, result_decision, step["policy_returned"],
-                              step["returned"], step["redaction_status"], post_completion_turns)
+                              step["returned"], step["redaction_status"], post_completion_turns,
+                              execution=step.get("execution"))
         if stopped:
             raise ValueError(f"restart turn k={k} is at or past the source's stopping turn "
                              f"({step['turn']}); a restart must stop before it")

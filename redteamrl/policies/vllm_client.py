@@ -23,8 +23,18 @@ def make_vllm_generate(
 		seed: int | None = None,
 		label: str = "",
 		log_prompt_stats: bool = False,
+		on_response=None,
+		session=None,
+		json_schema: dict | None = None,
+		require_reasoning: bool = False,
+		thinking_token_budget: int | None = None,
 ):
 
+	if require_reasoning and not enable_thinking:
+		raise ValueError("require_reasoning requires enable_thinking=True")
+	if thinking_token_budget is not None:
+		if not enable_thinking or not 0 < thinking_token_budget < max_tokens:
+			raise ValueError("thinking_token_budget requires thinking and must leave room below max_tokens")
 	url = f"{base_url.rstrip('/')}/v1/chat/completions"
 
 	def generate(system: str, messages: list[dict]) -> str:
@@ -42,23 +52,69 @@ def make_vllm_generate(
 			"chat_template_kwargs": {"enable_thinking": enable_thinking},
 		}
 
+		if thinking_token_budget is not None:
+			payload["thinking_token_budget"] = thinking_token_budget
+
+		if json_schema is not None:
+			payload["structured_outputs"] = {"json": json_schema}
+
 		if seed is not None:
 			payload["seed"] = seed
 
-		resp = requests.post(url, json=payload, timeout=timeout)
+		started = time.monotonic()
+		resp = (session or requests).post(url, json=payload, timeout=timeout)
 		if resp.status_code != 200:
 			# Surface vLLM's error body — raise_for_status() drops it, and that body
 			# (context-length overflow vs OOM vs bad field) is the whole diagnosis.
 			prefix = f" [{label}]" if label else ""
 			raise RuntimeError(f"vLLM{prefix} {resp.status_code} from {url} ({stats}): {resp.text[:800]}")
-		return resp.json()["choices"][0]["message"]["content"]
+		body = resp.json()
+		choice = body["choices"][0]
+		usage = body.get("usage") or {}
+		message = choice["message"]
+		content = message.get("content")
+		reasoning = message.get("reasoning") or message.get("reasoning_content")
+		reasoning_metadata = {}
+		if require_reasoning:
+			reasoning_metadata = {
+				"thinking_enabled": True,
+				"thinking_token_budget": thinking_token_budget,
+				"final_token_allowance": max_tokens - thinking_token_budget if thinking_token_budget is not None else None,
+				"reasoning_present": isinstance(reasoning, str) and bool(reasoning.strip()),
+				"final_present": isinstance(content, str) and bool(content.strip()),
+				"reasoning": reasoning, "final_content": content,
+				"reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+			}
+
+		if on_response is not None:
+			on_response({
+				**reasoning_metadata,
+				"label": label, "model": model, "seed": seed,
+				"latency_s": time.monotonic() - started, "max_tokens": max_tokens,
+				"finish_reason": choice.get("finish_reason"),
+				"prompt_tokens": usage.get("prompt_tokens"),
+				"completion_tokens": usage.get("completion_tokens"),
+				"cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+			})
+		if require_reasoning:
+			if choice.get("finish_reason") != "stop":
+				raise RuntimeError(f"Thinking generation did not finish normally ({choice.get('finish_reason')}); inspect token budget")
+			if not reasoning_metadata["reasoning_present"] or not reasoning_metadata["final_present"]:
+				raise RuntimeError("Thinking generation missing separate reasoning or final content; check qwen3 parser and token budget")
+			if "<think>" in content or "</think>" in content:
+				raise RuntimeError("Thinking generation has reasoning tags in final content; refusing to forward them")
+
+		if not isinstance(content, str):
+			raise RuntimeError(f"vLLM {label} returned non-text content: {content!r}")
+		return content
 
 	return generate
 
 
 def build_serve_command(model: str, port: int, mem_frac: float, max_model_len: int = 8192,
                         max_num_seqs: int | None = None, lora_name: str | None = None,
-                        lora_path: str | None = None, max_lora_rank: int = 16) -> list[str]:
+                        lora_path: str | None = None, max_lora_rank: int = 16,
+                        extra_args: list[str] | None = None) -> list[str]:
 	"""Assemble the `vllm serve` argv. Split out from the launcher so it is testable offline."""
 	if lora_path and not lora_name:
 		raise ValueError("lora_path requires a lora_name to address it in requests")
@@ -71,6 +127,7 @@ def build_serve_command(model: str, port: int, mem_frac: float, max_model_len: i
 		cmd += ["--enable-lora", "--max-lora-rank", str(max_lora_rank)]
 		if lora_path:
 			cmd += ["--lora-modules", f"{lora_name}={lora_path}"]
+	cmd += extra_args or []
 	return cmd
 
 
@@ -202,23 +259,29 @@ def reset_prefix_cache(base_url: str, timeout: float = 60.0) -> None:
 def start_vllm_server(model: str, port: int, mem_frac: float, max_model_len: int = 8192,
                       max_num_seqs: int | None = None, timeout_s: int = 1200, poll_s: int = 2,
                       lora_name: str | None = None, lora_path: str | None = None,
-                      max_lora_rank: int = 16) -> subprocess.Popen:
+                      max_lora_rank: int = 16, extra_args: list[str] | None = None) -> subprocess.Popen:
 	"""Launch `vllm serve <model>` and block until its /health is 200. Shared by the eval probe
 	and the training harness. `max_num_seqs` caps concurrent sequences — needed for hybrid
 	(Mamba) models at low gpu_memory_utilization, where vLLM's default 256 can exceed the cache
 	blocks that fit. Raises if it never becomes healthy within timeout_s."""
 	cmd = build_serve_command(model, port, mem_frac, max_model_len, max_num_seqs,
-	                          lora_name, lora_path, max_lora_rank)
+	                          lora_name, lora_path, max_lora_rank, extra_args)
 	proc = subprocess.Popen(cmd)
-	for _ in range(max(1, timeout_s // poll_s)):
-		try:
-			if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
-				return proc
-		except Exception:
-			pass
-		time.sleep(poll_s)
-	stop_vllm_server(proc)
-	raise RuntimeError(f"vLLM for {model} on :{port} never became healthy in {timeout_s}s")
+	try:
+		for _ in range(max(1, timeout_s // poll_s)):
+			code = proc.poll()
+			if code is not None:
+				raise RuntimeError(f"vLLM for {model} on :{port} exited during startup (code {code}); see server logs")
+			try:
+				if requests.get(f"http://localhost:{port}/health", timeout=2).status_code == 200:
+					return proc
+			except requests.RequestException:
+				pass
+			time.sleep(poll_s)
+		raise RuntimeError(f"vLLM for {model} on :{port} never became healthy in {timeout_s}s")
+	except BaseException:
+		stop_vllm_server(proc)
+		raise
 
 
 def stop_vllm_server(proc: subprocess.Popen | None, timeout_s: int = 60) -> None:

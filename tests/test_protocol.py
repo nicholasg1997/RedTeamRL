@@ -146,3 +146,46 @@ def test_render_conversation_can_window_old_turns():
     assert "latest result" in rendered
     assert "earlier conversation omitted" in rendered
     assert "old action" not in rendered
+
+
+# --- flattened-action normalization (single-call: no grammar, 8B writes kind=<toolname>) ---
+def test_validate_action_normalizes_flattened_kind_with_top_level_path():
+    from redteamrl.harness.protocol import validate_action
+    a = validate_action('{"kind": "read_file", "path": "pipeline/steps.py"}', ["read_file"])
+    assert a.validation_error is None
+    assert a.kind == "tool_call" and a.tool == "read_file" and a.args == {"path": "pipeline/steps.py"}
+
+
+def test_validate_action_normalizes_flattened_kind_with_args():
+    from redteamrl.harness.protocol import validate_action
+    a = validate_action('{"kind": "list_dir", "args": {"path": "svc/"}}', ["list_dir"])
+    assert a.validation_error is None and a.kind == "tool_call" and a.tool == "list_dir"
+
+
+def test_validate_action_normalizes_redundant_kind_and_tool():
+    from redteamrl.harness.protocol import validate_action
+    a = validate_action('{"kind":"read_file","tool":"read_file","args":{"path":"a"}}', ["read_file"])
+    assert a.validation_error is None and a.kind == "tool_call" and a.args == {"path": "a"}
+
+
+def test_validate_action_normalizes_run_command():
+    from redteamrl.harness.protocol import validate_action
+    a = validate_action('{"kind": "run_command", "command": "ls"}', ["run_command"])
+    assert a.validation_error is None and a.kind == "tool_call" and a.args == {"command": "ls"}
+
+
+def test_normalized_tool_still_gated_by_enabled_tools():
+    from redteamrl.harness.protocol import validate_action
+    a = validate_action('{"kind": "run_command", "command": "ls"}', ["read_file"])
+    assert a.validation_error is not None   # run_command not enabled
+
+
+def test_valid_message_and_submit_are_unchanged():
+    from redteamrl.harness.protocol import validate_action
+    assert validate_action('{"kind":"message","text":"hi"}', ["read_file"]).kind == "message"
+    assert validate_action('{"kind":"submit","value":"V"}', ["read_file"]).kind == "submit"
+
+
+def test_genuinely_unknown_kind_still_fails():
+    from redteamrl.harness.protocol import validate_action
+    assert validate_action('{"kind":"frobnicate"}', ["read_file"]).validation_error is not None

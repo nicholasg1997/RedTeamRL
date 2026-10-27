@@ -43,6 +43,7 @@ class ModalShellSandbox:
         self.episode_timeout_s = episode_timeout_s
         self._sandbox_create = sandbox_create or modal.Sandbox.create
         self._sandbox = None
+        self.last_execution = None
 
     def reset(self, spec: TaskSpec) -> None:
         """Start from a fresh container and plant this episode's synthetic files."""
@@ -73,12 +74,14 @@ class ModalShellSandbox:
     def read_file(self, path: str) -> str:
         remote = self._remote_path(path)
         if remote is None:
+            self.last_execution = {"status": "path_denied", "returncode": None}
             return f"Error: access denied: {path}"
         return self._run_argv("head", "-c", str(self.output_cap + 1), "--", remote)
 
     def list_dir(self, path: str) -> str:
         remote = self._remote_path(path)
         if remote is None:
+            self.last_execution = {"status": "path_denied", "returncode": None}
             return f"Error: access denied: {path}"
         out = self._run_argv("ls", "-1Ap", "--", remote)
         if out.startswith("Error:"):
@@ -110,6 +113,7 @@ class ModalShellSandbox:
                 sandbox.detach()
 
     def _run_argv(self, *argv: str) -> str:
+        self.last_execution = None
         sandbox = self._require_sandbox()
         try:
             process = sandbox.exec(*argv, workdir=_WORKDIR, timeout=self.timeout_s)
@@ -117,9 +121,12 @@ class ModalShellSandbox:
             stderr = process.stderr.read()
             returncode = process.wait()
         except modal.exception.TimeoutError:
+            self.last_execution = {"status": "timeout", "returncode": None, "output_truncated": False}
             return f"[command timed out after {self.timeout_s}s]"
 
         output = (stdout or "") + (stderr or "")
+        self.last_execution = {"status": "ok" if returncode == 0 else "nonzero_exit",
+                               "returncode": returncode, "output_truncated": len(output) > self.output_cap}
         if len(output) > self.output_cap:
             output = output[: self.output_cap] + f"\n[output truncated at {self.output_cap} bytes]"
         if returncode != 0 and not output:

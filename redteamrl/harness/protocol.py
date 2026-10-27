@@ -59,7 +59,7 @@ def parse_attacker_action(raw: str) -> AttackerAction:
     obj = _extract_json(raw)
     if isinstance(obj, dict):
         try:
-            return AttackerAction(**obj)
+            return AttackerAction(**{k: v for k, v in obj.items() if k != "validation_error"})
         except Exception:
             pass
     return AttackerAction(kind="message", text=_INVALID_ATTACKER_OUTPUT, raw=raw)
@@ -160,3 +160,50 @@ def render_action(action: AttackerAction) -> str:
     if action.kind == "tool_call":
         return f"{action.tool}({action.args})"
     return action.text or ""
+
+
+_TOOL_KINDS = ("read_file", "list_dir", "run_command")
+
+
+def _normalize_flattened_action(obj: dict) -> dict:
+    """Coerce the flattened form a grammar-free model emits -- ``{"kind": "<toolname>", ...}`` with
+    the path/command at top level or in ``args`` -- into the canonical ``tool_call`` shape. The
+    intent is unambiguous (a tool name is never a valid message/submit), so honoring it keeps
+    execution faithful instead of wasting the turn on a format technicality. Non-tool kinds and
+    already-canonical actions pass through unchanged."""
+    if not isinstance(obj, dict) or obj.get("kind") not in _TOOL_KINDS:
+        return obj
+    args = obj.get("args") if isinstance(obj.get("args"), dict) else {}
+    args = dict(args)
+    for key in ("path", "command"):
+        if key in obj and key not in args:
+            args[key] = obj[key]
+    return {"kind": "tool_call", "tool": obj["kind"], "args": args}
+
+
+def validate_action(raw: str, enabled_tools: list[str]) -> AttackerAction:
+    from pydantic import ValidationError
+    from redteamrl.harness.action_schema import ACTION_ADAPTER
+
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        reason = "Expected exactly one JSON object, without prose or code fences."
+    else:
+        obj = _normalize_flattened_action(obj)
+        try:
+            parsed = ACTION_ADAPTER.validate_python(obj)
+            if hasattr(parsed, "tool") and parsed.tool not in enabled_tools:
+                reason = "Tool is not enabled for this task; consult the fixed action contract."
+            else:
+                return AttackerAction(**parsed.model_dump())
+        except ValidationError:
+            if isinstance(obj, dict) and obj.get("kind") not in ("tool_call", "message", "submit"):
+                reason = "Invalid kind: use tool_call for a tool, message for text, or submit for a value."
+                return AttackerAction(kind="message", text=_INVALID_ATTACKER_OUTPUT, raw=raw,
+                                      validation_error=reason)
+            reason = ('Action does not match the contract: kind must be tool_call, message, or submit; '
+                      'tools require tool_call and args.path or args.command as shown. No extra fields.')
+    # Fixed text only: never expose raw model reasoning in the shared conversation.
+    return AttackerAction(kind="message", text=_INVALID_ATTACKER_OUTPUT, raw=raw,
+                          validation_error=reason)

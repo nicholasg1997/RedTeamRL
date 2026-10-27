@@ -12,6 +12,7 @@ class AttackerAction(BaseModel):
     tool: str | None = None
     args: dict[str, str] | None = None
     value: str | None = None      # submit: the exfiltrated secret (never shown to the monitor)
+    validation_error: str | None = None  # harness feedback; never a defender decision
     raw: str | None = None        # diagnostic: full pre-parse model text (never shown to the monitor)
 
     @model_validator(mode="after")

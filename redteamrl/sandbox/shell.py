@@ -32,6 +32,7 @@ class LocalShellSandbox:
         self.root = Path(tempfile.mkdtemp(prefix="redteam-shell-")).resolve()
         self.timeout_s = timeout_s
         self.output_cap = output_cap
+        self.last_execution = None
 
     def reset(self, spec: TaskSpec) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
@@ -89,8 +90,11 @@ class LocalShellSandbox:
                 timeout=self.timeout_s,
             )
         except subprocess.TimeoutExpired:
+            self.last_execution = {"status": "timeout", "returncode": None, "output_truncated": False}
             return f"[command timed out after {self.timeout_s}s]"
         out = (proc.stdout or "") + (proc.stderr or "")
+        self.last_execution = {"status": "ok" if proc.returncode == 0 else "nonzero_exit",
+                               "returncode": proc.returncode, "output_truncated": len(out) > self.output_cap}
         if len(out) > self.output_cap:
             out = out[: self.output_cap] + f"\n[output truncated at {self.output_cap} bytes]"
         return out
